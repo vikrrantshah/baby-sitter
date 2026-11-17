@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PR Babysitter — Flow</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3; --muted: #8b949e;
+    --script: #4a90d9; --codex: #a371f7; --gh: #3fb950; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 0 0 16px; font-size: 13px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -1px; border: 2px solid var(--c); background: color-mix(in srgb, var(--c) 25%, transparent); }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; align-items: start; }
+  .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px; overflow: auto; }
+  .diagram svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  pre.mermaid { visibility: hidden; margin: 0; }
+  pre.mermaid[data-processed] { visibility: visible; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--warn);
+    border-radius: 10px; padding: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; }
+  .card ol { margin: 0; padding-left: 18px; font-size: 14px; color: var(--muted); }
+  .card li { margin: 0 0 10px; }
+  .card li b { color: var(--fg); font-weight: 600; }
+  @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>PR Babysitter</h1>
+  <p class="sub">The control flow. Codex handles the steps inside the purple box; the script runs everything else.</p>
+  <div class="legend">
+    <span style="--c: var(--script)">Script</span>
+    <span style="--c: var(--codex)">Codex</span>
+    <span style="--c: var(--warn)">Decision</span>
+    <span style="--c: var(--gh)">Start / end</span>
+  </div>
+
+  <div class="layout">
+    <div class="diagram"><pre class="mermaid">
+flowchart TD
+  START([Start]):::term --> SNAP
+
+  SNAP["1 · Get snapshot"]:::script --> MC{{"2 · Merged or closed?"}}:::dec
+  MC -- yes --> END([End]):::term
+  MC -- no --> TH{{"3 · Unhandled open threads?<br/><small>new comments since last count</small>"}}:::dec
+
+  TH -- yes --> HC
+  subgraph CODEX ["Codex"]
+    direction TB
+    HC["Handle comments"]:::codex --> RC["Reply to comments"]:::codex
+  end
+  RC --> RS["Resolve threads<br/><small>only where the last reply is mine</small>"]:::script
+  RS --> RQ["Request re-review"]:::script
+  RQ --> UTD
+  style CODEX fill:#1d1430,stroke:#a371f7,stroke-width:2px,color:#d2b8ff
+  TH -- no --> UTD
+
+  UTD{{"4 · Up to date with base?"}}:::dec
+  UTD -- no --> UP["Update PR"]:::script --> CI
+  UTD -- yes --> CI
+
+  CI{{"5 · CI green?"}}:::dec
+  CI -- yes --> MERGE["Merge"]:::script --> END
+  CI -- no --> WAIT["Wait 10s"]:::script --> SNAP
+
+  classDef script fill:#16263b,stroke:#4a90d9,color:#e6f0ff,stroke-width:1.5px
+  classDef codex  fill:#2a1a45,stroke:#a371f7,color:#f3eaff,stroke-width:2px
+  classDef dec    fill:#2e2614,stroke:#d29922,color:#fff3d6,stroke-width:1.5px
+  classDef term   fill:#14301f,stroke:#3fb950,color:#e6ffed,stroke-width:2px
+    </pre></div>
+
+    <div class="card">
+      <h2>Gaps to settle</h2>
+      <ol>
+        <li><b>CI red vs. CI pending.</b> Right now both lead to "wait 10s". A real failure would loop forever with nobody fixing it.</li>
+        <li><b>Update PR has merge conflicts.</b> There is no path for this yet.</li>
+        <li><b>Merge gate.</b> CI green alone triggers the merge, even if a re-review is still pending or a thread is still open.</li>
+        <li><b>After Codex handles comments.</b> Does the flow continue to step 4 in the same pass (as drawn), or restart at step 1?</li>
+        <li><b>Tracking by comment count.</b> Edited or deleted comments don't change the count, or change it the wrong way. Tracking comment IDs avoids this.</li>
+        <li><b>Stopping condition.</b> There is no limit on loops or on time spent waiting.</li>
+      </ol>
+    </div>
+  </div>
+</main>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: "base",
+    flowchart: { useMaxWidth: true, curve: "basis", nodeSpacing: 40, rankSpacing: 44, padding: 12 },
+    themeVariables: {
+      fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, Inter, sans-serif",
+      fontSize: "15px",
+      lineColor: "#8b949e", textColor: "#e6edf3", edgeLabelBackground: "#161b22",
+      primaryColor: "#1c2230", primaryTextColor: "#e6edf3", primaryBorderColor: "#30363d"
+    }
+  });
+  await mermaid.run({ querySelector: "pre.mermaid" });
+</script>
+</body>
+</html>
