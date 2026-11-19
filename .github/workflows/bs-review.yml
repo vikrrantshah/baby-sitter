@@ -1,0 +1,30 @@
+name: sandbox-review
+on:
+  pull_request:
+    types: [labeled]
+permissions:
+  pull-requests: write
+  contents: read
+jobs:
+  review:
+    if: github.event.label.name == 'bs-review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post review threads as github-actions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          jq -n --arg sha "$SHA" '{
+            commit_id: $sha,
+            event: "COMMENT",
+            body: "",
+            comments: [
+              {path: "sandbox/stats.py", line: 3, side: "RIGHT",
+               body: "`range(1, len(values))` skips the first element, so the average is wrong. Iterate over all values."},
+              {path: "sandbox/stats.py", line: 10, side: "RIGHT",
+               body: "`len(values) / 2` is a float in Python 3, so indexing raises TypeError. Also `values.sort()` mutates the caller list."}
+            ]
+          }' | gh api "repos/$REPO/pulls/$PR/reviews" --input -
