@@ -57,7 +57,7 @@ fn comment(v: &Value, viewer: &str) -> anyhow::Result<Comment> {
     ))
 }
 macro_rules! parse_enum { ($s:expr, $($name:literal => $value:expr),+ $(,)?) => { match $s { $($name => $value,)+ other => bail!("unknown value {other:?}") } }; }
-pub fn parse_snapshot(_pr: &PrRef, json: &[u8]) -> anyhow::Result<Snapshot> {
+pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
     let v: Value = serde_json::from_slice(json)?;
     if let Some(errors) = v["errors"].as_array().filter(|x| !x.is_empty()) {
         bail!("GraphQL errors: {errors:?}");
@@ -191,17 +191,10 @@ pub fn parse_snapshot(_pr: &PrRef, json: &[u8]) -> anyhow::Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn pr() -> PrRef {
-        PrRef {
-            owner: "cli".into(),
-            repo: "cli".into(),
-            number: 15102,
-        }
-    }
     #[test]
     fn parses_public_response_and_rejects_truncation() {
         let raw = include_bytes!("../tests/fixtures/cli-15102.json");
-        let snapshot = parse_snapshot(&pr(), raw).unwrap();
+        let snapshot = parse_snapshot(raw).unwrap();
         assert!(matches!(
             snapshot.threads[0].comments()[0].actor,
             Actor::Bot(_)
@@ -218,7 +211,7 @@ mod tests {
             modified["data"]["repository"]["pullRequest"][connection]["pageInfo"][page] =
                 Value::Bool(true);
             assert!(
-                parse_snapshot(&pr(), &serde_json::to_vec(&modified).unwrap())
+                parse_snapshot(&serde_json::to_vec(&modified).unwrap())
                     .unwrap_err()
                     .to_string()
                     .contains("truncated")
@@ -227,12 +220,12 @@ mod tests {
         let mut modified = original.clone();
         modified["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]["pageInfo"]
             ["hasPreviousPage"] = Value::Bool(true);
-        assert!(parse_snapshot(&pr(), &serde_json::to_vec(&modified).unwrap()).is_err());
+        assert!(parse_snapshot(&serde_json::to_vec(&modified).unwrap()).is_err());
         let mut modified = original;
         modified["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"] =
             Value::Null;
         assert_eq!(
-            parse_snapshot(&pr(), &serde_json::to_vec(&modified).unwrap())
+            parse_snapshot(&serde_json::to_vec(&modified).unwrap())
                 .unwrap()
                 .ci,
             Ci::NoChecks

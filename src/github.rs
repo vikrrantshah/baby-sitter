@@ -54,7 +54,7 @@ impl Gh {
             None,
             self.deadline,
         )?;
-        wire::parse_snapshot(&self.pr, out.as_bytes())
+        wire::parse_snapshot(out.as_bytes())
     }
     fn mutation(&self, query: &str, fields: &[(&str, &str)]) -> anyhow::Result<()> {
         let mut cmd = Command::new("gh");

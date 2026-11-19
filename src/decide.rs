@@ -1,5 +1,5 @@
 use crate::domain::*;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt};
 
 pub struct Facts<'a> {
     pub snap: &'a Snapshot,
@@ -18,6 +18,16 @@ pub enum Verdict {
     Wait(String),
     Act(Action),
 }
+impl fmt::Display for Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Done => f.write_str("merged"),
+            Self::Stop(reason) => write!(f, "stop: {reason}"),
+            Self::Wait(reason) => write!(f, "wait: {reason}"),
+            Self::Act(action) => write!(f, "{action}"),
+        }
+    }
+}
 #[derive(Debug, PartialEq)]
 pub enum Action {
     FastForward(Sha),
@@ -26,6 +36,30 @@ pub enum Action {
     UpdateBranch,
     Merge { head: Sha, method: MergeMethod },
 }
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FastForward(sha) => write!(f, "fast-forward to {}", &sha.as_str()[..7]),
+            Self::ResolveThreads(ids) => write!(f, "resolve {} fixed threads", ids.len()),
+            Self::HandleComments { batch, .. } => {
+                write!(f, "handle {} items", batch.0.len())?;
+                for (index, item) in batch.0.iter().enumerate() {
+                    write!(f, "{}{item}", if index == 0 { ": " } else { ", " })?;
+                }
+                Ok(())
+            }
+            Self::UpdateBranch => f.write_str("update branch"),
+            Self::Merge { head, method } => {
+                let method = match method {
+                    MergeMethod::Squash => "squash",
+                    MergeMethod::Merge => "merge",
+                    MergeMethod::Rebase => "rebase",
+                };
+                write!(f, "merge {} ({method})", &head.as_str()[..7])
+            }
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Batch(pub Vec<Item>);
 #[derive(Clone, Debug, PartialEq)]
@@ -33,7 +67,31 @@ pub struct Item {
     pub id: ItemId,
     pub answers: u64,
     pub rereview: Option<Login>,
+    pub actor: Actor,
+    pub url: String,
+    pub path: Option<String>,
+    pub line: Option<u32>,
     pub context: String,
+}
+impl fmt::Display for Item {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.id {
+            ItemId::Thread(id) => {
+                write!(f, "thread {}", self.path.as_deref().unwrap_or(&id.0))?;
+                if let Some(line) = self.line {
+                    write!(f, ":{line}")?;
+                }
+            }
+            ItemId::Comment(id) => write!(f, "comment #{}", id.0)?,
+            ItemId::Review(id) => write!(f, "review #{}", id.0)?,
+        }
+        let author = match &self.actor {
+            Actor::Human(login) | Actor::Bot(login) => login.0.as_str(),
+            Actor::Viewer => "viewer",
+            Actor::Ghost => "ghost",
+        };
+        write!(f, " ({author})")
+    }
 }
 struct Rule {
     name: &'static str,
@@ -137,7 +195,7 @@ pub fn explain(f: &Facts<'_>) -> String {
             "{} {:<20} {}\n",
             if first { "->" } else { "  " },
             r.name,
-            v.map_or_else(|| "pass".into(), |v| format!("{v:?}"))
+            v.map_or_else(|| "pass".into(), |v| v.to_string())
         ));
     }
     out.push_str(if fired {
@@ -193,8 +251,8 @@ fn local_diverged(f: &Facts<'_>) -> Option<Verdict> {
         )),
         Relation::Diverged => Some(Verdict::Stop(format!(
             "local head {} and PR head {} diverged",
-            f.local.head.as_str(),
-            f.snap.head.sha.as_str()
+            &f.local.head.as_str()[..7],
+            &f.snap.head.sha.as_str()[..7]
         ))),
         _ => None,
     }
@@ -316,6 +374,10 @@ fn unhandled(s: &Snapshot) -> Batch {
             id: ItemId::Thread(t.id.clone()),
             answers: newest.id.0,
             rereview: rereview(&newest.actor),
+            actor: newest.actor.clone(),
+            url: newest.url.clone(),
+            path: Some(t.path.clone()),
+            line: t.line,
             context,
         });
     }
@@ -326,6 +388,10 @@ fn unhandled(s: &Snapshot) -> Batch {
                 id,
                 answers: c.id.0,
                 rereview: rereview(&c.actor),
+                actor: c.actor.clone(),
+                url: c.url.clone(),
+                path: None,
+                line: None,
                 context: format!("PR comment by {:?} {}: {}", c.actor, c.url, c.body),
             });
         }
@@ -338,6 +404,10 @@ fn unhandled(s: &Snapshot) -> Batch {
                 id,
                 answers: r.id.0,
                 rereview: rereview(&r.actor),
+                actor: r.actor.clone(),
+                url: r.url.clone(),
+                path: None,
+                line: None,
                 context: format!(
                     "Review by {:?} {:?} {}: {}",
                     r.actor, r.state, r.url, r.body
@@ -423,6 +493,34 @@ mod tests {
     }
     fn tid() -> ItemId {
         ItemId::Thread(ThreadId("t".into()))
+    }
+    #[test]
+    fn verdict_displays_items_without_comment_bodies() {
+        let mut w = World::new();
+        w.snap.threads.push(
+            Thread::new(
+                ThreadId("t".into()),
+                false,
+                false,
+                "sandbox/stats.py".into(),
+                Some(3),
+                vec![comment(
+                    1,
+                    Actor::Bot(Login("github-actions".into())),
+                    "long body",
+                )],
+            )
+            .unwrap(),
+        );
+        w.snap.comments.push(comment(
+            123,
+            Actor::Human(Login("alice".into())),
+            "another body",
+        ));
+        assert_eq!(
+            w.decision().verdict.to_string(),
+            "handle 2 items: thread sandbox/stats.py:3 (github-actions), comment #123 (alice)"
+        );
     }
     #[test]
     fn bands_precede_the_next_band() {

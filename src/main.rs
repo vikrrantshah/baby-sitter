@@ -90,7 +90,7 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        eprintln!("[{}] {:?}", decision.rule, decision.verdict);
+        eprintln!("[{}] {}", decision.rule, decision.verdict);
         match decision.verdict {
             Verdict::Done => return Ok(()),
             Verdict::Stop(reason) => anyhow::bail!("{reason}"),

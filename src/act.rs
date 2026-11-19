@@ -65,13 +65,7 @@ pub fn execute(env: &Env, action: Action) -> anyhow::Result<()> {
                 env.git.push(&head.branch)?;
             }
             for r in &resolved {
-                let marker = Marker {
-                    item: r.item.id.clone(),
-                    outcome: r.outcome,
-                    answers: r.item.answers,
-                }
-                .render();
-                let body = format!("{}\n\n{marker}", r.reply);
+                let body = reply_body(r);
                 match &r.item.id {
                     ItemId::Thread(id) => env.gh.reply_to_thread(id, &body)?,
                     _ => env.gh.comment(&body)?,
@@ -93,6 +87,67 @@ pub fn execute(env: &Env, action: Action) -> anyhow::Result<()> {
                 eprintln!("baby-sitter: warning: re-review request failed: {e:#}");
             }
             Ok(())
+        }
+    }
+}
+
+fn reply_body(resolution: &codex::Resolution) -> String {
+    let marker = Marker {
+        item: resolution.item.id.clone(),
+        outcome: resolution.outcome,
+        answers: resolution.item.answers,
+    }
+    .render();
+    match (&resolution.item.id, &resolution.item.actor) {
+        (ItemId::Comment(_) | ItemId::Review(_), Actor::Human(login) | Actor::Bot(login)) => {
+            format!(
+                "In reply to @{}: {}\n\n{}\n\n{marker}",
+                login.0, resolution.item.url, resolution.reply
+            )
+        }
+        _ => format!("{}\n\n{marker}", resolution.reply),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decide::Item;
+
+    #[test]
+    fn top_level_replies_link_and_mention_the_author() {
+        for id in [
+            ItemId::Comment(CommentId(123)),
+            ItemId::Review(ReviewId(456)),
+        ] {
+            let resolution = codex::Resolution {
+                item: Item {
+                    id,
+                    answers: 123,
+                    rereview: None,
+                    actor: Actor::Human(Login("alice".into())),
+                    url: "https://github.com/o/r/pull/1#issuecomment-123".into(),
+                    path: None,
+                    line: None,
+                    context: String::new(),
+                },
+                outcome: Outcome::Fixed,
+                reply: "Fixed.".into(),
+            };
+            let body = reply_body(&resolution);
+            assert!(body.starts_with(
+                "In reply to @alice: https://github.com/o/r/pull/1#issuecomment-123\n\nFixed.\n\n"
+            ));
+            assert!(
+                body.ends_with(
+                    &Marker {
+                        item: resolution.item.id.clone(),
+                        outcome: Outcome::Fixed,
+                        answers: 123,
+                    }
+                    .render()
+                )
+            );
         }
     }
 }
