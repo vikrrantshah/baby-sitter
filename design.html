@@ -35,12 +35,13 @@
 <body>
 <main>
   <h1>PR Babysitter</h1>
-  <p class="sub">The control flow. Codex handles the steps inside the purple box; the script runs everything else.</p>
+  <p class="sub">The control flow. Codex handles the step inside the purple box; the binary runs everything else and does every git and GitHub write.</p>
   <div class="legend">
-    <span style="--c: var(--script)">Script</span>
+    <span style="--c: var(--script)">Binary</span>
     <span style="--c: var(--codex)">Codex</span>
     <span style="--c: var(--warn)">Decision</span>
-    <span style="--c: var(--gh)">Start / end</span>
+    <span style="--c: var(--gh)">Start / merged</span>
+    <span style="--c: #f85149">Stop</span>
   </div>
 
   <div class="layout">
@@ -48,44 +49,47 @@
 flowchart TD
   START([Start]):::term --> SNAP
 
-  SNAP["1 · Get snapshot"]:::script --> MC{{"2 · Merged or closed?"}}:::dec
-  MC -- yes --> END([End]):::term
-  MC -- no --> TH{{"3 · Unhandled open threads?<br/><small>new comments since last count</small>"}}:::dec
+  SNAP["1 · Take a snapshot<br/><small>PR and local checkout</small>"]:::script --> T{{"2 · Merged, closed, draft,<br/>conflicting, or CI failed?"}}:::dec
+  T -- merged --> DONE([Exit 0]):::term
+  T -- other --> STOP([Stop, exit 1]):::stop
+  T -- no --> L{{"3 · Local checkout in sync?"}}:::dec
+  L -- behind --> FF["Fast-forward"]:::script --> NEXT
+  L -- "dirty, ahead, or diverged" --> STOP
+  L -- yes --> RF{{"4 · Fixed threads still open?"}}:::dec
+  RF -- yes --> RES["Resolve them"]:::script --> NEXT
+  RF -- no --> UH{{"5 · Unanswered comments?"}}:::dec
 
-  TH -- yes --> HC
+  UH -- yes --> HC
   subgraph CODEX ["Codex"]
     direction TB
-    HC["Handle comments"]:::codex --> RC["Reply to comments"]:::codex
+    HC["Edit code, draft replies<br/><small>fixed, declined, or needs_human</small>"]:::codex
   end
-  RC --> RS["Resolve threads<br/><small>only where the last reply is mine</small>"]:::script
-  RS --> RQ["Request re-review"]:::script
-  RQ --> UTD
+  HC --> PUSH["Commit and push"]:::script --> REPLY["Post replies with markers"]:::script
+  REPLY --> RR["Request re-review"]:::script --> NEXT
   style CODEX fill:#1d1430,stroke:#a371f7,stroke-width:2px,color:#d2b8ff
-  TH -- no --> UTD
 
-  UTD{{"4 · Up to date with base?"}}:::dec
-  UTD -- no --> UP["Update PR"]:::script --> CI
-  UTD -- yes --> CI
-
-  CI{{"5 · CI green?"}}:::dec
-  CI -- yes --> MERGE["Merge"]:::script --> END
-  CI -- no --> WAIT["Wait 10s"]:::script --> SNAP
+  UH -- no --> BE{{"6 · Behind base?"}}:::dec
+  BE -- yes --> UP["Update branch"]:::script --> NEXT
+  BE -- no --> G{{"7 · Anything blocks the merge?<br/><small>CI pending, merge state, open threads,<br/>review requests, review decision</small>"}}:::dec
+  G -- yes --> WAIT["Wait --interval"]:::script --> NEXT
+  G -- no --> MERGE["Merge the snapshot's head SHA"]:::script --> NEXT
+  NEXT(("Next pass")):::script -.-> SNAP
 
   classDef script fill:#16263b,stroke:#4a90d9,color:#e6f0ff,stroke-width:1.5px
   classDef codex  fill:#2a1a45,stroke:#a371f7,color:#f3eaff,stroke-width:2px
   classDef dec    fill:#2e2614,stroke:#d29922,color:#fff3d6,stroke-width:1.5px
   classDef term   fill:#14301f,stroke:#3fb950,color:#e6ffed,stroke-width:2px
+  classDef stop   fill:#3a1618,stroke:#f85149,color:#ffe2e0,stroke-width:2px
     </pre></div>
 
     <div class="card">
-      <h2>Gaps to settle</h2>
+      <h2>Known limits</h2>
       <ol>
-        <li><b>CI red vs. CI pending.</b> Right now both lead to "wait 10s". A real failure would loop forever with nobody fixing it.</li>
-        <li><b>Update PR has merge conflicts.</b> There is no path for this yet.</li>
-        <li><b>Merge gate.</b> CI green alone triggers the merge, even if a re-review is still pending or a thread is still open.</li>
-        <li><b>After Codex handles comments.</b> Does the flow continue to step 4 in the same pass (as drawn), or restart at step 1?</li>
-        <li><b>Tracking by comment count.</b> Edited or deleted comments don't change the count, or change it the wrong way. Tracking comment IDs avoids this.</li>
-        <li><b>Stopping condition.</b> There is no limit on loops or on time spent waiting.</li>
+        <li><b>Failing CI and conflicts.</b> The binary stops and names the cause. It does not try to fix them.</li>
+        <li><b>Declined and needs_human threads.</b> They stay open, and the merge waits until a person replies or resolves them.</li>
+        <li><b>Lost re-review request.</b> If a run crashes after it posts replies, the request is not retried. The merge still waits on the review decision.</li>
+        <li><b>Large PRs.</b> More than 100 threads, comments, reviews, or review requests stops the run.</li>
+        <li><b>Merge queues.</b> Not supported. A queued PR stays open after the merge call.</li>
       </ol>
     </div>
   </div>
