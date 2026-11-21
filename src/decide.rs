@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fmt};
 
 pub struct Facts<'a> {
     pub snap: &'a Snapshot,
-    pub local: &'a LocalState,
+    pub local: Option<&'a LocalState>,
     pub method: MergeMethod,
 }
 #[derive(Debug, PartialEq)]
@@ -231,7 +231,7 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn local_upstream(f: &Facts<'_>) -> Option<Verdict> {
-    match &f.local.upstream_branch {
+    match &f.local?.upstream_branch {
         None => Some(Verdict::Stop("local branch has no upstream".into())),
         Some(b) if *b != f.snap.head.branch => Some(Verdict::Stop(format!(
             "wrong upstream branch {b}; expected {}",
@@ -241,24 +241,26 @@ fn local_upstream(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn local_dirty(f: &Facts<'_>) -> Option<Verdict> {
-    (!f.local.dirty.is_empty())
-        .then(|| Verdict::Stop(format!("local tree is dirty: {}", f.local.dirty.join(", "))))
+    let local = f.local?;
+    (!local.dirty.is_empty())
+        .then(|| Verdict::Stop(format!("local tree is dirty: {}", local.dirty.join(", "))))
 }
 fn local_diverged(f: &Facts<'_>) -> Option<Verdict> {
-    match f.local.relation {
+    let local = f.local?;
+    match local.relation {
         Relation::Ahead => Some(Verdict::Stop(
             "local branch has unpushed commits; push or reset".into(),
         )),
         Relation::Diverged => Some(Verdict::Stop(format!(
             "local head {} and PR head {} diverged",
-            &f.local.head.as_str()[..7],
+            &local.head.as_str()[..7],
             &f.snap.head.sha.as_str()[..7]
         ))),
         _ => None,
     }
 }
 fn local_behind(f: &Facts<'_>) -> Option<Verdict> {
-    (f.local.relation == Relation::Behind)
+    (f.local?.relation == Relation::Behind)
         .then(|| Verdict::Act(Action::FastForward(f.snap.head.sha.clone())))
 }
 fn resolve_fixed(f: &Facts<'_>) -> Option<Verdict> {
@@ -457,7 +459,7 @@ mod tests {
         fn decision(&self) -> Decision {
             decide(&Facts {
                 snap: &self.snap,
-                local: &self.local,
+                local: Some(&self.local),
                 method: MergeMethod::Squash,
             })
         }
@@ -493,6 +495,21 @@ mod tests {
     }
     fn tid() -> ItemId {
         ItemId::Thread(ThreadId("t".into()))
+    }
+    #[test]
+    fn merged_pr_needs_no_local_checkout() {
+        let mut w = World::new();
+        w.snap.lifecycle = Lifecycle::Merged;
+        let facts = Facts {
+            snap: &w.snap,
+            local: None,
+            method: MergeMethod::Squash,
+        };
+        assert_eq!(decide(&facts).verdict, Verdict::Done);
+        assert!(local_upstream(&facts).is_none());
+        assert!(local_dirty(&facts).is_none());
+        assert!(local_diverged(&facts).is_none());
+        assert!(local_behind(&facts).is_none());
     }
     #[test]
     fn verdict_displays_items_without_comment_bodies() {

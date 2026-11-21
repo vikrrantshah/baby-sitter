@@ -9,7 +9,7 @@ mod wire;
 
 use crate::{
     decide::{Facts, Verdict},
-    domain::{LocalState, MergeMethod, Snapshot},
+    domain::{Lifecycle, LocalState, MergeMethod, Snapshot},
 };
 use clap::Parser;
 use std::{
@@ -37,18 +37,22 @@ struct Cli {
 }
 struct Observation {
     snap: Snapshot,
-    local: LocalState,
+    local: Option<LocalState>,
 }
 impl Observation {
     fn take(env: &act::Env) -> anyhow::Result<Self> {
         let snap = env.gh.snapshot()?;
-        let local = env.git.observe(&snap.head.sha)?;
+        let local = if snap.lifecycle == Lifecycle::Open {
+            Some(env.git.observe(&snap.head.sha)?)
+        } else {
+            None
+        };
         Ok(Self { snap, local })
     }
     fn facts(&self, method: MergeMethod) -> Facts<'_> {
         Facts {
             snap: &self.snap,
-            local: &self.local,
+            local: self.local.as_ref(),
             method,
         }
     }
