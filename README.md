@@ -30,7 +30,7 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 | Flag | Default | Meaning |
 |---|---|---|
 | `--dry-run` | off | Print the verdict of every rule for the current snapshot, then exit. |
-| `--merge-method` | `squash` | `squash`, `merge`, or `rebase`. |
+| `--merge-method` | `squash` | `squash`, `merge`, or `rebase` for direct merges. Merge queues use their configured method. |
 | `--timeout` | `2h` | Deadline for the whole run, including every `gh`, `git`, and `codex` call. |
 | `--interval` | `10s` | Time between snapshots while the run waits. |
 
@@ -42,43 +42,47 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 
 ## Flow
 
-Each pass takes a fresh snapshot of the PR and the local checkout. The first rule that matches decides the pass. After any action, the next pass takes a new snapshot, so no step acts on stale data.
+Each pass takes a fresh snapshot of the PR. For an open PR, it also observes the local checkout. The first rule that matches decides the pass. After any action, the next pass takes a new snapshot, so no step acts on stale data.
 
 ```mermaid
 flowchart TD
-  START([Start]) --> SNAP["1 · Take a snapshot<br/>PR and local checkout"]
+  START([Start]) --> SNAP["1 · Take a snapshot<br/>PR and open PR checkout"]
   SNAP --> T{{"2 · Merged, closed, draft,<br/>conflicting, or CI failed?"}}
   T -- merged --> DONE([Exit 0])
   T -- other --> STOP([Stop, exit 1])
-  T -- no --> L{{"3 · Local checkout in sync?"}}
+  T -- no --> Q{{"3 · Queue status?"}}
+  Q -- queued --> WAIT["Wait --interval"] --> NEXT
+  Q -- "removed at current head" --> STOP
+  Q -- otherwise --> L{{"4 · Local checkout in sync?"}}
   L -- behind --> FF["Fast-forward"] --> NEXT
   L -- "dirty, ahead, or diverged" --> STOP
-  L -- yes --> RF{{"4 · Fixed threads still open?"}}
+  L -- yes --> RF{{"5 · Fixed threads still open?"}}
   RF -- yes --> RES["Resolve them"] --> NEXT
-  RF -- no --> UH{{"5 · Unanswered comments?"}}
+  RF -- no --> UH{{"6 · Unanswered comments?"}}
   UH -- yes --> HC
   subgraph CODEX ["Codex"]
     HC["Edit code, draft replies<br/>fixed, declined, or needs_human"]
   end
   HC --> PUSH["Commit and push"] --> REPLY["Post replies with markers"] --> RR["Request re-review"] --> NEXT
-  UH -- no --> BE{{"6 · Behind base?"}}
+  UH -- no --> BE{{"7 · Direct merge behind base?"}}
   BE -- yes --> UP["Update branch"] --> NEXT
-  BE -- no --> G{{"7 · Anything blocks the merge?"}}
-  G -- yes --> WAIT["Wait --interval"] --> NEXT
-  G -- no --> MERGE["Merge the snapshot's head SHA"] --> NEXT
+  BE -- no --> G{{"8 · Anything blocks the merge?"}}
+  G -- yes --> WAIT
+  G -- no --> MERGE["Merge or enqueue the snapshot's head SHA"] --> NEXT
   NEXT(("Next pass")) -.-> SNAP
 ```
 
-The rules live in one ordered table, `RULES` in `src/decide.rs`. The table order is the precedence. Merge is not a rule. It runs only when no rule matches.
+The rules live in one ordered table, `RULES` in `src/decide.rs`. The table order is the precedence. A direct merge or enqueue action runs only when no rule matches.
 
 | Step | Rules | Result when a rule matches |
 |---|---|---|
 | 2 | `merged`, `closed`, `draft`, `conflict`, `ci-failed` | Exit 0 for `merged`. Stop for the others. |
-| 3 | `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Fast-forward when behind. Stop for the others. |
-| 4 | `resolve-fixed` | Resolve threads whose newest marker says `fixed`. |
-| 5 | `unhandled-items` | Send the items to Codex, push, reply, and request re-review. |
-| 6 | `behind-base` | Run `gh pr update-branch`. |
-| 7 | `ci-pending`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision` | Wait, then take a new snapshot. |
+| 3 | `in-queue`, `dequeued` | Wait while queued. Stop if the current head was removed for a reason other than `merged`. |
+| 4 | `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Fast-forward when behind. Stop for the others. |
+| 5 | `resolve-fixed` | Resolve threads whose newest marker says `fixed`. |
+| 6 | `unhandled-items` | Send the items to Codex, push, reply, and request re-review. |
+| 7 | `behind-base` | Run `gh pr update-branch` for direct merges. Skip this rule for merge queues. |
+| 8 | `ci-pending`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision` | Wait, then take a new snapshot. |
 
 ## Comments and replies
 
@@ -119,16 +123,17 @@ A lock file at `$(git rev-parse --git-dir)/baby-sitter/pr-<n>.lock` stops a seco
 The binary merges only when all of these are true:
 
 - CI passed or the PR has no checks.
-- `mergeStateStatus` is `CLEAN` or `HAS_HOOKS`.
+- `mergeStateStatus` is `CLEAN` or `HAS_HOOKS`, or `BEHIND` when the base uses a merge queue.
 - No review threads are unresolved.
 - No review requests are pending.
 - `reviewDecision` is not `CHANGES_REQUESTED` or `REVIEW_REQUIRED`.
 
 The merge passes `--match-head-commit` with the SHA from the snapshot. If someone pushes in between, GitHub rejects the merge and the run stops.
 
+For a merge queue, the binary enqueues the snapshot's head SHA and uses the queue's configured merge method. It waits without handling new review feedback while the PR is queued because pushing would remove it from the queue. If the queue removes the current head without merging it, the run stops with the removal reason. A new head can be enqueued after the cause is fixed.
+
 ## Known limits
 
 - The binary does not fix failing CI or merge conflicts. It stops and names the cause.
 - A PR with more than 100 review threads, top-level comments, reviews, or review requests stops the run. The binary does not act on a partial view.
-- Merge queues are not supported. After `gh pr merge` adds the PR to a queue, the PR stays open.
 - A lost re-review request is not retried.
