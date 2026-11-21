@@ -94,7 +94,18 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        eprintln!("[{}] {}", decision.rule, decision.verdict);
+        if let (
+            Verdict::Act(decide::Action::Enqueue { .. }),
+            domain::MergeRoute::Queue { method },
+        ) = (&decision.verdict, observation.snap.route)
+        {
+            eprintln!(
+                "[{}] {} (queue merges with {method})",
+                decision.rule, decision.verdict
+            );
+        } else {
+            eprintln!("[{}] {}", decision.rule, decision.verdict);
+        }
         match decision.verdict {
             Verdict::Done => return Ok(()),
             Verdict::Stop(reason) => anyhow::bail!("{reason}"),
@@ -102,7 +113,7 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 std::thread::sleep(cli.interval.min(remaining));
             }
-            Verdict::Act(action) => act::execute(&env, action)?,
+            Verdict::Act(action) => act::execute(&env, action, &observation.snap.pr_id)?,
         }
     }
 }

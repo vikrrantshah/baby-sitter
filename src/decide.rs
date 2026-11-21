@@ -34,6 +34,7 @@ pub enum Action {
     ResolveThreads(Vec<ThreadId>),
     HandleComments { batch: Batch, head: Head },
     UpdateBranch,
+    Enqueue { head: Sha },
     Merge { head: Sha, method: MergeMethod },
 }
 impl fmt::Display for Action {
@@ -49,6 +50,7 @@ impl fmt::Display for Action {
                 Ok(())
             }
             Self::UpdateBranch => f.write_str("update branch"),
+            Self::Enqueue { head } => write!(f, "enqueue {}", &head.as_str()[..7]),
             Self::Merge { head, method } => {
                 let method = match method {
                     MergeMethod::Squash => "squash",
@@ -119,6 +121,14 @@ const RULES: &[Rule] = &[
         eval: ci_failed,
     },
     Rule {
+        name: "in-queue",
+        eval: in_queue,
+    },
+    Rule {
+        name: "dequeued",
+        eval: dequeued,
+    },
+    Rule {
         name: "local-upstream",
         eval: local_upstream,
     },
@@ -177,10 +187,19 @@ pub fn decide(f: &Facts<'_>) -> Decision {
             })
         })
         .unwrap_or_else(|| Decision {
-            rule: "merge",
-            verdict: Verdict::Act(Action::Merge {
-                head: f.snap.head.sha.clone(),
-                method: f.method,
+            rule: if matches!(f.snap.route, MergeRoute::Queue { .. }) {
+                "enqueue"
+            } else {
+                "merge"
+            },
+            verdict: Verdict::Act(match f.snap.route {
+                MergeRoute::Queue { .. } => Action::Enqueue {
+                    head: f.snap.head.sha.clone(),
+                },
+                MergeRoute::Direct => Action::Merge {
+                    head: f.snap.head.sha.clone(),
+                    method: f.method,
+                },
             }),
         })
 }
@@ -198,11 +217,16 @@ pub fn explain(f: &Facts<'_>) -> String {
             v.map_or_else(|| "pass".into(), |v| v.to_string())
         ));
     }
-    out.push_str(if fired {
-        "   merge (not reached)\n"
+    let action = if matches!(f.snap.route, MergeRoute::Queue { .. }) {
+        "enqueue"
     } else {
-        "-> merge\n"
-    });
+        "merge"
+    };
+    out.push_str(&format!(
+        "{} {action}{}\n",
+        if fired { "  " } else { "->" },
+        if fired { " (not reached)" } else { "" }
+    ));
     out
 }
 fn merged(f: &Facts<'_>) -> Option<Verdict> {
@@ -227,6 +251,25 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
             failing,
             ..
         } => Some(Verdict::Stop(format!("CI failed: {}", failing.join(", ")))),
+        _ => None,
+    }
+}
+fn in_queue(f: &Facts<'_>) -> Option<Verdict> {
+    match &f.snap.queue {
+        QueueStatus::Queued { state, position } => Some(Verdict::Wait(format!(
+            "in merge queue: position {position}, {state}"
+        ))),
+        _ => None,
+    }
+}
+fn dequeued(f: &Facts<'_>) -> Option<Verdict> {
+    match &f.snap.queue {
+        QueueStatus::Removed {
+            reason,
+            before_commit,
+        } if *before_commit == f.snap.head.sha && !reason.eq_ignore_ascii_case("merged") => {
+            Some(Verdict::Stop(format!("removed from merge queue: {reason}")))
+        }
         _ => None,
     }
 }
@@ -288,7 +331,8 @@ fn unhandled_items(f: &Facts<'_>) -> Option<Verdict> {
     })
 }
 fn behind_base(f: &Facts<'_>) -> Option<Verdict> {
-    (f.snap.merge_state == MergeState::Behind).then_some(Verdict::Act(Action::UpdateBranch))
+    (f.snap.merge_state == MergeState::Behind && f.snap.route == MergeRoute::Direct)
+        .then_some(Verdict::Act(Action::UpdateBranch))
 }
 fn ci_pending(f: &Facts<'_>) -> Option<Verdict> {
     match &f.snap.ci {
@@ -306,6 +350,7 @@ fn merge_state(f: &Facts<'_>) -> Option<Verdict> {
     }
     match f.snap.merge_state {
         MergeState::Clean | MergeState::HasHooks => None,
+        MergeState::Behind if matches!(f.snap.route, MergeRoute::Queue { .. }) => None,
         x => Some(Verdict::Wait(format!("merge state: {x:?}"))),
     }
 }
@@ -432,6 +477,9 @@ mod tests {
             let sha = Sha::parse(&"a".repeat(40)).unwrap();
             Self {
                 snap: Snapshot {
+                    pr_id: "PR_test".into(),
+                    route: MergeRoute::Direct,
+                    queue: QueueStatus::NotQueued,
                     author: Actor::Viewer,
                     lifecycle: Lifecycle::Open,
                     draft: false,
@@ -510,6 +558,73 @@ mod tests {
         assert!(local_dirty(&facts).is_none());
         assert!(local_diverged(&facts).is_none());
         assert!(local_behind(&facts).is_none());
+    }
+    #[test]
+    fn queue_waits_before_feedback_and_behind_base() {
+        let mut w = World::new();
+        w.snap.route = MergeRoute::Queue {
+            method: MergeMethod::Squash,
+        };
+        w.snap.queue = QueueStatus::Queued {
+            state: QueueEntryState::AwaitingChecks,
+            position: 2,
+        };
+        w.snap.merge_state = MergeState::Behind;
+        w.snap
+            .comments
+            .push(comment(3, Actor::Human(Login("bob".into())), "feedback"));
+        let decision = w.decision();
+        assert_eq!(decision.rule, "in-queue");
+        assert_eq!(
+            decision.verdict,
+            Verdict::Wait("in merge queue: position 2, awaiting checks".into())
+        );
+    }
+    #[test]
+    fn queue_removal_stops_only_at_the_removed_head() {
+        let mut w = World::new();
+        w.snap.route = MergeRoute::Queue {
+            method: MergeMethod::Squash,
+        };
+        w.snap.queue = QueueStatus::Removed {
+            reason: "checks failed".into(),
+            before_commit: w.snap.head.sha.clone(),
+        };
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Stop("removed from merge queue: checks failed".into())
+        );
+        w.snap.head.sha = Sha::parse(&"b".repeat(40)).unwrap();
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Act(Action::Enqueue {
+                head: w.snap.head.sha.clone()
+            })
+        );
+    }
+    #[test]
+    fn queue_behind_base_enqueues_and_direct_route_merges() {
+        let mut w = World::new();
+        w.snap.route = MergeRoute::Queue {
+            method: MergeMethod::Rebase,
+        };
+        w.snap.merge_state = MergeState::Behind;
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Act(Action::Enqueue {
+                head: w.snap.head.sha.clone()
+            })
+        );
+        w.snap.route = MergeRoute::Direct;
+        assert_eq!(w.decision().verdict, Verdict::Act(Action::UpdateBranch));
+        w.snap.merge_state = MergeState::Clean;
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Act(Action::Merge {
+                head: w.snap.head.sha.clone(),
+                method: MergeMethod::Squash
+            })
+        );
     }
     #[test]
     fn verdict_displays_items_without_comment_bodies() {

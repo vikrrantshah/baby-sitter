@@ -2,9 +2,13 @@ use crate::domain::*;
 use anyhow::{Context, bail};
 use serde_json::Value;
 
-pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!){
- viewer{login} repository(owner:$owner,name:$repo){pullRequest(number:$n){
- state isDraft headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision author{__typename login}
+pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$base:String!){
+ viewer{login} repository(owner:$owner,name:$repo){
+ mergeQueue(branch:$base){configuration{mergeMethod}}
+ pullRequest(number:$n){
+ id state isDraft headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision author{__typename login}
+ mergeQueueEntry{state position}
+ timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{__typename ... on RemovedFromMergeQueueEvent{reason beforeCommit{oid}}}}
  reviewRequests(first:100){pageInfo{hasNextPage} nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login} ... on Team{slug}}}}
  commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:100){nodes{__typename ... on CheckRun{name conclusion status} ... on StatusContext{context state}}}}}}}
  reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(last:100){pageInfo{hasPreviousPage} nodes{databaseId author{__typename login} body url}}}}
@@ -68,6 +72,38 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
     if p.is_null() {
         bail!("PR not found");
     }
+    let configuration = &data["repository"]["mergeQueue"];
+    let route = if configuration.is_null() {
+        MergeRoute::Direct
+    } else {
+        let method = parse_enum!(string(&configuration["configuration"], "mergeMethod")?,
+            "SQUASH" => MergeMethod::Squash, "MERGE" => MergeMethod::Merge, "REBASE" => MergeMethod::Rebase);
+        MergeRoute::Queue { method }
+    };
+    let entry = &p["mergeQueueEntry"];
+    let queue = if !entry.is_null() {
+        let state = parse_enum!(string(entry, "state")?,
+            "QUEUED" => QueueEntryState::Queued, "AWAITING_CHECKS" => QueueEntryState::AwaitingChecks,
+            "MERGEABLE" => QueueEntryState::Mergeable, "UNMERGEABLE" => QueueEntryState::Unmergeable,
+            "LOCKED" => QueueEntryState::Locked);
+        QueueStatus::Queued {
+            state,
+            position: u32::try_from(number(entry, "position")?)?,
+        }
+    } else {
+        let events = p["timelineItems"]["nodes"]
+            .as_array()
+            .context("missing queue timeline")?;
+        match events.last() {
+            Some(event) if string(event, "__typename")? == "RemovedFromMergeQueueEvent" => {
+                QueueStatus::Removed {
+                    reason: string(event, "reason")?.into(),
+                    before_commit: Sha::parse(string(&event["beforeCommit"], "oid")?)?,
+                }
+            }
+            _ => QueueStatus::NotQueued,
+        }
+    };
     let lifecycle = parse_enum!(string(p,"state")?, "OPEN" => Lifecycle::Open, "CLOSED" => Lifecycle::Closed, "MERGED" => Lifecycle::Merged);
     let mergeable = parse_enum!(string(p,"mergeable")?, "MERGEABLE" => Mergeable::Yes, "CONFLICTING" => Mergeable::Conflicting, "UNKNOWN" => Mergeable::Unknown);
     let merge_state = parse_enum!(string(p,"mergeStateStatus")?, "CLEAN" => MergeState::Clean, "BEHIND" => MergeState::Behind, "BLOCKED" => MergeState::Blocked, "DIRTY" => MergeState::Dirty, "DRAFT" => MergeState::Draft, "HAS_HOOKS" => MergeState::HasHooks, "UNKNOWN" => MergeState::Unknown, "UNSTABLE" => MergeState::Unstable);
@@ -173,6 +209,9 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
         reviews.push(Review { id: ReviewId(number(r,"databaseId")?), actor: actor(&r["author"], viewer)?, state: parse_enum!(string(r,"state")?, "APPROVED" => ReviewState::Approved, "CHANGES_REQUESTED" => ReviewState::ChangesRequested, "COMMENTED" => ReviewState::Commented, "DISMISSED" => ReviewState::Dismissed, "PENDING" => ReviewState::Pending), body: string(r,"body")?.into(), url: string(r,"url")?.into() });
     }
     Ok(Snapshot {
+        pr_id: string(p, "id")?.into(),
+        route,
+        queue,
         author: actor(&p["author"], viewer)?,
         lifecycle,
         draft: boolean(p, "isDraft")?,
@@ -229,6 +268,42 @@ mod tests {
                 .unwrap()
                 .ci,
             Ci::NoChecks
+        );
+    }
+    #[test]
+    fn parses_queue_route_entry_and_removal() {
+        let mut v: Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/cli-15102.json")).unwrap();
+        v["data"]["repository"]["mergeQueue"] =
+            serde_json::json!({"configuration":{"mergeMethod":"SQUASH"}});
+        v["data"]["repository"]["pullRequest"]["mergeQueueEntry"] =
+            serde_json::json!({"state":"AWAITING_CHECKS","position":3});
+        let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(
+            snapshot.route,
+            MergeRoute::Queue {
+                method: MergeMethod::Squash
+            }
+        );
+        assert_eq!(
+            snapshot.queue,
+            QueueStatus::Queued {
+                state: QueueEntryState::AwaitingChecks,
+                position: 3
+            }
+        );
+        v["data"]["repository"]["pullRequest"]["mergeQueueEntry"] = Value::Null;
+        v["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"] = serde_json::json!([{
+            "__typename":"RemovedFromMergeQueueEvent", "reason":"checks failed",
+            "beforeCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+        }]);
+        let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(
+            snapshot.queue,
+            QueueStatus::Removed {
+                reason: "checks failed".into(),
+                before_commit: Sha::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            }
         );
     }
 }
