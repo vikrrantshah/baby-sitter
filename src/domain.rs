@@ -19,42 +19,28 @@ impl Sha {
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ThreadId(pub String);
+impl fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "thread:{}", self.0)
+    }
+}
+impl FromStr for ThreadId {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        let id = s.strip_prefix("thread:").context("invalid thread id")?;
+        if id.is_empty() {
+            bail!("invalid thread id {s:?}");
+        }
+        Ok(Self(id.into()))
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommentId(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ReviewId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrRef {
     pub owner: String,
     pub repo: String,
     pub number: u64,
-}
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ItemId {
-    Thread(ThreadId),
-    Comment(CommentId),
-    Review(ReviewId),
-}
-impl fmt::Display for ItemId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Thread(id) => write!(f, "thread:{}", id.0),
-            Self::Comment(id) => write!(f, "comment:{}", id.0),
-            Self::Review(id) => write!(f, "review:{}", id.0),
-        }
-    }
-}
-impl FromStr for ItemId {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        let (kind, id) = s.split_once(':').context("invalid item id")?;
-        Ok(match kind {
-            "thread" if !id.is_empty() => Self::Thread(ThreadId(id.into())),
-            "comment" => Self::Comment(CommentId(id.parse()?)),
-            "review" => Self::Review(ReviewId(id.parse()?)),
-            _ => bail!("invalid item id {s:?}"),
-        })
-    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Actor {
@@ -180,7 +166,6 @@ pub struct Snapshot {
     pub review_requests: Vec<Reviewer>,
     pub ci: Ci,
     pub threads: Vec<Thread>,
-    pub comments: Vec<Comment>,
     pub reviews: Vec<Review>,
 }
 #[derive(Clone, Debug)]
@@ -221,7 +206,7 @@ impl Thread {
             .iter()
             .filter(|c| c.actor == Actor::Viewer)
             .map(|c| match &c.marker {
-                Some(m) if m.item == ItemId::Thread(self.id.clone()) => m.answers,
+                Some(m) if m.item == self.id => m.answers,
                 Some(_) => 0,
                 None => c.id.0,
             })
@@ -240,7 +225,7 @@ impl Thread {
             .iter()
             .rev()
             .filter_map(|c| c.marker.as_ref())
-            .find(|m| m.item == ItemId::Thread(self.id.clone()))
+            .find(|m| m.item == self.id)
     }
 }
 #[derive(Clone, Debug)]
@@ -266,17 +251,11 @@ impl Comment {
             marker,
         }
     }
-    pub fn marker(&self) -> Option<&Marker> {
-        self.marker.as_ref()
-    }
 }
 #[derive(Clone, Debug)]
 pub struct Review {
-    pub id: ReviewId,
     pub actor: Actor,
     pub state: ReviewState,
-    pub body: String,
-    pub url: String,
 }
 #[derive(Clone, Debug)]
 pub struct LocalState {
@@ -320,7 +299,7 @@ impl FromStr for Outcome {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Marker {
-    pub item: ItemId,
+    pub item: ThreadId,
     pub outcome: Outcome,
     pub answers: u64,
 }

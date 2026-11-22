@@ -1,5 +1,5 @@
 use crate::domain::*;
-use std::{collections::BTreeSet, fmt};
+use std::fmt;
 
 pub struct Facts<'a> {
     pub snap: &'a Snapshot,
@@ -66,26 +66,19 @@ impl fmt::Display for Action {
 pub struct Batch(pub Vec<Item>);
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
-    pub id: ItemId,
+    pub id: ThreadId,
     pub answers: u64,
     pub rereview: Option<Login>,
     pub actor: Actor,
-    pub url: String,
-    pub path: Option<String>,
+    pub path: String,
     pub line: Option<u32>,
     pub context: String,
 }
 impl fmt::Display for Item {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.id {
-            ItemId::Thread(id) => {
-                write!(f, "thread {}", self.path.as_deref().unwrap_or(&id.0))?;
-                if let Some(line) = self.line {
-                    write!(f, ":{line}")?;
-                }
-            }
-            ItemId::Comment(id) => write!(f, "comment #{}", id.0)?,
-            ItemId::Review(id) => write!(f, "review #{}", id.0)?,
+        write!(f, "thread {}", self.path)?;
+        if let Some(line) = self.line {
+            write!(f, ":{line}")?;
         }
         let author = match &self.actor {
             Actor::Human(login) | Actor::Bot(login) => login.0.as_str(),
@@ -375,17 +368,6 @@ fn review_decision(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn unhandled(s: &Snapshot) -> Batch {
-    let handled: BTreeSet<_> = s
-        .comments
-        .iter()
-        .filter_map(|c| c.marker())
-        .filter(|m| match &m.item {
-            ItemId::Comment(id) => id.0 == m.answers,
-            ItemId::Review(id) => id.0 == m.answers,
-            _ => false,
-        })
-        .map(|m| m.item.clone())
-        .collect();
     let rereview = |a: &Actor| match a {
         Actor::Human(l)
             if s.author != *a
@@ -418,49 +400,14 @@ fn unhandled(s: &Snapshot) -> Batch {
                 .join("\n")
         );
         items.push(Item {
-            id: ItemId::Thread(t.id.clone()),
+            id: t.id.clone(),
             answers: newest.id.0,
             rereview: rereview(&newest.actor),
             actor: newest.actor.clone(),
-            url: newest.url.clone(),
-            path: Some(t.path.clone()),
+            path: t.path.clone(),
             line: t.line,
             context,
         });
-    }
-    for c in &s.comments {
-        let id = ItemId::Comment(c.id);
-        if matches!(c.actor, Actor::Human(_)) && !handled.contains(&id) {
-            items.push(Item {
-                id,
-                answers: c.id.0,
-                rereview: rereview(&c.actor),
-                actor: c.actor.clone(),
-                url: c.url.clone(),
-                path: None,
-                line: None,
-                context: format!("PR comment by {:?} {}: {}", c.actor, c.url, c.body),
-            });
-        }
-    }
-    for r in &s.reviews {
-        let id = ItemId::Review(r.id);
-        if matches!(r.actor, Actor::Human(_)) && !r.body.trim().is_empty() && !handled.contains(&id)
-        {
-            items.push(Item {
-                id,
-                answers: r.id.0,
-                rereview: rereview(&r.actor),
-                actor: r.actor.clone(),
-                url: r.url.clone(),
-                path: None,
-                line: None,
-                context: format!(
-                    "Review by {:?} {:?} {}: {}",
-                    r.actor, r.state, r.url, r.body
-                ),
-            });
-        }
     }
     Batch(items)
 }
@@ -493,7 +440,6 @@ mod tests {
                     review_requests: vec![],
                     ci: Ci::NoChecks,
                     threads: vec![],
-                    comments: vec![],
                     reviews: vec![],
                 },
                 local: LocalState {
@@ -518,7 +464,7 @@ mod tests {
     fn bot(id: u64) -> Comment {
         comment(id, Actor::Bot(Login("bot".into())), "issue")
     }
-    fn marked(id: u64, item: ItemId, outcome: Outcome, answers: u64) -> Comment {
+    fn marked(id: u64, item: ThreadId, outcome: Outcome, answers: u64) -> Comment {
         comment(
             id,
             Actor::Viewer,
@@ -541,8 +487,8 @@ mod tests {
         )
         .unwrap()
     }
-    fn tid() -> ItemId {
-        ItemId::Thread(ThreadId("t".into()))
+    fn tid() -> ThreadId {
+        ThreadId("t".into())
     }
     #[test]
     fn merged_pr_needs_no_local_checkout() {
@@ -570,9 +516,7 @@ mod tests {
             position: 2,
         };
         w.snap.merge_state = MergeState::Behind;
-        w.snap
-            .comments
-            .push(comment(3, Actor::Human(Login("bob".into())), "feedback"));
+        w.snap.threads.push(thread(vec![bot(3)]));
         let decision = w.decision();
         assert_eq!(decision.rule, "in-queue");
         assert_eq!(
@@ -644,14 +588,9 @@ mod tests {
             )
             .unwrap(),
         );
-        w.snap.comments.push(comment(
-            123,
-            Actor::Human(Login("alice".into())),
-            "another body",
-        ));
         assert_eq!(
             w.decision().verdict.to_string(),
-            "handle 2 items: thread sandbox/stats.py:3 (github-actions), comment #123 (alice)"
+            "handle 1 items: thread sandbox/stats.py:3 (github-actions)"
         );
     }
     #[test]
@@ -666,18 +605,16 @@ mod tests {
             .push(thread(vec![bot(1), marked(2, tid(), Outcome::Fixed, 1)]));
         assert_eq!(w.decision().rule, "local-dirty");
         w.local.dirty.clear();
-        w.snap
-            .comments
-            .push(comment(3, Actor::Human(Login("bob".into())), "feedback"));
+        w.snap.threads.push(thread(vec![bot(3)]));
         assert_eq!(w.decision().rule, "resolve-fixed");
-        w.snap.threads.clear();
+        w.snap.threads.remove(0);
         w.snap.ci = Ci::Rollup {
             state: RollupState::Pending,
             failing: vec![],
             pending: vec![],
         };
         assert_eq!(w.decision().rule, "unhandled-items");
-        w.snap.comments.clear();
+        w.snap.threads.clear();
         assert_eq!(w.decision().rule, "ci-pending");
         w.snap.ci = Ci::NoChecks;
         assert_eq!(w.decision().rule, "merge");
@@ -705,29 +642,31 @@ mod tests {
         assert_eq!(w.decision().rule, "unresolved-threads");
         w.snap.threads = vec![thread(vec![bot(1), marked(2, tid(), Outcome::Fixed, 1)])];
         assert_eq!(w.decision().rule, "resolve-fixed");
+        w.snap.threads = vec![thread(vec![
+            bot(1),
+            comment(
+                2,
+                Actor::Viewer,
+                "<!-- baby-sitter:v1 item=thread:t outcome=fixed answers=1 -->",
+            ),
+        ])];
+        assert_eq!(w.decision().rule, "resolve-fixed");
     }
     #[test]
-    fn top_level_marker_handled_and_forgery_ignored() {
+    fn submitted_review_author_is_eligible_for_rereview() {
         let mut w = World::new();
-        let id = ItemId::Comment(CommentId(9));
+        let alice = Actor::Human(Login("alice".into()));
         w.snap
-            .comments
-            .push(comment(9, Actor::Human(Login("bob".into())), "feedback"));
-        w.snap
-            .comments
-            .push(marked(10, id.clone(), Outcome::Fixed, 9));
-        assert_eq!(w.decision().rule, "merge");
-        w.snap.comments[1] = comment(
-            10,
-            Actor::Human(Login("evil".into())),
-            &Marker {
-                item: id,
-                outcome: Outcome::Fixed,
-                answers: 9,
-            }
-            .render(),
-        );
-        assert_eq!(w.decision().rule, "unhandled-items");
+            .threads
+            .push(thread(vec![comment(1, alice.clone(), "feedback")]));
+        w.snap.reviews.push(Review {
+            actor: alice,
+            state: ReviewState::Commented,
+        });
+        let Verdict::Act(Action::HandleComments { batch, .. }) = w.decision().verdict else {
+            panic!("expected review thread");
+        };
+        assert_eq!(batch.0[0].rereview, Some(Login("alice".into())));
     }
     #[test]
     fn merge_requires_all_gates_and_unknown_reviewer_blocks() {

@@ -58,12 +58,12 @@ flowchart TD
   L -- "dirty, ahead, or diverged" --> STOP
   L -- yes --> RF{{"5 · Fixed threads still open?"}}
   RF -- yes --> RES["Resolve them"] --> NEXT
-  RF -- no --> UH{{"6 · Unanswered comments?"}}
+  RF -- no --> UH{{"6 · Unanswered review threads?"}}
   UH -- yes --> HC
   subgraph CODEX ["Codex"]
     HC["Edit code, draft replies<br/>fixed, declined, or needs_human"]
   end
-  HC --> PUSH["Commit and push"] --> REPLY["Post replies with markers"] --> RR["Request re-review"] --> NEXT
+  HC --> PUSH["Commit and push"] --> REPLY["Reply in threads with markers"] --> RR["Request re-review"] --> NEXT
   UH -- no --> BE{{"7 · Direct merge behind base?"}}
   BE -- yes --> UP["Update branch"] --> NEXT
   BE -- no --> G{{"8 · Anything blocks the merge?"}}
@@ -80,19 +80,15 @@ The rules live in one ordered table, `RULES` in `src/decide.rs`. The table order
 | 3 | `in-queue`, `dequeued` | Wait while queued. Stop if the current head was removed for a reason other than `merged`. |
 | 4 | `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Fast-forward when behind. Stop for the others. |
 | 5 | `resolve-fixed` | Resolve threads whose newest marker says `fixed`. |
-| 6 | `unhandled-items` | Send the items to Codex, push, reply, and request re-review. |
+| 6 | `unhandled-items` | Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
 | 7 | `behind-base` | Run `gh pr update-branch` for direct merges. Skip this rule for merge queues. |
 | 8 | `ci-pending`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision` | Wait, then take a new snapshot. |
 
-## Comments and replies
+## Review threads and replies
 
-The binary handles three kinds of items:
+The binary handles unresolved review threads from people and bots. It replies only in those threads and never posts a top-level PR comment.
 
-- Unresolved review threads from people and bots.
-- Top-level PR comments from people.
-- Non-empty review bodies from people.
-
-Codex gets every unanswered item in one batch. It edits files only and returns one result for each item: `fixed`, `declined`, or `needs_human`, with reply text. If Codex fails, times out, or returns a result that does not match the batch, the run stops before it writes anything.
+Codex gets every unanswered review thread in one batch. It edits files only and returns one result for each thread: `fixed`, `declined`, or `needs_human`, with reply text. If Codex fails, times out, or returns a result that does not match the batch, the run stops before it writes anything.
 
 Every reply ends with a hidden marker:
 
@@ -135,5 +131,5 @@ For a merge queue, the binary enqueues the snapshot's head SHA and uses the queu
 ## Known limits
 
 - The binary does not fix failing CI or merge conflicts. It stops and names the cause.
-- A PR with more than 100 review threads, top-level comments, reviews, or review requests stops the run. The binary does not act on a partial view.
+- A PR with more than 100 review threads, comments in a thread, reviews, or review requests stops the run. The binary does not act on a partial view.
 - A lost re-review request is not retried.

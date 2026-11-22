@@ -97,22 +97,6 @@ impl Gh {
             &[("id", &id.0)],
         )
     }
-    pub fn comment(&self, body: &str) -> anyhow::Result<()> {
-        proc::run(
-            Command::new("gh").args([
-                "pr",
-                "comment",
-                &self.number(),
-                "-R",
-                &self.repo(),
-                "--body-file",
-                "-",
-            ]),
-            Some(body),
-            self.deadline,
-        )?;
-        Ok(())
-    }
     pub fn request_reviewers(&self, users: &[Login]) -> anyhow::Result<()> {
         let path = format!(
             "repos/{}/pulls/{}/requested_reviewers",
