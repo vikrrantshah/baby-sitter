@@ -156,7 +156,7 @@ The binary merges only when all of these are true:
 - CI passed or the PR has no checks.
 - `mergeStateStatus` is `CLEAN` or `HAS_HOOKS`, or `BEHIND` when the base uses a merge queue.
 - No review threads are unresolved.
-- No review requests are pending.
+- No review requests are pending, unless GitHub already reports the PR approved. A re-review request the binary sent after fixing threads does not hold back an approved PR.
 - `reviewDecision` is not `CHANGES_REQUESTED` or `REVIEW_REQUIRED`.
 
 The merge passes `--match-head-commit` with the SHA from the snapshot. If someone pushes in between, GitHub rejects the merge and the run stops.

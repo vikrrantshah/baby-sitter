@@ -617,13 +617,16 @@ fn unresolved_threads(f: &Facts<'_>) -> Option<Verdict> {
         ))
     })
 }
+/// GitHub's `reviewDecision` already encodes the required approvals; once it is
+/// `Approved`, a still-pending request (often our own re-review request) no longer blocks.
 fn review_requests(f: &Facts<'_>) -> Option<Verdict> {
-    (!f.snap.review_requests.is_empty()).then(|| {
-        Verdict::Wait(format!(
-            "Waiting for review from {}",
-            names(f.snap.review_requests.iter())
-        ))
-    })
+    (!f.snap.review_requests.is_empty() && f.snap.review_decision != Some(ReviewDecision::Approved))
+        .then(|| {
+            Verdict::Wait(format!(
+                "Waiting for review from {}",
+                names(f.snap.review_requests.iter())
+            ))
+        })
 }
 fn review_decision(f: &Facts<'_>) -> Option<Verdict> {
     match f.snap.review_decision {
@@ -705,6 +708,7 @@ mod tests {
     #[test]
     fn review_requests_display_plain_names() {
         let mut w = World::new();
+        w.snap.review_decision = None;
         w.snap.review_requests = vec![
             Reviewer::User(Login("alice".into())),
             Reviewer::Bot(Login("bot".into())),
@@ -1069,6 +1073,12 @@ mod tests {
         let mut w = World::new();
         assert_eq!(w.decision().rule, "merge");
         w.snap.review_requests.push(Reviewer::Unknown);
+        assert_eq!(
+            w.decision().rule,
+            "merge",
+            "an approved PR merges past a pending request"
+        );
+        w.snap.review_decision = None;
         assert_eq!(w.decision().rule, "review-requests");
         w.snap.review_requests.clear();
         w.snap.review_decision = Some(ReviewDecision::ReviewRequired);
