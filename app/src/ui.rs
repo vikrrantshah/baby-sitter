@@ -6,7 +6,7 @@ use crate::{
     },
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
-    theme::{coral, dusk, glow, housing, mint, moon, night, rail},
+    theme::{accent, danger, divider, ink, muted, panel, raised, success, surface, warning},
 };
 use gpui_kit::{assets::IconName, component::StyledExt, prelude::FluentBuilder};
 use gpui_kit::{
@@ -14,7 +14,7 @@ use gpui_kit::{
         Disableable, Icon, Selectable, Sizable,
         button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
         input::{Input, InputEvent, InputState},
-        select::{Select, SelectEvent, SelectItem, SelectState},
+        select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
         switch::Switch,
         tooltip::Tooltip,
     },
@@ -79,12 +79,12 @@ pub struct AppView {
     repos: Load<Vec<RepoName>>,
     prs: Load<Vec<PrRow>>,
     repo_filter: Entity<InputState>,
-    org_select: Entity<SelectState<Vec<OrgChoice>>>,
+    org_select: Entity<SelectState<Vec<PickerChoice<String>>>>,
     org_filter: Option<String>,
     /// Owner login to its downloaded profile picture.
     avatars: BTreeMap<String, PathBuf>,
     scope: RepoScope,
-    dashboard_filter: Entity<SelectState<Vec<String>>>,
+    dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
     selected_filter: Option<RepoName>,
     inputs: BTreeMap<RepoName, RepoInputs>,
     states: BTreeMap<PrRef, SitState>,
@@ -124,9 +124,22 @@ impl AppView {
         };
         let repo_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter repositories"));
-        let dashboard_filter =
-            cx.new(|cx| SelectState::new(vec!["All repositories".to_string()], None, window, cx));
-        let org_select = cx.new(|cx| SelectState::new(vec![OrgChoice::ALL], None, window, cx));
+        let dashboard_filter = cx.new(|cx| {
+            SelectState::new(
+                vec![PickerChoice::all("All repositories", IconName::BookMarked)],
+                None,
+                window,
+                cx,
+            )
+        });
+        let org_select = cx.new(|cx| {
+            SelectState::new(
+                vec![PickerChoice::all("All organizations", IconName::Building2)],
+                None,
+                window,
+                cx,
+            )
+        });
         let subscriptions = vec![
             cx.subscribe(&repo_filter, |_: &mut Self, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -135,7 +148,7 @@ impl AppView {
             }),
             cx.subscribe(
                 &org_select,
-                |this: &mut Self, _, event: &SelectEvent<Vec<OrgChoice>>, cx| {
+                |this: &mut Self, _, event: &SelectEvent<Vec<PickerChoice<String>>>, cx| {
                     let SelectEvent::Confirm(value) = event;
                     this.org_filter = value.clone().flatten();
                     cx.notify();
@@ -143,9 +156,9 @@ impl AppView {
             ),
             cx.subscribe(
                 &dashboard_filter,
-                |this: &mut Self, _, event: &SelectEvent<Vec<String>>, cx| {
+                |this: &mut Self, _, event: &SelectEvent<Vec<PickerChoice<RepoName>>>, cx| {
                     let SelectEvent::Confirm(value) = event;
-                    this.selected_filter = value.as_ref().and_then(|s| s.parse().ok());
+                    this.selected_filter = value.clone().flatten();
                     cx.notify();
                 },
             ),
@@ -417,10 +430,11 @@ impl AppView {
         {
             self.org_filter = None;
         }
-        let mut choices = vec![OrgChoice::ALL];
-        choices.extend(owners.into_iter().map(|owner| OrgChoice {
-            avatar: self.avatars.get(&owner).cloned(),
-            owner: Some(owner),
+        let mut choices = vec![PickerChoice::all("All organizations", IconName::Building2)];
+        choices.extend(owners.into_iter().map(|owner| PickerChoice {
+            title: owner.clone().into(),
+            mark: Mark::Avatar(self.avatars.get(&owner).cloned()),
+            value: Some(owner),
         }));
         let selected = self.org_filter.clone();
         self.org_select.update(cx, |state, cx| {
@@ -454,6 +468,7 @@ impl AppView {
             let _ = view.update_in(cx, |this, window, cx| {
                 this.avatars.extend(fetched);
                 this.update_org_choices(window, cx);
+                this.update_filter(window, cx);
                 cx.notify();
             });
         }));
@@ -494,13 +509,13 @@ impl AppView {
         {
             self.selected_filter = None;
         }
-        let mut choices = vec!["All repositories".to_owned()];
-        choices.extend(repos.into_iter().map(|repo| repo.to_string()));
-        let selected = self
-            .selected_filter
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "All repositories".into());
+        let mut choices = vec![PickerChoice::all("All repositories", IconName::BookMarked)];
+        choices.extend(repos.into_iter().map(|repo| PickerChoice {
+            title: repo.to_string().into(),
+            mark: Mark::Avatar(self.avatars.get(&repo.owner).cloned()),
+            value: Some(repo),
+        }));
+        let selected = self.selected_filter.clone();
         self.dashboard_filter.update(cx, |state, cx| {
             state.set_items(choices, window, cx);
             state.set_selected_value(&selected, window, cx);
@@ -603,7 +618,7 @@ impl AppView {
         };
         let merged = Reading {
             level: STEPS.len(),
-            tip: mint(),
+            tip: success(),
             breathe: false,
             merged: true,
             verb: Some("Merged"),
@@ -612,55 +627,55 @@ impl AppView {
         match state {
             None => Reading {
                 level: 0,
-                tip: rail(),
+                tip: divider(),
                 breathe: false,
                 merged: false,
                 verb: None,
                 detail: None,
             },
             Some(SitState::Preparing) => {
-                reading(moon(), true, "Preparing", Some("Setting up the worktree"))
+                reading(ink(), true, "Preparing", Some("Setting up the worktree"))
             }
             Some(SitState::Running { last_line: None }) => {
-                reading(moon(), true, "Starting", Some("Taking the first snapshot"))
+                reading(ink(), true, "Starting", Some("Taking the first snapshot"))
             }
             Some(SitState::Running {
                 last_line: Some(line),
             }) => match model::parse_pass(line) {
                 Some(pass) => match pass.kind {
                     VerdictKind::Done => merged,
-                    VerdictKind::Wait => reading(glow(), true, "Waiting", Some(pass.detail)),
-                    VerdictKind::Act => reading(moon(), true, "Working", Some(pass.detail)),
-                    VerdictKind::Stop => reading(coral(), false, "Stopping", Some(pass.detail)),
+                    VerdictKind::Wait => reading(accent(), true, "Waiting", Some(pass.detail)),
+                    VerdictKind::Act => reading(ink(), true, "Working", Some(pass.detail)),
+                    VerdictKind::Stop => reading(danger(), false, "Stopping", Some(pass.detail)),
                 },
                 None => reading(
-                    moon(),
+                    ink(),
                     true,
                     "Running",
                     Some(line.strip_prefix("baby-sitter: ").unwrap_or(line)),
                 ),
             },
             Some(SitState::Cancelling) => reading(
-                dusk(),
+                muted(),
                 false,
                 "Cancelling",
                 Some("Waiting for the process to exit"),
             ),
             Some(SitState::Finished(Outcome::Merged)) => merged,
             Some(SitState::Finished(Outcome::TimedOut)) => reading(
-                glow(),
+                warning(),
                 false,
                 "Timed out",
                 Some("The deadline passed before the merge"),
             ),
             Some(SitState::Finished(Outcome::Stopped(reason))) => {
-                reading(coral(), false, "Stopped", Some(reason))
+                reading(danger(), false, "Stopped", Some(reason))
             }
             Some(SitState::Finished(Outcome::Cancelled)) => {
-                reading(dusk(), false, "Cancelled", None)
+                reading(muted(), false, "Cancelled", None)
             }
             Some(SitState::Finished(Outcome::Failed(reason))) => {
-                reading(coral(), false, "Failed", Some(reason))
+                reading(danger(), false, "Failed", Some(reason))
             }
         }
     }
@@ -708,7 +723,7 @@ impl AppView {
             .w_full()
             .px(px(ROW_INSET))
             .border_b_1()
-            .border_color(rail())
+            .border_color(divider())
             .flex()
             .items_center()
             .gap(px(20.))
@@ -717,7 +732,7 @@ impl AppView {
                     .flex_1()
                     .min_w_0()
                     .text_ellipsis()
-                    .text_color(moon())
+                    .text_color(ink())
                     .child(repo.name.clone()),
             )
             .when(count > 0, |row| {
@@ -727,9 +742,9 @@ impl AppView {
                         .px(px(8.))
                         .py(px(3.))
                         .rounded(px(12.))
-                        .bg(glow().opacity(0.12))
+                        .bg(accent().opacity(0.12))
                         .text_size(px(12.))
-                        .text_color(glow())
+                        .text_color(accent())
                         .child(if count == 1 {
                             "1 babysit running".to_owned()
                         } else {
@@ -802,9 +817,9 @@ impl AppView {
                                             .h(px(REPO_ROW_HEIGHT))
                                             .w_full()
                                             .px(px(ROW_INSET))
-                                            .bg(housing())
+                                            .bg(panel())
                                             .border_b_1()
-                                            .border_color(rail())
+                                            .border_color(divider())
                                             .flex()
                                             .items_center()
                                             .gap(px(20.))
@@ -821,7 +836,7 @@ impl AppView {
                                                             .min_w_0()
                                                             .font_semibold()
                                                             .text_ellipsis()
-                                                            .text_color(moon())
+                                                            .text_color(ink())
                                                             .child(name.clone()),
                                                     ),
                                             )
@@ -829,7 +844,7 @@ impl AppView {
                                                 div()
                                                     .flex_shrink_0()
                                                     .text_size(px(12.))
-                                                    .text_color(dusk())
+                                                    .text_color(muted())
                                                     .child(format!("{watched} of {total} watched")),
                                             )
                                             .into_any_element(),
@@ -847,7 +862,7 @@ impl AppView {
             let selected = self.scope == scope;
             Button::new(id).selected(selected).child(
                 div()
-                    .text_color(if selected { glow() } else { dusk() })
+                    .text_color(if selected { accent() } else { muted() })
                     .when(selected, |d| d.font_semibold())
                     .child(label),
             )
@@ -872,7 +887,7 @@ impl AppView {
             .px(px(ROW_INSET))
             .py(px(16.))
             .border_b_1()
-            .border_color(rail())
+            .border_color(divider())
             .flex()
             .items_center()
             .gap(px(12.))
@@ -894,14 +909,11 @@ impl AppView {
                 "Repositories",
                 Some("Babysits run only in the repositories you watch."),
             )
-            .child(
-                div().w(px(240.)).flex_shrink_0().child(
-                    Select::new(&self.org_select)
-                        .large()
-                        .accessibility_label("Filter by organization")
-                        .placeholder("All organizations"),
-                ),
-            ),
+            .child(header_picker(
+                &self.org_select,
+                "Filter by organization",
+                "All organizations",
+            )),
             body,
         )
     }
@@ -915,8 +927,8 @@ impl AppView {
                      input: &Entity<InputState>,
                      error: &Option<String>| {
             let note = match error {
-                Some(error) => div().text_color(coral()).child(error.clone()),
-                None => div().text_color(dusk()).child(hint),
+                Some(error) => div().text_color(danger()).child(error.clone()),
+                None => div().text_color(muted()).child(hint),
             };
             div()
                 .w_full()
@@ -935,7 +947,7 @@ impl AppView {
                                 .flex_shrink_0()
                                 .text_size(px(14.))
                                 .font_semibold()
-                                .text_color(moon())
+                                .text_color(ink())
                                 .child(label),
                         )
                         .child(
@@ -959,7 +971,7 @@ impl AppView {
             .pt(px(20.))
             .pb(px(20.))
             .border_b_1()
-            .border_color(rail())
+            .border_color(divider())
             .flex()
             .flex_col()
             .items_start()
@@ -986,13 +998,13 @@ impl AppView {
                             .text_size(px(24.))
                             .line_height(relative(1.2))
                             .font_semibold()
-                            .text_color(moon())
+                            .text_color(ink())
                             .child(repo.to_string()),
                     )
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(dusk())
+                            .text_color(muted())
                             .child("Applies to babysits you start from now on."),
                     ),
             );
@@ -1048,24 +1060,38 @@ impl AppView {
         let action = if active {
             let cancelling = matches!(state, Some(SitState::Cancelling));
             Some(
-                Button::new(SharedString::from(format!("cancel-{pr}")))
-                    .label(if cancelling { "Cancelling" } else { "Cancel" })
-                    .outline()
-                    .disabled(cancelling)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.ask_cancel(pr.clone(), window, cx)
-                    })),
+                round_button(
+                    SharedString::from(format!("cancel-{pr}")),
+                    IconName::Square,
+                    if cancelling {
+                        "Cancelling babysit"
+                    } else {
+                        "Cancel babysit"
+                    },
+                    muted(),
+                    danger(),
+                    cx,
+                )
+                .disabled(cancelling)
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.ask_cancel(pr.clone(), window, cx)),
+                ),
             )
         } else if reading.merged {
             None
         } else {
             Some(
-                Button::new(SharedString::from(format!("start-{pr}")))
-                    .label("Start")
-                    .primary()
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.start(pr.clone(), window, cx)),
-                    ),
+                round_button(
+                    SharedString::from(format!("start-{pr}")),
+                    IconName::Play,
+                    "Start babysit",
+                    accent(),
+                    accent(),
+                    cx,
+                )
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.start(pr.clone(), window, cx)),
+                ),
             )
         };
         let time_left = active
@@ -1079,8 +1105,8 @@ impl AppView {
             .text_size(px(16.))
             .line_height(relative(1.3))
             .font_semibold()
-            .text_color(moon())
-            .hover(|style| style.text_color(glow()))
+            .text_color(ink())
+            .hover(|style| style.text_color(accent()))
             .child(row.title.clone())
             .on_click(move |_, _, _| {
                 let url = url.clone();
@@ -1103,11 +1129,15 @@ impl AppView {
                     div()
                         .flex_shrink_0()
                         .font_medium()
-                        .text_color(if reading.merged { mint() } else { reading.tip })
+                        .text_color(if reading.merged {
+                            success()
+                        } else {
+                            reading.tip
+                        })
                         .child(verb),
                 )
                 .when_some(reading.detail.clone(), |line, detail| {
-                    line.child(div().min_w_0().text_color(moon()).child(detail))
+                    line.child(div().min_w_0().text_color(ink()).child(detail))
                 })
         });
         let path = sitter::worktree_path(&self.data, &row.pr);
@@ -1118,7 +1148,7 @@ impl AppView {
                 .items_center()
                 .gap(px(10.))
                 .text_size(px(12.))
-                .text_color(dusk())
+                .text_color(muted())
                 .child(div().min_w_0().text_ellipsis().child(shown))
                 .child(
                     Button::new(SharedString::from(format!("reveal-{}", row.pr)))
@@ -1143,7 +1173,7 @@ impl AppView {
             .flex_col()
             .gap(px(4.))
             .child(title)
-            .child(div().text_size(px(13.)).text_color(dusk()).child(place))
+            .child(div().text_size(px(13.)).text_color(muted()).child(place))
             .when_some(status, |d, status| d.child(div().pt(px(6.)).child(status)))
             .when_some(worktree, |d, worktree| d.child(worktree));
         div()
@@ -1151,7 +1181,7 @@ impl AppView {
             .flex_shrink_0()
             .py(px(18.))
             .border_b_1()
-            .border_color(rail())
+            .border_color(divider())
             .flex()
             .items_start()
             .gap(px(20.))
@@ -1164,7 +1194,7 @@ impl AppView {
                     .items_center()
                     .gap(px(16.))
                     .when_some(time_left, |d, left| {
-                        d.child(div().text_size(px(12.)).text_color(dusk()).child(left))
+                        d.child(div().text_size(px(12.)).text_color(muted()).child(left))
                     })
                     .when_some(action, |d, action| d.child(action)),
             )
@@ -1241,11 +1271,11 @@ impl AppView {
                 )
             }
         };
-        let header = header("Pull requests", None).child(
-            div()
-                .w(px(240.))
-                .child(Select::new(&self.dashboard_filter).placeholder("All repositories")),
-        );
+        let header = header("Pull requests", None).child(header_picker(
+            &self.dashboard_filter,
+            "Filter by repository",
+            "All repositories",
+        ));
         (header, list)
     }
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
@@ -1269,36 +1299,12 @@ impl AppView {
                         Page::Repositories
                     )
             );
-            Button::new(id)
-                .custom(
-                    ButtonCustomVariant::new(cx)
-                        .foreground(if selected { moon() } else { dusk() })
-                        .hover(rgb(0x222440).into())
-                        .active(rail()),
-                )
-                .w_full()
-                .h(px(34.))
-                .accessibility_label(label)
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .px(px(4.))
-                        .text_size(px(14.))
-                        .when(selected, |d| d.font_semibold())
-                        .child(Icon::new(icon).size_4().text_color(if selected {
-                            glow()
-                        } else {
-                            dusk()
-                        }))
-                        .child(label),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
+            sidebar_item(id, icon, label, selected, cx).on_click(cx.listener(
+                move |this, _, _, cx| {
                     this.page = page.clone();
                     cx.notify();
-                }))
+                },
+            ))
         };
         div()
             .w(px(SIDEBAR_WIDTH))
@@ -1306,9 +1312,9 @@ impl AppView {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .bg(housing())
+            .bg(panel())
             .border_r_1()
-            .border_color(rail())
+            .border_color(divider())
             .child(drag_area().h(px(52.)))
             .child(
                 div()
@@ -1321,7 +1327,7 @@ impl AppView {
                         div()
                             .text_size(px(18.))
                             .font_semibold()
-                            .text_color(moon())
+                            .text_color(ink())
                             .child("Baby Sitter"),
                     ),
             )
@@ -1331,10 +1337,10 @@ impl AppView {
                     .pt(px(20.))
                     .text_size(px(14.))
                     .line_height(relative(1.5))
-                    .text_color(dusk())
+                    .text_color(muted())
                     .child(watching)
                     .when(needs_you > 0, |d| {
-                        d.child(div().text_color(coral()).child(if needs_you == 1 {
+                        d.child(div().text_color(danger()).child(if needs_you == 1 {
                             "1 needs you.".to_owned()
                         } else {
                             format!("{needs_you} need you.")
@@ -1364,19 +1370,76 @@ impl AppView {
                     )),
             )
             .child(div().flex_1())
-            .child(
-                div().p(px(20.)).child(
-                    Button::new("refresh")
-                        .label("Refresh")
-                        .outline()
-                        .w_full()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.refresh(window, cx);
-                            cx.notify();
-                        })),
+            .child(div().p(px(12.)).pb(px(16.)).child(
+                sidebar_item("refresh", IconName::RefreshCw, "Refresh", false, cx).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.refresh(window, cx);
+                        cx.notify();
+                    }),
                 ),
-            )
+            ))
     }
+}
+
+/// A full-width sidebar row: an icon and a label, lit in the accent when selected.
+fn sidebar_item(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    selected: bool,
+    cx: &App,
+) -> Button {
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .foreground(if selected { ink() } else { muted() })
+                .hover(raised())
+                .active(divider()),
+        )
+        .w_full()
+        .h(px(34.))
+        .accessibility_label(label)
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .px(px(4.))
+                .text_size(px(14.))
+                .when(selected, |d| d.font_semibold())
+                .child(Icon::new(icon).size_4().text_color(if selected {
+                    accent()
+                } else {
+                    muted()
+                }))
+                .child(label),
+        )
+}
+/// A round icon-only button: tinted with `tint` at rest, filled further with `hover` under the pointer.
+fn round_button(
+    id: SharedString,
+    icon: IconName,
+    label: &'static str,
+    tint: Hsla,
+    hover: Hsla,
+    cx: &App,
+) -> Button {
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(tint)
+                .foreground(hover)
+                .hover(hover.opacity(0.3))
+                .active(hover.opacity(0.45)),
+        )
+        .rounded(px(17.))
+        .w(px(34.))
+        .h(px(34.))
+        .p_0()
+        .accessibility_label(label)
+        .tooltip(label)
+        .child(Icon::new(icon).size(px(14.)))
 }
 
 /// The page title row. Its empty space drags the window, since the title bar is hidden.
@@ -1390,7 +1453,7 @@ fn header(title: &'static str, detail: Option<&'static str>) -> Div {
         .items_start()
         .gap(px(16.))
         .border_b_1()
-        .border_color(rail())
+        .border_color(divider())
         .child(
             drag_area()
                 .flex_1()
@@ -1401,13 +1464,30 @@ fn header(title: &'static str, detail: Option<&'static str>) -> Div {
                     div()
                         .text_size(px(24.))
                         .font_semibold()
-                        .text_color(moon())
+                        .text_color(ink())
                         .child(title),
                 )
                 .when_some(detail, |d, detail| {
-                    d.child(div().text_size(px(13.)).text_color(dusk()).child(detail))
+                    d.child(div().text_size(px(13.)).text_color(muted()).child(detail))
                 }),
         )
+}
+/// The filter picker at the right of a page header. Every page uses this one so they match.
+fn header_picker<D>(
+    state: &Entity<SelectState<D>>,
+    label: &'static str,
+    placeholder: &'static str,
+) -> Div
+where
+    D: SelectDelegate,
+    <D::Item as SelectItem>::Value: PartialEq + Clone,
+{
+    div().w(px(240.)).flex_shrink_0().child(
+        Select::new(state)
+            .large()
+            .accessibility_label(label)
+            .placeholder(placeholder),
+    )
 }
 fn drag_area() -> Div {
     div().on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
@@ -1421,39 +1501,48 @@ fn time_left(seconds: u64) -> String {
         (h, m) => format!("{h}h {m}m left"),
     }
 }
+/// One choice in a header picker: an organization or repository with its owner's
+/// profile picture, or the "All …" choice with an icon.
 #[derive(Clone)]
-struct OrgChoice {
-    /// `None` is the "All organizations" choice.
-    owner: Option<String>,
-    avatar: Option<PathBuf>,
+struct PickerChoice<V> {
+    /// `None` is the "All …" choice.
+    value: Option<V>,
+    title: SharedString,
+    mark: Mark,
 }
-impl OrgChoice {
-    const ALL: Self = Self {
-        owner: None,
-        avatar: None,
-    };
+#[derive(Clone)]
+enum Mark {
+    Icon(IconName),
+    Avatar(Option<PathBuf>),
+}
+impl<V> PickerChoice<V> {
+    fn all(title: &'static str, icon: IconName) -> Self {
+        Self {
+            value: None,
+            title: title.into(),
+            mark: Mark::Icon(icon),
+        }
+    }
     fn row(&self) -> Div {
         div()
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(match self.owner {
-                Some(_) => avatar(self.avatar.as_ref(), 18.),
-                None => Icon::new(IconName::Building2)
+            .min_w_0()
+            .child(match &self.mark {
+                Mark::Avatar(path) => avatar(path.as_ref(), 18.),
+                Mark::Icon(icon) => Icon::new(*icon)
                     .size(px(18.))
-                    .text_color(dusk())
+                    .text_color(muted())
                     .into_any_element(),
             })
-            .child(self.title())
+            .child(div().min_w_0().text_ellipsis().child(self.title.clone()))
     }
 }
-impl SelectItem for OrgChoice {
-    type Value = Option<String>;
+impl<V: Clone + PartialEq + 'static> SelectItem for PickerChoice<V> {
+    type Value = Option<V>;
     fn title(&self) -> SharedString {
-        self.owner
-            .clone()
-            .unwrap_or_else(|| "All organizations".into())
-            .into()
+        self.title.clone()
     }
     fn display_title(&self) -> Option<AnyElement> {
         Some(self.row().into_any_element())
@@ -1462,7 +1551,7 @@ impl SelectItem for OrgChoice {
         self.row()
     }
     fn value(&self) -> &Self::Value {
-        &self.owner
+        &self.value
     }
 }
 /// A profile picture, or a blank tile of the same size until it downloads.
@@ -1477,11 +1566,11 @@ fn avatar(path: Option<&PathBuf>, size: f32) -> AnyElement {
             .size(px(size))
             .flex_shrink_0()
             .rounded(px(4.))
-            .bg(rail())
+            .bg(divider())
             .into_any_element(),
     }
 }
-/// The caretaker and the child: a lit disc holding a smaller mint one.
+/// The caretaker and the child: a lit disc holding a smaller light one.
 fn pair_mark() -> Div {
     div()
         .relative()
@@ -1495,7 +1584,7 @@ fn pair_mark() -> Div {
                 .left_0()
                 .size(px(16.))
                 .rounded_full()
-                .bg(glow()),
+                .bg(accent()),
         )
         .child(
             div()
@@ -1505,8 +1594,8 @@ fn pair_mark() -> Div {
                 .size(px(13.))
                 .rounded_full()
                 .border_2()
-                .border_color(housing())
-                .bg(mint()),
+                .border_color(panel())
+                .bg(ink()),
         )
 }
 /// A baby monitor's level meter: one segment per checklist step, lit up to the
@@ -1516,9 +1605,9 @@ fn meter(pr: &PrRef, reading: &Reading) -> AnyElement {
         let segment = div().w(px(20.)).h(px(5.)).rounded(px(1.));
         let position = index + 1;
         if reading.merged {
-            segment.bg(mint()).into_any_element()
+            segment.bg(success()).into_any_element()
         } else if position < reading.level {
-            segment.bg(glow()).into_any_element()
+            segment.bg(accent()).into_any_element()
         } else if position == reading.level && reading.breathe {
             segment
                 .bg(reading.tip)
@@ -1533,7 +1622,7 @@ fn meter(pr: &PrRef, reading: &Reading) -> AnyElement {
         } else if position == reading.level {
             segment.bg(reading.tip).into_any_element()
         } else {
-            segment.bg(rail()).into_any_element()
+            segment.bg(divider()).into_any_element()
         }
     });
     let tooltip: Option<SharedString> = if reading.merged {
@@ -1572,12 +1661,12 @@ fn message(title: &'static str, detail: Option<String>) -> Div {
         .gap(px(8.))
         .max_w(px(620.))
         .text_size(px(14.))
-        .text_color(dusk())
+        .text_color(muted())
         .child(
             div()
                 .text_size(px(16.))
                 .font_semibold()
-                .text_color(moon())
+                .text_color(ink())
                 .child(title),
         )
         .when_some(detail, |d, text| d.child(text))
@@ -1598,8 +1687,8 @@ impl Render for AppView {
         div()
             .size_full()
             .flex()
-            .bg(night())
-            .text_color(moon())
+            .bg(surface())
+            .text_color(ink())
             .child(self.render_sidebar(cx))
             .child(
                 div()
@@ -1617,8 +1706,8 @@ impl Render for AppView {
                                 .px(px(14.))
                                 .py(px(10.))
                                 .rounded(px(6.))
-                                .bg(coral().opacity(0.14))
-                                .text_color(coral())
+                                .bg(danger().opacity(0.14))
+                                .text_color(danger())
                                 .text_size(px(13.))
                                 .child(error),
                         )
