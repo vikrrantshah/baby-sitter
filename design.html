@@ -35,7 +35,7 @@
 <body>
 <main>
   <h1>PR Babysitter</h1>
-  <p class="sub">The control flow. Codex handles the step inside the purple box; the binary runs everything else and does every git and GitHub write.</p>
+  <p class="sub">Codex handles unanswered review threads inside the purple box. The binary replies only in threads, resolves fixed threads, and does every git and GitHub write.</p>
   <div class="legend">
     <span style="--c: var(--script)">Binary</span>
     <span style="--c: var(--codex)">Codex</span>
@@ -60,14 +60,14 @@ flowchart TD
   L -- "dirty, ahead, or diverged" --> STOP
   L -- yes --> RF{{"5 · Fixed threads still open?"}}:::dec
   RF -- yes --> RES["Resolve them"]:::script --> NEXT
-  RF -- no --> UH{{"6 · Unanswered comments?"}}:::dec
+  RF -- no --> UH{{"6 · Unanswered review threads?"}}:::dec
 
   UH -- yes --> HC
   subgraph CODEX ["Codex"]
     direction TB
     HC["Edit code, draft replies<br/><small>fixed, declined, or needs_human</small>"]:::codex
   end
-  HC --> PUSH["Commit and push"]:::script --> REPLY["Post replies with markers"]:::script
+  HC --> PUSH["Commit and push"]:::script --> REPLY["Reply in threads with markers"]:::script
   REPLY --> RR["Request re-review"]:::script --> NEXT
   style CODEX fill:#1d1430,stroke:#a371f7,stroke-width:2px,color:#d2b8ff
 
@@ -91,7 +91,7 @@ flowchart TD
         <li><b>Failing CI and conflicts.</b> The binary stops and names the cause. It does not try to fix them.</li>
         <li><b>Declined and needs_human threads.</b> They stay open, and the merge waits until a person replies or resolves them.</li>
         <li><b>Lost re-review request.</b> If a run crashes after it posts replies, the request is not retried. The merge still waits on the review decision.</li>
-        <li><b>Large PRs.</b> More than 100 threads, comments, reviews, or review requests stops the run.</li>
+        <li><b>Large PRs.</b> More than 100 threads, comments in a thread, reviews, or review requests stops the run.</li>
         <li><b>Queued feedback.</b> New review feedback waits until the PR leaves the queue. A push would remove the PR from the queue.</li>
       </ol>
     </div>
