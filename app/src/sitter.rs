@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use async_channel::Sender;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Read},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -53,6 +53,175 @@ pub fn worktree_path(data: &Path, pr: &PrRef) -> PathBuf {
 }
 fn clone_path(data: &Path, repo: &RepoName) -> PathBuf {
     data.join("repos").join(&repo.owner).join(&repo.name)
+}
+
+fn repo_lock(locks: &RepoLocks, repo: &RepoName) -> Arc<Mutex<()>> {
+    locks
+        .lock()
+        .unwrap()
+        .entry(repo.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn parse_worktree_path(root: &Path, path: &Path) -> Option<PrRef> {
+    let mut parts = path.strip_prefix(root).ok()?.components();
+    let owner = parts.next()?.as_os_str().to_str()?;
+    let repo = parts.next()?.as_os_str().to_str()?;
+    let dir = parts.next()?.as_os_str().to_str()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let number = dir.strip_prefix("pr-")?;
+    let pr: PrRef = format!("{owner}/{repo}#{number}").parse().ok()?;
+    (dir == format!("pr-{}", pr.number)).then_some(pr)
+}
+
+fn git_output(
+    env: &ChildEnv,
+    clone: &Path,
+    args: &[&std::ffi::OsStr],
+) -> Result<std::process::Output> {
+    let mut command = env.command("git");
+    command
+        .arg("-C")
+        .arg(clone)
+        .args(args)
+        .process_group(0)
+        .stdin(Stdio::null());
+    command.output().context("start git")
+}
+
+pub fn remove_merged_worktree(
+    env: &ChildEnv,
+    data: &Path,
+    locks: &RepoLocks,
+    pr: &PrRef,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let lock = repo_lock(locks, &pr.repo);
+    let _guard = lock
+        .lock()
+        .map_err(|error| anyhow::anyhow!("repository lock: {error}"))?;
+    let clone = clone_path(data, &pr.repo);
+    let worktree = worktree_path(data, pr);
+    let remove = git_output(
+        env,
+        &clone,
+        &[
+            "worktree".as_ref(),
+            "remove".as_ref(),
+            "--force".as_ref(),
+            worktree.as_os_str(),
+        ],
+    )?;
+    let branch = format!("baby-sitter/pr-{}", pr.number);
+    let reference = format!("refs/heads/{branch}");
+    let exists = git_output(
+        env,
+        &clone,
+        &[
+            "show-ref".as_ref(),
+            "--verify".as_ref(),
+            "--quiet".as_ref(),
+            reference.as_ref(),
+        ],
+    )?;
+    if exists.status.success() {
+        let deleted = git_output(
+            env,
+            &clone,
+            &["branch".as_ref(), "-D".as_ref(), branch.as_ref()],
+        )?;
+        if !deleted.status.success() {
+            bail!(
+                "delete branch: {}",
+                String::from_utf8_lossy(&deleted.stderr).trim()
+            );
+        }
+    } else if exists.status.code() != Some(1) {
+        bail!(
+            "check branch: {}",
+            String::from_utf8_lossy(&exists.stderr).trim()
+        );
+    }
+    let prune = git_output(env, &clone, &["worktree".as_ref(), "prune".as_ref()])?;
+    if !prune.status.success() {
+        bail!(
+            "prune worktrees: {}",
+            String::from_utf8_lossy(&prune.stderr).trim()
+        );
+    }
+    if !remove.status.success() && worktree.exists() {
+        let list = git_output(
+            env,
+            &clone,
+            &[
+                "worktree".as_ref(),
+                "list".as_ref(),
+                "--porcelain".as_ref(),
+                "-z".as_ref(),
+            ],
+        )?;
+        if !list.status.success() {
+            bail!(
+                "list worktrees: {}",
+                String::from_utf8_lossy(&list.stderr).trim()
+            );
+        }
+        if list
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|entry| entry.strip_prefix(b"worktree ") == Some(worktree.as_os_str().as_bytes()))
+        {
+            bail!(
+                "remove worktree: {}",
+                String::from_utf8_lossy(&remove.stderr).trim()
+            );
+        }
+        std::fs::remove_dir_all(&worktree).context("remove unregistered worktree")?;
+    }
+    Ok(())
+}
+
+pub fn sweep_merged(
+    env: &ChildEnv,
+    data: &Path,
+    locks: &RepoLocks,
+    keep: &BTreeSet<PrRef>,
+) -> Vec<PrRef> {
+    fn directories(path: &Path) -> impl Iterator<Item = PathBuf> {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|kind| kind.is_dir())
+                    .map(|_| entry.path())
+            })
+    }
+    let root = data.join("worktrees");
+    let mut removed = Vec::new();
+    for owner in directories(&root) {
+        for repo in directories(&owner) {
+            for path in directories(&repo) {
+                let Some(pr) = parse_worktree_path(&root, &path) else {
+                    continue;
+                };
+                if !keep.contains(&pr)
+                    && gh::pr_state(env, &pr.url()).is_ok_and(|state| state == "MERGED")
+                    && remove_merged_worktree(env, data, locks, &pr).is_ok()
+                {
+                    removed.push(pr);
+                }
+            }
+        }
+    }
+    removed
 }
 fn emit(tx: &Sender<SitEvent>, pr: &PrRef, state: SitState) {
     let _ = tx.send_blocking(SitEvent {
@@ -146,6 +315,7 @@ enum ReadEvent {
 enum ProcessMode {
     Capture,
     Sit,
+    #[cfg(test)]
     Quiet,
 }
 
@@ -314,12 +484,7 @@ impl Runner {
         Ok(output.stdout)
     }
     fn repo_lock(&self) -> Arc<Mutex<()>> {
-        self.locks
-            .lock()
-            .unwrap()
-            .entry(self.pr.repo.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        repo_lock(&self.locks, &self.pr.repo)
     }
     fn prepare(&self) -> Result<Option<Outcome>> {
         let head: gh::PrHead =
@@ -452,22 +617,6 @@ impl Runner {
             return Ok(outcome);
         }
     }
-    fn remove_worktree(&self) {
-        let worktree = worktree_path(&self.data, &self.pr);
-        if !worktree.exists() {
-            return;
-        }
-        let clone = clone_path(&self.data, &self.pr.repo);
-        let lock = self.repo_lock();
-        let Ok(_guard) = lock.lock() else { return };
-        let mut command = self.env.command("git");
-        command
-            .arg("-C")
-            .arg(clone)
-            .args(["worktree", "remove"])
-            .arg(worktree);
-        let _ = self.run(command, ProcessMode::Quiet);
-    }
 }
 
 pub fn spawn(
@@ -509,7 +658,7 @@ pub fn spawn(
             return;
         }
         if outcome == Outcome::Merged {
-            runner.remove_worktree();
+            let _ = remove_merged_worktree(&runner.env, &runner.data, &runner.locks, &runner.pr);
         }
         if QUITTING.load(Ordering::SeqCst) {
             return;
@@ -550,6 +699,104 @@ fn notify(env: &ChildEnv, pr: &PrRef, outcome: &Outcome) {
 mod tests {
     use super::*;
     use std::{fs, os::unix::process::CommandExt};
+    #[test]
+    fn parses_only_worktree_paths() {
+        let root = Path::new("/data/worktrees");
+        assert_eq!(
+            parse_worktree_path(root, Path::new("/data/worktrees/owner/repo/pr-42")),
+            Some(PrRef {
+                repo: "owner/repo".parse().unwrap(),
+                number: 42
+            })
+        );
+        assert_eq!(
+            parse_worktree_path(root, Path::new("/data/worktrees/owner/repo/pr-x")),
+            None
+        );
+        assert_eq!(
+            parse_worktree_path(root, Path::new("/data/worktrees/owner/repo/extra/pr-42")),
+            None
+        );
+        assert_eq!(
+            parse_worktree_path(root, Path::new("/data/worktrees/owner/pr-42")),
+            None
+        );
+    }
+
+    #[test]
+    fn removes_merged_worktree_with_untracked_files_and_branch() {
+        let data = std::env::temp_dir().join(format!(
+            "app-merged-worktree-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = data.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("git").args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let source_str = source.to_str().unwrap();
+        run(&["init", source_str]);
+        run(&[
+            "-C",
+            source_str,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let pr: PrRef = "owner/repo#42".parse().unwrap();
+        let clone = clone_path(&data, &pr.repo);
+        fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        run(&[
+            "clone",
+            "--no-checkout",
+            source_str,
+            clone.to_str().unwrap(),
+        ]);
+        let tree = worktree_path(&data, &pr);
+        fs::create_dir_all(tree.parent().unwrap()).unwrap();
+        run(&[
+            "-C",
+            clone.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "baby-sitter/pr-42",
+            tree.to_str().unwrap(),
+            "HEAD",
+        ]);
+        fs::write(tree.join("untracked"), "scratch").unwrap();
+        let locks = Arc::new(Mutex::new(BTreeMap::new()));
+        remove_merged_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
+        assert!(!tree.exists());
+        let status = Command::new("git")
+            .args([
+                "-C",
+                clone.to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/baby-sitter/pr-42",
+            ])
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        fs::remove_dir_all(data).unwrap();
+    }
+
     fn fixture(mode: &str) -> (Child, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "app-cancel-{}-{}-{mode}",

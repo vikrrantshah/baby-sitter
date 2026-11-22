@@ -5,6 +5,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     os::unix::fs::PermissionsExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -148,6 +149,19 @@ pub fn list_my_prs(env: &ChildEnv) -> Result<Vec<PrRow>> {
             updated_at: row.updated_at,
         })
         .collect())
+}
+
+pub fn pr_state(env: &ChildEnv, url: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct State {
+        state: String,
+    }
+    let mut command = env.command("gh");
+    command
+        .args(["pr", "view", url, "--json", "state"])
+        .process_group(0);
+    let state: State = serde_json::from_slice(&output(command)?).context("parse PR state")?;
+    Ok(state.state)
 }
 
 #[derive(Deserialize)]

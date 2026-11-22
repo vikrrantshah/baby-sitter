@@ -99,6 +99,8 @@ pub struct AppView {
     repo_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
+    sweep_task: Option<Task<()>>,
+    sweep_pending: bool,
 }
 
 impl AppView {
@@ -236,6 +238,8 @@ impl AppView {
             repo_task: None,
             avatar_task: None,
             pr_task: None,
+            sweep_task: None,
+            sweep_pending: false,
         };
         for (repo, settings) in this.config.repos.clone() {
             this.add_inputs(repo, &settings, window, cx);
@@ -485,11 +489,44 @@ impl AppView {
                 )
                 .await;
             let _ = view.update_in(cx, |this, window, cx| {
-                this.prs = match result {
-                    Ok(prs) => Load::Ready(prs),
-                    Err(error) => Load::Error(error),
-                };
+                match result {
+                    Ok(prs) => {
+                        this.prs = Load::Ready(prs);
+                        this.sweep_worktrees(window, cx);
+                    }
+                    Err(error) => this.prs = Load::Error(error),
+                }
                 this.update_filter(window, cx);
+                cx.notify();
+            });
+        }));
+    }
+    fn sweep_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sweep_task.is_some() {
+            self.sweep_pending = true;
+            return;
+        }
+        let Load::Ready(prs) = &self.prs else {
+            return;
+        };
+        let mut keep: BTreeSet<_> = prs.iter().map(|row| row.pr.clone()).collect();
+        keep.extend(
+            self.states
+                .iter()
+                .filter(|(_, state)| state.is_active())
+                .map(|(pr, _)| pr.clone()),
+        );
+        let env = self.env.clone();
+        let data = self.data.clone();
+        let locks = self.locks.clone();
+        self.sweep_task = Some(cx.spawn_in(window, async move |view, cx| {
+            cx.background_spawn(async move { sitter::sweep_merged(&env, &data, &locks, &keep) })
+                .await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.sweep_task = None;
+                if std::mem::take(&mut this.sweep_pending) {
+                    this.sweep_worktrees(window, cx);
+                }
                 cx.notify();
             });
         }));
