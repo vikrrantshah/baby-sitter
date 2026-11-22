@@ -1090,11 +1090,13 @@ impl AppView {
             .flatten()
             .map(|deadline| time_left(deadline.saturating_sub(model::unix_now())));
         let url = row.url.clone();
-        let open = icon_button(
+        let open = round_button(
             SharedString::from(format!("open-{}", row.pr)),
             IconName::Github,
             "Open on GitHub",
-            px(34.),
+            muted(),
+            ink(),
+            cx,
         )
         .on_click(move |_, _, _| {
             let url = url.clone();
