@@ -7,6 +7,7 @@ pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$
  mergeQueue(branch:$base){configuration{mergeMethod}}
  pullRequest(number:$n){
  id state isDraft headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision author{__typename login}
+ headRef{compare(headRef:$base){aheadBy}}
  mergeQueueEntry{state position}
  timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{__typename ... on RemovedFromMergeQueueEvent{reason beforeCommit{oid}}}}
  reviewRequests(first:100){pageInfo{hasNextPage} nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login} ... on Team{slug}}}}
@@ -242,6 +243,8 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
         head,
         mergeable,
         merge_state,
+        // Null when the head branch is gone or GitHub cannot compare; only draft updates need it.
+        commits_behind: p["headRef"]["compare"]["aheadBy"].as_u64(),
         review_decision,
         review_requests: requests,
         ci,
@@ -262,6 +265,17 @@ mod tests {
             "oid": p["headRefOid"], "message":"existing commit"
         }}]});
         v
+    }
+    #[test]
+    fn parses_commits_behind_and_missing_head_ref() {
+        let mut v = fixture();
+        let p = &mut v["data"]["repository"]["pullRequest"];
+        p["headRef"] = serde_json::json!({"compare": {"aheadBy": 3}});
+        let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(snapshot.commits_behind, Some(3));
+        v["data"]["repository"]["pullRequest"]["headRef"] = Value::Null;
+        let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(snapshot.commits_behind, None);
     }
     #[test]
     fn top_level_feedback_does_not_block_merge() {

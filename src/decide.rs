@@ -171,11 +171,6 @@ const RULES: &[Rule] = &[
         eval: closed,
     },
     Rule {
-        name: "draft",
-        gate: Gate::Merge,
-        eval: draft,
-    },
-    Rule {
         name: "conflict",
         gate: Gate::Branch,
         eval: conflict,
@@ -259,6 +254,11 @@ const RULES: &[Rule] = &[
         name: "review-decision",
         gate: Gate::Reviews,
         eval: review_decision,
+    },
+    Rule {
+        name: "draft",
+        gate: Gate::Merge,
+        eval: draft,
     },
 ];
 /// The four requirements a PR meets on its way to merged, as reported by `--gates`.
@@ -415,8 +415,9 @@ fn closed(f: &Facts<'_>) -> Option<Verdict> {
         .then(|| Verdict::Stop("PR was closed without merging".into()))
 }
 fn draft(f: &Facts<'_>) -> Option<Verdict> {
-    (f.snap.draft || f.snap.merge_state == MergeState::Draft)
-        .then(|| Verdict::Stop("PR is still a draft".into()))
+    (f.snap.draft || f.snap.merge_state == MergeState::Draft).then(|| {
+        Verdict::Wait("Draft: everything else is done. Mark it ready for review to merge.".into())
+    })
 }
 fn conflict(f: &Facts<'_>) -> Option<Verdict> {
     (f.snap.mergeable == Mergeable::Conflicting || f.snap.merge_state == MergeState::Dirty)
@@ -568,8 +569,11 @@ fn fix_ci(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn behind_base(f: &Facts<'_>) -> Option<Verdict> {
-    (f.snap.merge_state == MergeState::Behind && f.snap.route == MergeRoute::Direct)
-        .then_some(Verdict::Act(Action::UpdateBranch))
+    (f.snap.route == MergeRoute::Direct
+        && (f.snap.merge_state == MergeState::Behind
+            || (f.snap.merge_state == MergeState::Draft
+                && f.snap.commits_behind.is_some_and(|count| count > 0))))
+    .then_some(Verdict::Act(Action::UpdateBranch))
 }
 fn ci_pending(f: &Facts<'_>) -> Option<Verdict> {
     match &f.snap.ci {
@@ -592,17 +596,16 @@ fn merge_state(f: &Facts<'_>) -> Option<Verdict> {
         ));
     }
     match f.snap.merge_state {
-        MergeState::Clean | MergeState::HasHooks => None,
+        MergeState::Clean | MergeState::HasHooks | MergeState::Draft => None,
         MergeState::Behind if matches!(f.snap.route, MergeRoute::Queue { .. }) => None,
         state => Some(Verdict::Wait(
             match state {
                 MergeState::Behind => "Branch is behind its base",
                 MergeState::Blocked => "Waiting for branch protection rules to allow the merge",
                 MergeState::Dirty => "PR has merge conflicts with its base branch",
-                MergeState::Draft => "PR is still a draft",
                 MergeState::Unknown => "Waiting for GitHub to work out the merge state",
                 MergeState::Unstable => "Waiting: some checks are failing or still running",
-                MergeState::Clean | MergeState::HasHooks => unreachable!(),
+                MergeState::Clean | MergeState::HasHooks | MergeState::Draft => unreachable!(),
             }
             .into(),
         )),
@@ -747,6 +750,7 @@ mod tests {
                     },
                     mergeable: Mergeable::Yes,
                     merge_state: MergeState::Clean,
+                    commits_behind: None,
                     review_decision: Some(ReviewDecision::Approved),
                     review_requests: vec![],
                     ci: Ci::NoChecks,
@@ -910,8 +914,7 @@ mod tests {
         let mut w = World::new();
         w.snap.draft = true;
         w.local.dirty.push("x".into());
-        assert_eq!(w.decision().rule, "draft");
-        w.snap.draft = false;
+        assert_eq!(w.decision().rule, "local-dirty");
         w.snap
             .threads
             .push(thread(vec![bot(1), marked(2, tid(), Outcome::Fixed, 1)]));
@@ -929,7 +932,77 @@ mod tests {
         w.snap.threads.clear();
         assert_eq!(w.decision().rule, "ci-pending");
         w.snap.ci = Ci::NoChecks;
+        assert_eq!(w.decision().rule, "draft");
+        w.snap.draft = false;
         assert_eq!(w.decision().rule, "merge");
+    }
+    #[test]
+    fn draft_waits_until_ready_then_merges() {
+        let mut w = World::new();
+        w.snap.draft = true;
+        w.snap.merge_state = MergeState::Draft;
+        let decision = w.decision();
+        assert_eq!(decision.rule, "draft");
+        assert_eq!(
+            decision.verdict,
+            Verdict::Wait(
+                "Draft: everything else is done. Mark it ready for review to merge.".into()
+            )
+        );
+        let facts = Facts {
+            snap: &w.snap,
+            local: Some(&w.local),
+            method: MergeMethod::Squash,
+        };
+        assert_eq!(
+            gates(&facts).to_string(),
+            "reviews=met checks=met branch=met merge=waiting"
+        );
+        w.snap.draft = false;
+        w.snap.merge_state = MergeState::Clean;
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Act(Action::Merge {
+                head: w.snap.head.sha.clone(),
+                method: MergeMethod::Squash,
+            })
+        );
+    }
+    #[test]
+    fn draft_work_precedes_waiting_for_ready() {
+        let mut w = World::new();
+        w.snap.draft = true;
+        w.snap.merge_state = MergeState::Draft;
+        w.snap.commits_behind = Some(3);
+        assert_eq!(w.decision().verdict, Verdict::Act(Action::UpdateBranch));
+        w.snap.route = MergeRoute::Queue {
+            method: MergeMethod::Squash,
+        };
+        assert_eq!(w.decision().rule, "draft");
+        w.snap.route = MergeRoute::Direct;
+        w.snap.commits_behind = Some(0);
+        let checks = vec![FailedCheck {
+            name: "build".into(),
+            source: CheckSource::Actions { job_id: 17 },
+        }];
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Failure,
+            failing: checks.clone(),
+            pending: vec![],
+        };
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Act(Action::FixCi {
+                checks,
+                head: w.snap.head.clone()
+            })
+        );
+        w.snap.threads.push(thread(vec![bot(1)]));
+        assert_eq!(w.decision().rule, "unhandled-items");
+        assert!(matches!(
+            w.decision().verdict,
+            Verdict::Act(Action::HandleComments { .. })
+        ));
     }
     #[test]
     fn failing_ci_waits_for_pending_checks_before_checking_the_attempt_limit() {

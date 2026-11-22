@@ -188,6 +188,7 @@ pub struct Snapshot {
     pub head: Head,
     pub mergeable: Mergeable,
     pub merge_state: MergeState,
+    pub commits_behind: Option<u64>,
     pub review_decision: Option<ReviewDecision>,
     pub review_requests: Vec<Reviewer>,
     pub ci: Ci,

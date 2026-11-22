@@ -45,12 +45,15 @@ enum SettingsPage {
 #[derive(Clone, Copy)]
 enum Field {
     Timeout,
+    DraftTimeout,
     Interval,
 }
 struct RepoInputs {
     timeout: Entity<InputState>,
+    draft_timeout: Entity<InputState>,
     interval: Entity<InputState>,
     timeout_error: Option<String>,
+    draft_timeout_error: Option<String>,
     interval_error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -109,6 +112,7 @@ pub struct AppView {
     repo_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
+    ready_tasks: BTreeMap<PrRef, Task<()>>,
     sweep_task: Option<Task<()>>,
     sweep_pending: bool,
 }
@@ -280,6 +284,7 @@ impl AppView {
             repo_task: None,
             avatar_task: None,
             pr_task: None,
+            ready_tasks: BTreeMap::new(),
             sweep_task: None,
             sweep_pending: false,
         };
@@ -319,11 +324,19 @@ impl AppView {
         let timeout = cx.new(|cx| {
             InputState::new(window, cx).default_value(model::format_duration(settings.timeout))
         });
+        let draft_timeout = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(model::format_duration(settings.draft_timeout))
+        });
         let interval = cx.new(|cx| {
             InputState::new(window, cx).default_value(model::format_duration(settings.interval))
         });
         let mut subscriptions = Vec::new();
-        for (input, field) in [(&timeout, Field::Timeout), (&interval, Field::Interval)] {
+        for (input, field) in [
+            (&timeout, Field::Timeout),
+            (&draft_timeout, Field::DraftTimeout),
+            (&interval, Field::Interval),
+        ] {
             let repo = repo.clone();
             subscriptions.push(cx.subscribe_in(
                 input,
@@ -341,8 +354,10 @@ impl AppView {
             repo,
             RepoInputs {
                 timeout,
+                draft_timeout,
                 interval,
                 timeout_error: None,
+                draft_timeout_error: None,
                 interval_error: None,
                 _subscriptions: subscriptions,
             },
@@ -361,6 +376,7 @@ impl AppView {
                 let previous = self.config.repos.get_mut(repo).and_then(|settings| {
                     let value = match field {
                         Field::Timeout => &mut settings.timeout,
+                        Field::DraftTimeout => &mut settings.draft_timeout,
                         Field::Interval => &mut settings.interval,
                     };
                     if *value == duration {
@@ -375,12 +391,14 @@ impl AppView {
                 {
                     match field {
                         Field::Timeout => settings.timeout = previous,
+                        Field::DraftTimeout => settings.draft_timeout = previous,
                         Field::Interval => settings.interval = previous,
                     }
                 }
                 if let Some(inputs) = self.inputs.get_mut(repo) {
                     match field {
                         Field::Timeout => inputs.timeout_error = None,
+                        Field::DraftTimeout => inputs.draft_timeout_error = None,
                         Field::Interval => inputs.interval_error = None,
                     }
                 }
@@ -389,6 +407,7 @@ impl AppView {
                 if let Some(inputs) = self.inputs.get_mut(repo) {
                     match field {
                         Field::Timeout => inputs.timeout_error = Some(error),
+                        Field::DraftTimeout => inputs.draft_timeout_error = Some(error),
                         Field::Interval => inputs.interval_error = Some(error),
                     }
                 }
@@ -570,6 +589,41 @@ impl AppView {
             });
         }));
     }
+    fn mark_ready(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ready_tasks.contains_key(&pr) {
+            return;
+        }
+        let env = self.env.clone();
+        let task_pr = pr.clone();
+        let task = cx.spawn_in(window, async move |view, cx| {
+            let request_pr = task_pr.clone();
+            let result = cx
+                .background_spawn(async move { gh::mark_ready(&env, &request_pr) })
+                .await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.ready_tasks.remove(&task_pr);
+                match result {
+                    Ok(()) => {
+                        if let Load::Ready(rows) = &mut this.prs
+                            && let Some(row) = rows.iter_mut().find(|row| row.pr == task_pr)
+                        {
+                            row.is_draft = false;
+                        }
+                        this.load_prs(window, cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!(
+                            "Could not mark #{} ready for review: {error}",
+                            task_pr.number
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.ready_tasks.insert(pr, task);
+        cx.notify();
+    }
     fn sweep_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sweep_task.is_some() {
             self.sweep_pending = true;
@@ -664,7 +718,13 @@ impl AppView {
         let Some(settings) = self.config.repos.get(&pr.repo) else {
             return;
         };
-        let Some(deadline) = model::unix_now().checked_add(settings.timeout.as_secs()) else {
+        let timeout = if matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|row| row.pr == pr && row.is_draft))
+        {
+            settings.draft_timeout
+        } else {
+            settings.timeout
+        };
+        let Some(deadline) = model::unix_now().checked_add(timeout.as_secs()) else {
             self.error = Some("Timeout is too large".into());
             cx.notify();
             return;
@@ -1160,6 +1220,12 @@ impl AppView {
                             &inputs.timeout_error,
                         ))
                         .child(field(
+                            "Draft timeout",
+                            "How long to babysit a draft pull request.",
+                            &inputs.draft_timeout,
+                            &inputs.draft_timeout_error,
+                        ))
+                        .child(field(
                             "Interval",
                             "How long to wait between checks, for example 30s.",
                             &inputs.interval,
@@ -1241,6 +1307,23 @@ impl AppView {
             .then(|| self.config.active.get(&row.pr))
             .flatten()
             .map(|deadline| time_left(deadline.saturating_sub(model::unix_now())));
+        let ready = row.is_draft.then(|| {
+            let pr = row.pr.clone();
+            round_button_with(
+                SharedString::from(format!("ready-{pr}")),
+                Icon::empty()
+                    .path("icons/git-pull-request-arrow.svg")
+                    .size(px(14.)),
+                "Ready for review",
+                muted(),
+                ink(),
+                cx,
+            )
+            .disabled(self.ready_tasks.contains_key(&pr))
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.mark_ready(pr.clone(), window, cx)),
+            )
+        });
         let url = row.url.clone();
         let open = round_button(
             SharedString::from(format!("open-{}", row.pr)),
@@ -1388,9 +1471,13 @@ impl AppView {
                     })
                     .map(|d| match (action, dismiss) {
                         // The rightmost slot holds the row's main action; a merged row's is Dismiss.
-                        (None, Some(dismiss)) => d.child(open).child(dismiss),
+                        (None, Some(dismiss)) => d
+                            .when_some(ready, |d, ready| d.child(ready))
+                            .child(open)
+                            .child(dismiss),
                         (action, dismiss) => d
                             .when_some(dismiss, |d, dismiss| d.child(dismiss))
+                            .when_some(ready, |d, ready| d.child(ready))
                             .child(open)
                             .child(match action {
                                 Some(action) => action.into_any_element(),

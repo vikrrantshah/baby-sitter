@@ -108,10 +108,16 @@ mod duration_serde {
     }
 }
 
+fn default_draft_timeout() -> Duration {
+    Duration::from_secs(7200)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepoSettings {
     #[serde(with = "duration_serde")]
     pub timeout: Duration,
+    #[serde(default = "default_draft_timeout", with = "duration_serde")]
+    pub draft_timeout: Duration,
     #[serde(with = "duration_serde")]
     pub interval: Duration,
 }
@@ -119,6 +125,7 @@ impl Default for RepoSettings {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(7200),
+            draft_timeout: default_draft_timeout(),
             interval: Duration::from_secs(30),
         }
     }
@@ -837,6 +844,18 @@ mod tests {
             },
         );
         let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), config);
+    }
+
+    #[test]
+    fn draft_timeout_defaults_and_round_trips_in_config() {
+        let json = r#"{"repos":{"owner/repo":{"timeout":"1h","interval":"30s"}}}"#;
+        let mut config: Config = serde_json::from_str(json).unwrap();
+        let repo: RepoName = "owner/repo".parse().unwrap();
+        assert_eq!(config.repos[&repo].draft_timeout, Duration::from_secs(7200));
+        config.repos.get_mut(&repo).unwrap().draft_timeout = Duration::from_secs(28800);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""draft_timeout":"8h""#));
         assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), config);
     }
 

@@ -151,6 +151,19 @@ pub fn list_my_prs(env: &ChildEnv) -> Result<Vec<PrRow>> {
         .collect())
 }
 
+pub fn mark_ready(env: &ChildEnv, pr: &PrRef) -> Result<()> {
+    let mut command = env.command("gh");
+    command.args([
+        "pr",
+        "ready",
+        &pr.number.to_string(),
+        "--repo",
+        &pr.repo.to_string(),
+    ]);
+    output(command)?;
+    Ok(())
+}
+
 pub fn pr_state(env: &ChildEnv, url: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct State {

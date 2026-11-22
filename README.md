@@ -22,6 +22,8 @@ cargo install --path .
 
 Use the Settings gear on the pull requests page to manage repositories, or Refresh to reload the lists. From Repositories, use the back link to return to pull requests, or press Escape on either settings page.
 
+For a draft pull request, use its Ready for review button to mark it ready on GitHub.
+
 ```sh
 app/bundle.sh                       # builds target/release/Baby Sitter.app
 open "target/release/Baby Sitter.app"
@@ -31,8 +33,8 @@ Drag the app to `/Applications` to keep it. The script needs Xcode's command lin
 
 For development, `cargo build --workspace && target/debug/baby-sitter-app` runs the window without a bundle. Both binaries must sit in the same directory. Outside the bundle the Dock shows the name `baby-sitter-app`, and system notification responses are disabled.
 
-- **Repositories** groups accessible repositories by organization and leaves out archived ones. Filter by organization or watched status. Use the toggle to watch a repository and the gear to set its timeout and interval. The default interval is `30s`, not the CLI's `10s`. Each pass makes two GraphQL calls, so six PRs at `10s` use most of the hourly limit of 5,000 points.
-- **Pull requests** lists your open PRs and completed babysits. Filter by repository or select All, Watched, Unwatched, or Merged. Watched shows PRs with an active babysit. Unwatched shows PRs that are neither being babysat nor merged, including stopped, timed-out, cancelled, and failed babysits. Completed babysits keep their outcome across restarts until you dismiss them. Press the play button to start a babysit or the stop button to cancel it. The GitHub button opens the PR. Each row shows what the latest pass is doing, and after a stop it shows the reason. Before that text, four icons show what the merge still needs: reviews, checks, an up-to-date branch, and the merge itself. Green is done, amber is waiting, red is blocked, and grey is not started; hover over an icon for its name. A badge in the same colors ends the line: a check for merged, a dash while the babysit runs or after a timeout, a cross after a stop or failure, and an empty ring after a cancel. Hover over the badge for the state's name, such as Stopped or Timed out. The app runs the binary with `--gates` to get the icons. After a stop, the row names the PR's worktree folder; the folder button reveals it in Finder.
+- **Repositories** groups accessible repositories by organization and leaves out archived ones. Filter by organization or watched status. Use the toggle to watch a repository and the gear to set its timeout, draft timeout, and interval. A babysit started on a draft uses the draft timeout, and keeps that deadline if the PR is marked ready while it runs. The default interval is `30s`, not the CLI's `10s`. Each pass makes two GraphQL calls, so six PRs at `10s` use most of the hourly limit of 5,000 points.
+- **Pull requests** lists your open PRs and completed babysits. Filter by repository or select All, Watched, Unwatched, or Merged. Watched shows PRs with an active babysit. Unwatched shows PRs that are neither being babysat nor merged, including stopped, timed-out, cancelled, and failed babysits. Completed babysits keep their outcome across restarts until you dismiss them. Press the play button to start a babysit or the stop button to cancel it. The GitHub button opens the PR. Each row shows what the latest pass is doing, and after a stop it shows the reason. Before that text, four icons show what the merge still needs: reviews, an up-to-date branch, checks, and the merge itself. Green is done, amber is waiting, red is blocked, and grey is not started; hover over an icon for its name. A badge in the same colors ends the line: a check for merged, a dash while the babysit runs or after a timeout, a cross after a stop or failure, and an empty ring after a cancel. Hover over the badge for the state's name, such as Stopped or Timed out. The app runs the binary with `--gates` to get the icons. After a stop, the row names the PR's worktree folder; the folder button reveals it in Finder.
 - A notification appears when a babysit merges, times out, or stops. A cancel does not notify.
 
 The app keeps its configuration, one clone per repository, and one worktree per PR in `~/Library/Application Support/baby-sitter`. It removes a worktree after a merge and deletes leftover worktrees for merged PRs when the PR list loads. After any other outcome it keeps the worktree and shows its path with a Reveal button.
@@ -73,9 +75,9 @@ Each pass takes a fresh snapshot of the PR. For an open PR, it also observes the
 ```mermaid
 flowchart TD
   START([Start]) --> SNAP["1 · Take a snapshot<br/>PR and open PR checkout"]
-  SNAP --> T{{"2 · Merged, closed, draft, conflicting,<br/>or failing CI with pending checks or at its limit?"}}
+  SNAP --> T{{"2 · Merged, closed, conflicting,<br/>or failing CI with pending checks or at its limit?"}}
   T -- merged --> DONE([Exit 0])
-  T -- "closed, draft, conflict, or fix limit" --> STOP([Stop, exit 1])
+  T -- "closed, conflict, or fix limit" --> STOP([Stop, exit 1])
   T -- "CI failing with checks pending" --> WAIT["Wait --interval"] --> NEXT
   T -- no --> Q{{"3 · Queue status?"}}
   Q -- queued --> WAIT
@@ -110,14 +112,14 @@ The rules live in one ordered table, `RULES` in `src/decide.rs`. The table order
 
 | Step | Rules | Result when a rule matches |
 |---|---|---|
-| 2 | `merged`, `closed`, `draft`, `conflict`, `ci-failed` | Exit 0 for `merged`. Wait for pending checks when CI is failing. Stop for the others or after three failed CI fixes. |
+| 2 | `merged`, `closed`, `conflict`, `ci-failed` | Exit 0 for `merged`. Wait for pending checks when CI is failing. Stop for the others or after three failed CI fixes. |
 | 3 | `in-queue`, `dequeued` | Wait while queued. Stop if the current head was removed for a reason other than `merged`. |
 | 4 | `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Fast-forward when behind. Stop for the others. |
 | 5 | `resolve-fixed` | Resolve threads whose newest marker says `fixed`. |
 | 6 | `unhandled-items` | Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
 | 7 | `fix-ci` | Send failed Actions job logs and external check URLs to Codex, then commit and push a code fix. |
 | 8 | `behind-base` | Run `gh pr update-branch` for direct merges. Skip this rule for merge queues. |
-| 9 | `ci-pending`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision` | Wait, then take a new snapshot. |
+| 9 | `ci-pending`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision`, `draft` | Wait, then take a new snapshot. A draft PR runs earlier actions and waits for review readiness before merging or enqueueing. |
 
 CI fix commits carry the `Baby-Sitter: fix-ci` trailer. The binary stops if CI still fails after three fix commits among the PR's last 20 commits. Codex must not edit CI configuration or weaken tests, and must return `needs_human` for non-code causes. The binary checks for protected CI configuration changes in the working tree before committing and in the commit before pushing. It leaves unsafe changes uncommitted or the unsafe commit local for inspection.
 
