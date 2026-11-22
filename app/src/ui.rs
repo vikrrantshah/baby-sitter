@@ -1296,6 +1296,7 @@ impl AppView {
         let gates = self.gates.get(&row.pr);
         let status = reading.verb.map(|verb| {
             div()
+                .min_w_0()
                 .flex()
                 .items_start()
                 .gap(px(8.))
@@ -1325,6 +1326,8 @@ impl AppView {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
             div()
+                .flex_shrink_0()
+                .h(px(19.))
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -1350,6 +1353,15 @@ impl AppView {
                     }),
                 )
         });
+        let meta = (status.is_some() || worktree.is_some()).then(|| {
+            div()
+                .pt(px(6.))
+                .flex()
+                .items_start()
+                .gap(px(16.))
+                .when_some(status, |d, status| d.child(status))
+                .when_some(worktree, |d, worktree| d.child(worktree))
+        });
         let content = div()
             .flex_1()
             .min_w_0()
@@ -1358,8 +1370,7 @@ impl AppView {
             .gap(px(4.))
             .child(title)
             .child(div().text_size(px(13.)).text_color(muted()).child(place))
-            .when_some(status, |d, status| d.child(div().pt(px(6.)).child(status)))
-            .when_some(worktree, |d, worktree| d.child(worktree));
+            .when_some(meta, |d, meta| d.child(meta));
         div()
             .px(px(ROW_INSET))
             .flex_shrink_0()
