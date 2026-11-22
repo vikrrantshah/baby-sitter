@@ -142,7 +142,7 @@ The binary keeps no local state file. Each pass reads progress from GitHub and f
 | The crash happened | The next run sees | The next run does |
 |---|---|---|
 | While Codex ran | A dirty tree, or the same unanswered items | Stops so you can inspect the tree, or calls Codex again |
-| After the commit, before the push | The local branch is ahead | Stops and tells you to push or reset |
+| After the commit, before the push | The local branch is ahead | Pushes the commits if baby-sitter made all of them and none touches CI configuration. Stops if any commit is yours |
 | After some replies | Markers on the answered items | Sends only the remaining items to Codex |
 | Before the threads were resolved | Open threads with a `fixed` marker | Resolves them |
 | Before the re-review request | Nothing | Nothing. The request is lost, and the merge still waits on the review decision. |

@@ -290,6 +290,8 @@ pub enum Relation {
     /// Ahead of the PR head GitHub reports, but the branch on the remote already has
     /// the local head: GitHub's PR view lags a push for a few seconds.
     Pushed,
+    /// Ahead of the PR head only by commits baby-sitter made and failed to push.
+    Unpushed,
     Diverged,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

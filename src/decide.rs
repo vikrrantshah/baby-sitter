@@ -50,6 +50,11 @@ pub enum Action {
         head: Sha,
         method: MergeMethod,
     },
+    /// Push commits baby-sitter made locally but failed to push. `base` is the PR head.
+    PushLocal {
+        base: Sha,
+        head: Head,
+    },
 }
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -73,6 +78,9 @@ impl fmt::Display for Action {
                     MergeMethod::Rebase => "rebase",
                 };
                 write!(f, "merge {} ({method})", &head.as_str()[..7])
+            }
+            Self::PushLocal { head, .. } => {
+                write!(f, "push local commits up to {}", &head.sha.as_str()[..7])
             }
         }
     }
@@ -444,6 +452,13 @@ fn local_diverged(f: &Facts<'_>) -> Option<Verdict> {
             "waiting for GitHub to show pushed head {}",
             &local.head.as_str()[..7]
         ))),
+        Relation::Unpushed => Some(Verdict::Act(Action::PushLocal {
+            base: f.snap.head.sha.clone(),
+            head: Head {
+                branch: f.snap.head.branch.clone(),
+                sha: local.head.clone(),
+            },
+        })),
         Relation::Diverged => Some(Verdict::Stop(format!(
             "local head {} and PR head {} diverged",
             &local.head.as_str()[..7],
@@ -948,6 +963,13 @@ mod tests {
         let decision = w.decision();
         assert_eq!(decision.rule, "local-diverged");
         assert!(matches!(decision.verdict, Verdict::Wait(_)));
+        w.local.relation = Relation::Unpushed;
+        let decision = w.decision();
+        assert_eq!(decision.rule, "local-diverged");
+        assert!(matches!(
+            decision.verdict,
+            Verdict::Act(Action::PushLocal { ref base, .. }) if *base == w.snap.head.sha
+        ));
     }
     #[test]
     fn gates_report_every_requirement_not_just_the_first_blocker() {

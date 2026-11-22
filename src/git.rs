@@ -117,6 +117,8 @@ impl Git {
         } else if ancestor(remote_head, &head)? {
             if fetched.as_ref() == Some(&head) {
                 Relation::Pushed
+            } else if self.only_own_commits_since(remote_head)? {
+                Relation::Unpushed
             } else {
                 Relation::Ahead
             }
@@ -152,6 +154,20 @@ impl Git {
         self.run(&["push", remote, &format!("HEAD:refs/heads/{branch}")])?;
         Ok(())
     }
+    /// True when `base..HEAD` is non-empty and every commit in it is one baby-sitter made.
+    fn only_own_commits_since(&self, base: &Sha) -> anyhow::Result<bool> {
+        let log = self.run(&[
+            "log",
+            "--format=%B%x00",
+            &format!("{}..HEAD", base.as_str()),
+        ])?;
+        let mut messages = log
+            .split('\0')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .peekable();
+        Ok(messages.peek().is_some() && messages.all(is_own_commit))
+    }
 }
 fn optional(result: anyhow::Result<String>) -> anyhow::Result<Option<String>> {
     match result {
@@ -159,6 +175,14 @@ fn optional(result: anyhow::Result<String>) -> anyhow::Result<Option<String>> {
         Err(e) if e.downcast_ref::<proc::TimedOut>().is_some() => Err(e),
         Err(_) => Ok(None),
     }
+}
+pub const REVIEW_COMMIT_MESSAGE: &str =
+    "baby-sitter: address review feedback\n\nBaby-Sitter: review";
+fn is_own_commit(message: &str) -> bool {
+    message.lines().next() == Some("baby-sitter: address review feedback")
+        || message
+            .lines()
+            .any(|line| matches!(line.trim(), "Baby-Sitter: fix-ci" | "Baby-Sitter: review"))
 }
 
 fn is_ci_configuration(path: &str) -> bool {
@@ -307,6 +331,50 @@ mod tests {
             git.committed_ci_changes(&before_rename).unwrap(),
             [".github/workflows/ci.yml"]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_own_commits_since_accepts_baby_sitter_commits_and_rejects_yours() {
+        use std::{fs, time::Duration};
+
+        let root = std::env::temp_dir().join(format!(
+            "baby-sitter-own-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let git = Git {
+            git_dir: root.join(".git"),
+            root: root.clone(),
+            remote: None,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        git.run(&["init", "-q"]).unwrap();
+        git.run(&["config", "user.name", "Test"]).unwrap();
+        git.run(&["config", "user.email", "test@example.com"])
+            .unwrap();
+        git.run(&["config", "commit.gpgsign", "false"]).unwrap();
+        git.run(&["commit", "--allow-empty", "-m", "initial"])
+            .unwrap();
+        let base = git.head().unwrap();
+        assert!(!git.only_own_commits_since(&base).unwrap());
+
+        fs::write(root.join("a.txt"), "fix\n").unwrap();
+        assert!(
+            git.commit_all_with("fix: repair tests\n\nBaby-Sitter: fix-ci")
+                .unwrap()
+        );
+        fs::write(root.join("b.txt"), "review\n").unwrap();
+        assert!(git.commit_all_with(REVIEW_COMMIT_MESSAGE).unwrap());
+        assert!(git.only_own_commits_since(&base).unwrap());
+
+        fs::write(root.join("c.txt"), "mine\n").unwrap();
+        assert!(git.commit_all_with("wip: my local change").unwrap());
+        assert!(!git.only_own_commits_since(&base).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }

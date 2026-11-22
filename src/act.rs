@@ -48,6 +48,19 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
         Action::UpdateBranch => env.gh.update_branch(),
         Action::Enqueue { head } => env.gh.enqueue(pr_id, &head),
         Action::Merge { head, method } => env.gh.merge(method, &head),
+        Action::PushLocal { base, head } => {
+            ensure!(
+                env.git.head()? == head.sha,
+                "local HEAD moved since snapshot"
+            );
+            let protected = env.git.committed_ci_changes(&base)?;
+            ensure!(
+                protected.is_empty(),
+                "local commits touch CI configuration: {}; not pushed",
+                protected.join(", ")
+            );
+            env.git.push(&head.branch)
+        }
         Action::HandleComments { batch, head } => {
             ensure!(
                 env.git.head()? == head.sha,
@@ -62,10 +75,7 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 env.git.head()? == head.sha,
                 "codex changed HEAD; inspect the checkout"
             );
-            if env
-                .git
-                .commit_all_with("baby-sitter: address review feedback")?
-            {
+            if env.git.commit_all_with(crate::git::REVIEW_COMMIT_MESSAGE)? {
                 env.git.push(&head.branch)?;
             }
             for r in &resolved {
