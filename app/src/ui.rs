@@ -827,14 +827,6 @@ impl AppView {
             .flex()
             .items_center()
             .gap(px(12.))
-            .child(
-                div().w(px(190.)).flex_shrink_0().child(
-                    Select::new(&self.org_select)
-                        .small()
-                        .accessibility_label("Filter by organization")
-                        .placeholder("All organizations"),
-                ),
-            )
             .child(scope)
             .child(
                 div()
@@ -852,6 +844,13 @@ impl AppView {
             header(
                 "Repositories",
                 Some("Babysits run only in the repositories you watch."),
+            )
+            .child(
+                div().w(px(240.)).flex_shrink_0().child(
+                    Select::new(&self.org_select)
+                        .accessibility_label("Filter by organization")
+                        .placeholder("All organizations"),
+                ),
             ),
             body,
         )
@@ -1338,7 +1337,7 @@ fn header(title: &'static str, detail: Option<&'static str>) -> Div {
         .pt(px(36.))
         .pb(px(20.))
         .flex()
-        .items_end()
+        .items_start()
         .gap(px(16.))
         .border_b_1()
         .border_color(rail())
