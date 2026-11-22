@@ -36,7 +36,7 @@ impl Env {
         })
     }
 }
-pub fn execute(env: &Env, action: Action) -> anyhow::Result<()> {
+pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
     match action {
         Action::FastForward(sha) => env.git.fast_forward(&sha),
         Action::ResolveThreads(ids) => {
@@ -46,6 +46,7 @@ pub fn execute(env: &Env, action: Action) -> anyhow::Result<()> {
             Ok(())
         }
         Action::UpdateBranch => env.gh.update_branch(),
+        Action::Enqueue { head } => env.gh.enqueue(pr_id, &head),
         Action::Merge { head, method } => env.gh.merge(method, &head),
         Action::HandleComments { batch, head } => {
             ensure!(

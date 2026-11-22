@@ -38,6 +38,19 @@ impl Gh {
         self.pr.number.to_string()
     }
     pub fn snapshot(&self) -> anyhow::Result<Snapshot> {
+        let base_response = proc::run(
+            Command::new("gh").args([
+                "api", "graphql", "-f", &format!("owner={}", self.pr.owner),
+                "-f", &format!("repo={}", self.pr.repo), "-F", &format!("n={}", self.pr.number),
+                "-f", "query=query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n){baseRefName}}}",
+            ]),
+            None,
+            self.deadline,
+        )?;
+        let base_json: serde_json::Value = serde_json::from_str(&base_response)?;
+        let base = base_json["data"]["repository"]["pullRequest"]["baseRefName"]
+            .as_str()
+            .context("missing PR base branch")?;
         let out = proc::run(
             Command::new("gh").args([
                 "api",
@@ -49,11 +62,17 @@ impl Gh {
                 "-F",
                 &format!("n={}", self.pr.number),
                 "-f",
+                &format!("base={base}"),
+                "-f",
                 &format!("query={}", wire::SNAPSHOT_QUERY),
             ]),
             None,
             self.deadline,
         )?;
+        let response: serde_json::Value = serde_json::from_str(&out)?;
+        if response["data"]["repository"]["pullRequest"]["baseRefName"].as_str() != Some(base) {
+            bail!("base branch changed during snapshot");
+        }
         wire::parse_snapshot(out.as_bytes())
     }
     fn mutation(&self, query: &str, fields: &[(&str, &str)]) -> anyhow::Result<()> {
@@ -114,6 +133,29 @@ impl Gh {
             None,
             self.deadline,
         )?;
+        Ok(())
+    }
+    pub fn enqueue(&self, pr_id: &str, head: &Sha) -> anyhow::Result<()> {
+        let result = self.mutation(
+            "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{id}}}",
+            &[("id", pr_id), ("head", head.as_str())],
+        );
+        if let Err(error) = result {
+            let queued = proc::run(
+                Command::new("gh").args([
+                    "api", "graphql", "-f", &format!("owner={}", self.pr.owner),
+                    "-f", &format!("repo={}", self.pr.repo), "-F", &format!("n={}", self.pr.number),
+                    "-f", "query=query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n){mergeQueueEntry{headCommit{oid}}}}}",
+                ]),
+                None,
+                self.deadline,
+            ).ok().and_then(|out| serde_json::from_str::<serde_json::Value>(&out).ok())
+                .and_then(|v| v["data"]["repository"]["pullRequest"]["mergeQueueEntry"]["headCommit"]["oid"].as_str().map(str::to_owned))
+                .is_some_and(|oid| oid.eq_ignore_ascii_case(head.as_str()));
+            if !queued {
+                return Err(error);
+            }
+        }
         Ok(())
     }
     pub fn merge(&self, method: MergeMethod, head: &Sha) -> anyhow::Result<()> {

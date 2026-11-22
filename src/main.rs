@@ -9,7 +9,7 @@ mod wire;
 
 use crate::{
     decide::{Facts, Verdict},
-    domain::{LocalState, MergeMethod, Snapshot},
+    domain::{Lifecycle, LocalState, MergeMethod, Snapshot},
 };
 use clap::Parser;
 use std::{
@@ -37,18 +37,22 @@ struct Cli {
 }
 struct Observation {
     snap: Snapshot,
-    local: LocalState,
+    local: Option<LocalState>,
 }
 impl Observation {
     fn take(env: &act::Env) -> anyhow::Result<Self> {
         let snap = env.gh.snapshot()?;
-        let local = env.git.observe(&snap.head.sha)?;
+        let local = if snap.lifecycle == Lifecycle::Open {
+            Some(env.git.observe(&snap.head.sha)?)
+        } else {
+            None
+        };
         Ok(Self { snap, local })
     }
     fn facts(&self, method: MergeMethod) -> Facts<'_> {
         Facts {
             snap: &self.snap,
-            local: &self.local,
+            local: self.local.as_ref(),
             method,
         }
     }
@@ -90,7 +94,18 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        eprintln!("[{}] {}", decision.rule, decision.verdict);
+        if let (
+            Verdict::Act(decide::Action::Enqueue { .. }),
+            domain::MergeRoute::Queue { method },
+        ) = (&decision.verdict, observation.snap.route)
+        {
+            eprintln!(
+                "[{}] {} (queue merges with {method})",
+                decision.rule, decision.verdict
+            );
+        } else {
+            eprintln!("[{}] {}", decision.rule, decision.verdict);
+        }
         match decision.verdict {
             Verdict::Done => return Ok(()),
             Verdict::Stop(reason) => anyhow::bail!("{reason}"),
@@ -98,7 +113,7 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 std::thread::sleep(cli.interval.min(remaining));
             }
-            Verdict::Act(action) => act::execute(&env, action)?,
+            Verdict::Act(action) => act::execute(&env, action, &observation.snap.pr_id)?,
         }
     }
 }

@@ -49,15 +49,18 @@
 flowchart TD
   START([Start]):::term --> SNAP
 
-  SNAP["1 · Take a snapshot<br/><small>PR and local checkout</small>"]:::script --> T{{"2 · Merged, closed, draft,<br/>conflicting, or CI failed?"}}:::dec
+  SNAP["1 · Take a snapshot<br/><small>PR and open PR checkout</small>"]:::script --> T{{"2 · Merged, closed, draft,<br/>conflicting, or CI failed?"}}:::dec
   T -- merged --> DONE([Exit 0]):::term
   T -- other --> STOP([Stop, exit 1]):::stop
-  T -- no --> L{{"3 · Local checkout in sync?"}}:::dec
+  T -- no --> Q{{"3 · Queue status?"}}:::dec
+  Q -- queued --> WAIT["Wait --interval"]:::script --> NEXT
+  Q -- "removed at current head" --> STOP
+  Q -- otherwise --> L{{"4 · Local checkout in sync?"}}:::dec
   L -- behind --> FF["Fast-forward"]:::script --> NEXT
   L -- "dirty, ahead, or diverged" --> STOP
-  L -- yes --> RF{{"4 · Fixed threads still open?"}}:::dec
+  L -- yes --> RF{{"5 · Fixed threads still open?"}}:::dec
   RF -- yes --> RES["Resolve them"]:::script --> NEXT
-  RF -- no --> UH{{"5 · Unanswered comments?"}}:::dec
+  RF -- no --> UH{{"6 · Unanswered comments?"}}:::dec
 
   UH -- yes --> HC
   subgraph CODEX ["Codex"]
@@ -68,11 +71,11 @@ flowchart TD
   REPLY --> RR["Request re-review"]:::script --> NEXT
   style CODEX fill:#1d1430,stroke:#a371f7,stroke-width:2px,color:#d2b8ff
 
-  UH -- no --> BE{{"6 · Behind base?"}}:::dec
+  UH -- no --> BE{{"7 · Direct merge behind base?"}}:::dec
   BE -- yes --> UP["Update branch"]:::script --> NEXT
-  BE -- no --> G{{"7 · Anything blocks the merge?<br/><small>CI pending, merge state, open threads,<br/>review requests, review decision</small>"}}:::dec
-  G -- yes --> WAIT["Wait --interval"]:::script --> NEXT
-  G -- no --> MERGE["Merge the snapshot's head SHA"]:::script --> NEXT
+  BE -- no --> G{{"8 · Anything blocks the merge?<br/><small>CI pending, merge state, open threads,<br/>review requests, review decision</small>"}}:::dec
+  G -- yes --> WAIT
+  G -- no --> MERGE["Merge or enqueue the snapshot's head SHA"]:::script --> NEXT
   NEXT(("Next pass")):::script -.-> SNAP
 
   classDef script fill:#16263b,stroke:#4a90d9,color:#e6f0ff,stroke-width:1.5px
@@ -89,7 +92,7 @@ flowchart TD
         <li><b>Declined and needs_human threads.</b> They stay open, and the merge waits until a person replies or resolves them.</li>
         <li><b>Lost re-review request.</b> If a run crashes after it posts replies, the request is not retried. The merge still waits on the review decision.</li>
         <li><b>Large PRs.</b> More than 100 threads, comments, reviews, or review requests stops the run.</li>
-        <li><b>Merge queues.</b> Not supported. A queued PR stays open after the merge call.</li>
+        <li><b>Queued feedback.</b> New review feedback waits until the PR leaves the queue. A push would remove the PR from the queue.</li>
       </ol>
     </div>
   </div>

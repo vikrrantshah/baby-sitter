@@ -94,6 +94,42 @@ pub enum MergeState {
     Unstable,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeRoute {
+    Direct,
+    Queue { method: MergeMethod },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueEntryState {
+    Queued,
+    AwaitingChecks,
+    Mergeable,
+    Unmergeable,
+    Locked,
+}
+impl fmt::Display for QueueEntryState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Queued => "queued",
+            Self::AwaitingChecks => "awaiting checks",
+            Self::Mergeable => "mergeable",
+            Self::Unmergeable => "unmergeable",
+            Self::Locked => "locked",
+        })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueueStatus {
+    NotQueued,
+    Queued {
+        state: QueueEntryState,
+        position: u32,
+    },
+    Removed {
+        reason: String,
+        before_commit: Sha,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewDecision {
     Approved,
     ChangesRequested,
@@ -131,6 +167,9 @@ pub struct Head {
 }
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    pub pr_id: String,
+    pub route: MergeRoute,
+    pub queue: QueueStatus,
     pub author: Actor,
     pub lifecycle: Lifecycle,
     pub draft: bool,
@@ -316,4 +355,13 @@ pub enum MergeMethod {
     Squash,
     Merge,
     Rebase,
+}
+impl fmt::Display for MergeMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        })
+    }
 }
