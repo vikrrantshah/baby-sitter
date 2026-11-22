@@ -1,8 +1,8 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, Config, GateState, Outcome, PrRef, PrRow, RepoListItem, RepoName, RepoScope,
-        RepoSettings, SitState, VerdictKind,
+        self, Config, GateState, Outcome, PastSit, PrRef, PrRow, PrScope, RepoListItem, RepoName,
+        RepoScope, RepoSettings, SitState, VerdictKind,
     },
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
@@ -78,12 +78,15 @@ pub struct AppView {
     page: Page,
     repos: Load<Vec<RepoName>>,
     prs: Load<Vec<PrRow>>,
+    /// Merged PRs dismissed while a GitHub search may still return an older snapshot.
+    dismissed_merged: BTreeSet<PrRef>,
     repo_filter: Entity<InputState>,
     org_select: Entity<SelectState<Vec<PickerChoice<String>>>>,
     org_filter: Option<String>,
     /// Owner login to its downloaded profile picture.
     avatars: BTreeMap<String, PathBuf>,
     scope: RepoScope,
+    pr_scope: PrScope,
     dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
     selected_filter: Option<RepoName>,
     inputs: BTreeMap<RepoName, RepoInputs>,
@@ -166,20 +169,42 @@ impl AppView {
             ),
         ];
         let (event_tx, event_rx) = async_channel::unbounded::<SitEvent>();
-        let events = cx.spawn(async move |view, cx| {
+        let events = cx.spawn_in(window, async move |view, cx| {
             while let Ok(event) = event_rx.recv().await {
                 if view
-                    .update(cx, |this, cx| {
+                    .update_in(cx, |this, window, cx| {
                         if matches!(this.states.get(&event.pr), Some(SitState::Cancelling))
                             && !matches!(event.state, SitState::Finished(_))
                         {
                             return;
                         }
-                        if matches!(event.state, SitState::Finished(_)) {
-                            this.handles.remove(&event.pr);
-                            if this.config.active.remove(&event.pr).is_some() {
-                                this.save();
+                        let finished = matches!(event.state, SitState::Finished(_));
+                        if let SitState::Finished(outcome) = &event.state {
+                            let title = match &this.prs {
+                                Load::Ready(prs) => prs
+                                    .iter()
+                                    .find(|row| row.pr == event.pr)
+                                    .map(|row| row.title.clone()),
+                                _ => None,
                             }
+                            .or_else(|| {
+                                this.config
+                                    .history
+                                    .get(&event.pr)
+                                    .map(|past| past.title.clone())
+                            })
+                            .unwrap_or_else(|| format!("Pull request #{}", event.pr.number));
+                            this.handles.remove(&event.pr);
+                            this.config.active.remove(&event.pr);
+                            this.config.history.insert(
+                                event.pr.clone(),
+                                PastSit {
+                                    title,
+                                    outcome: outcome.clone(),
+                                    finished_at: model::unix_now(),
+                                },
+                            );
+                            this.save();
                         }
                         if let SitState::Running {
                             last_line: Some(line),
@@ -191,6 +216,9 @@ impl AppView {
                             return;
                         }
                         this.states.insert(event.pr, event.state);
+                        if finished {
+                            this.update_filter(window, cx);
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -219,11 +247,13 @@ impl AppView {
             page: Page::PullRequests,
             repos: Load::Loading,
             prs: Load::Loading,
+            dismissed_merged: BTreeSet::new(),
             repo_filter,
             org_select,
             org_filter: None,
             avatars: BTreeMap::new(),
             scope: RepoScope::All,
+            pr_scope: PrScope::default(),
             dashboard_filter,
             selected_filter: None,
             inputs: BTreeMap::new(),
@@ -241,12 +271,17 @@ impl AppView {
             sweep_task: None,
             sweep_pending: false,
         };
+        for (pr, past) in &this.config.history {
+            this.states
+                .insert(pr.clone(), SitState::Finished(past.outcome.clone()));
+        }
         for (repo, settings) in this.config.repos.clone() {
             this.add_inputs(repo, &settings, window, cx);
         }
         for (pr, deadline) in this.config.active.clone() {
             this.resume(pr, deadline);
         }
+        this.update_filter(window, cx);
         this.refresh(window, cx);
         this
     }
@@ -490,7 +525,8 @@ impl AppView {
                 .await;
             let _ = view.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(prs) => {
+                    Ok(mut prs) => {
+                        prs.retain(|row| !this.dismissed_merged.contains(&row.pr));
                         this.prs = Load::Ready(prs);
                         this.sweep_worktrees(window, cx);
                     }
@@ -536,11 +572,17 @@ impl AppView {
             Load::Ready(prs) => prs.as_slice(),
             _ => &[],
         };
-        let repos: BTreeSet<_> =
-            model::dashboard_rows(prs, self.states.keys(), &self.config.repos, None)
-                .into_iter()
-                .map(|row| row.pr.repo.clone())
-                .collect();
+        let repos: BTreeSet<_> = model::dashboard_rows(
+            prs,
+            &self.config.history,
+            &self.states,
+            &self.config.repos,
+            self.pr_scope,
+            None,
+        )
+        .into_iter()
+        .map(|row| row.pr.repo.clone())
+        .collect();
         if self
             .selected_filter
             .as_ref()
@@ -594,13 +636,41 @@ impl AppView {
             cx.notify();
             return;
         };
+        let previous = self.config.history.remove(&pr);
         self.config.active.insert(pr.clone(), deadline);
         if !self.save() {
             self.config.active.remove(&pr);
+            if let Some(past) = previous {
+                self.config.history.insert(pr, past);
+            }
             cx.notify();
             return;
         }
         self.resume(pr, deadline);
+        self.update_filter(window, cx);
+        cx.notify();
+    }
+    fn dismiss(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
+        let merged = match self.states.get(&pr) {
+            Some(SitState::Finished(outcome)) => *outcome == Outcome::Merged,
+            _ => return,
+        };
+        let previous = self.config.history.remove(&pr);
+        if !self.save() {
+            if let Some(past) = previous {
+                self.config.history.insert(pr, past);
+            }
+            cx.notify();
+            return;
+        }
+        if merged {
+            if let Load::Ready(prs) = &mut self.prs {
+                prs.retain(|row| row.pr != pr);
+            }
+            self.dismissed_merged.insert(pr.clone());
+        }
+        self.states.remove(&pr);
+        self.gates.remove(&pr);
         self.update_filter(window, cx);
         cx.notify();
     }
@@ -1075,8 +1145,10 @@ impl AppView {
         };
         model::dashboard_rows(
             prs,
-            self.states.keys(),
+            &self.config.history,
+            &self.states,
             &self.config.repos,
+            self.pr_scope,
             self.selected_filter.as_ref(),
         )
     }
@@ -1107,6 +1179,17 @@ impl AppView {
             )
         } else if reading.merged {
             None
+        } else if !self.config.repos.contains_key(&row.pr.repo) {
+            let repo = row.pr.repo.clone();
+            Some(
+                Button::new(SharedString::from(format!("watch-{repo}")))
+                    .label("Watch repo")
+                    .small()
+                    .outline()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_repo(repo.clone(), true, window, cx)
+                    })),
+            )
         } else {
             Some(
                 round_button(
@@ -1122,6 +1205,16 @@ impl AppView {
                 ),
             )
         };
+        let dismiss = matches!(state, Some(SitState::Finished(_))).then(|| {
+            let pr = row.pr.clone();
+            icon_button(
+                SharedString::from(format!("dismiss-{pr}")),
+                IconName::X,
+                "Dismiss",
+                px(34.),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.dismiss(pr.clone(), window, cx)))
+        });
         let time_left = active
             .then(|| self.config.active.get(&row.pr))
             .flatten()
@@ -1239,6 +1332,7 @@ impl AppView {
                         d.child(div().text_size(px(12.)).text_color(muted()).child(left))
                     })
                     .child(open)
+                    .when_some(dismiss, |d, dismiss| d.child(dismiss))
                     .child(match action {
                         Some(action) => action.into_any_element(),
                         // Keeps the GitHub button aligned with rows that have an action.
@@ -1265,7 +1359,7 @@ impl AppView {
                     .child(Self::retry_prs_button(cx))
             }
             _ if rows.is_empty() => {
-                if self.config.repos.is_empty() {
+                if self.pr_scope == PrScope::Watched && self.config.repos.is_empty() {
                     message(
                         "No watched repositories",
                         Some("Watch a repository to see its pull requests.".into()),
@@ -1285,13 +1379,26 @@ impl AppView {
                         Some("Choose All repositories to see the rest.".into()),
                     )
                 } else {
-                    message(
-                        "No open pull requests",
-                        Some(
-                            "None of your watched repositories has an open pull request from you."
-                                .into(),
+                    match self.pr_scope {
+                        PrScope::Watched => message(
+                            "No open pull requests",
+                            Some(
+                                "None of your watched repositories has an open pull request from you."
+                                    .into(),
+                            ),
                         ),
-                    )
+                        PrScope::Unwatched => {
+                            message("No pull requests in unwatched repositories", None)
+                        }
+                        PrScope::Merged => message(
+                            "No merged babysits",
+                            Some(
+                                "Babysat PRs show here after they merge, until you dismiss them."
+                                    .into(),
+                            ),
+                        ),
+                        PrScope::All => message("No open pull requests", None),
+                    }
                 }
             }
             _ => {
@@ -1323,7 +1430,56 @@ impl AppView {
             "Filter by repository",
             "All repositories",
         ));
-        (header, list)
+        let segment = |id: &'static str, label: &'static str, scope: PrScope| {
+            let selected = self.pr_scope == scope;
+            Button::new(id).selected(selected).child(
+                div()
+                    .text_color(if selected { accent() } else { muted() })
+                    .when(selected, |d| d.font_semibold())
+                    .child(label),
+            )
+        };
+        let scope = ButtonGroup::new("pr-scope")
+            .small()
+            .outline()
+            .child(segment("pr-scope-all", "All", PrScope::All))
+            .child(segment("pr-scope-watched", "Watched", PrScope::Watched))
+            .child(segment(
+                "pr-scope-unwatched",
+                "Unwatched",
+                PrScope::Unwatched,
+            ))
+            .child(segment("pr-scope-merged", "Merged", PrScope::Merged))
+            .on_click(cx.listener(|this, selected: &Vec<usize>, window, cx| {
+                let scopes = [
+                    PrScope::All,
+                    PrScope::Watched,
+                    PrScope::Unwatched,
+                    PrScope::Merged,
+                ];
+                if let Some(scope) = selected.first().and_then(|index| scopes.get(*index)) {
+                    this.pr_scope = *scope;
+                    this.update_filter(window, cx);
+                    cx.notify();
+                }
+            }));
+        let filters = div()
+            .flex_shrink_0()
+            .px(px(ROW_INSET))
+            .py(px(16.))
+            .border_b_1()
+            .border_color(divider())
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(scope);
+        let body = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(filters)
+            .child(div().flex_1().min_h_0().child(list));
+        (header, body)
     }
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let running = self.states.values().filter(|s| s.is_active()).count();
