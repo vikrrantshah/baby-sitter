@@ -1,4 +1,5 @@
 mod gh;
+mod icons;
 mod model;
 mod sitter;
 mod store;
@@ -51,34 +52,36 @@ fn run() -> anyhow::Result<()> {
         }
     });
     let env = gh::ChildEnv::new();
-    application().with_assets(assets::AllAssets).run(move |cx| {
-        init(cx);
-        theme::install(cx);
-        set_dock_icon();
-        let quit_registry = registry.clone();
-        cx.on_app_quit(move |_| {
-            sitter::terminate_all(&quit_registry);
-            async {}
-        })
-        .detach();
-        cx.on_window_closed(|cx, _| cx.quit()).detach();
-        let bounds = Bounds::centered(None, size(px(1080.0), px(760.0)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(760.0), px(480.0))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Baby Sitter".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(16.0), px(18.0))),
-            }),
-            ..Default::default()
-        };
-        open_window(options, cx, move |window, cx| {
-            cx.new(|cx| ui::AppView::new(data, config, env, registry, locks, window, cx))
-        })
-        .expect("open baby-sitter window");
-        cx.activate(true);
-    });
+    application()
+        .with_assets(icons::FilledAssets)
+        .run(move |cx| {
+            init(cx);
+            theme::install(cx);
+            set_dock_icon();
+            let quit_registry = registry.clone();
+            cx.on_app_quit(move |_| {
+                sitter::terminate_all(&quit_registry);
+                async {}
+            })
+            .detach();
+            cx.on_window_closed(|cx, _| cx.quit()).detach();
+            let bounds = Bounds::centered(None, size(px(1080.0), px(760.0)), cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(760.0), px(480.0))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Baby Sitter".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(16.0), px(18.0))),
+                }),
+                ..Default::default()
+            };
+            open_window(options, cx, move |window, cx| {
+                cx.new(|cx| ui::AppView::new(data, config, env, registry, locks, window, cx))
+            })
+            .expect("open baby-sitter window");
+            cx.activate(true);
+        });
     Ok(())
 }
 

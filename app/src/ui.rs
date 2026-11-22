@@ -1991,25 +1991,30 @@ fn state_style(state: GateState) -> (Hsla, &'static str) {
         GateState::Pending => (muted().opacity(0.45), "not started"),
     }
 }
-/// A filled circle holding a check, dash, or cross; a hollow ring when not started.
+/// A filled circle with a check, dash, or cross; a hollow ring when not started.
 fn status_badge(state: GateState) -> Div {
     let (color, _) = state_style(state);
     let badge = div()
         .size(px(14.))
         .flex_shrink_0()
-        .rounded_full()
         .flex()
         .items_center()
         .justify_center();
-    let glyph = match state {
+    let icon = match state {
         GateState::Met => IconName::Check,
         GateState::Waiting => IconName::Minus,
         GateState::Blocked => IconName::X,
-        GateState::Pending => return badge.border_2().border_color(color),
+        GateState::Pending => {
+            return badge.child(
+                div()
+                    .size(px(12.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(color),
+            );
+        }
     };
-    badge
-        .bg(color)
-        .child(Icon::new(glyph).size(px(10.)).text_color(panel()))
+    badge.child(Icon::new(icon).size(px(14.)).text_color(color))
 }
 /// The caretaker and the child: a lit disc holding a smaller light one.
 fn pair_mark() -> Div {
