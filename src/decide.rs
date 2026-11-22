@@ -3,6 +3,35 @@ use std::fmt;
 
 const MAX_CI_FIX_ATTEMPTS: u32 = 3;
 
+fn names<I>(mut items: I) -> String
+where
+    I: ExactSizeIterator,
+    I::Item: fmt::Display,
+{
+    use std::fmt::Write;
+
+    let count = items.len();
+    let mut result = String::new();
+    for index in 0..count.min(3) {
+        if index > 0 {
+            result.push_str(if index == count - 1 { " and " } else { ", " });
+        }
+        write!(result, "{}", items.next().unwrap()).unwrap();
+    }
+    if count > 3 {
+        write!(result, " and {} more", count - 3).unwrap();
+    }
+    result
+}
+
+fn check_names(checks: &[FailedCheck]) -> String {
+    names(checks.iter().map(|check| &check.name))
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
 pub struct Facts<'a> {
     pub snap: &'a Snapshot,
     pub local: Option<&'a LocalState>,
@@ -59,28 +88,43 @@ pub enum Action {
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FastForward(sha) => write!(f, "fast-forward to {}", &sha.as_str()[..7]),
-            Self::ResolveThreads(ids) => write!(f, "resolve {} fixed threads", ids.len()),
-            Self::HandleComments { batch, .. } => {
-                write!(f, "handle {} items", batch.0.len())?;
-                for (index, item) in batch.0.iter().enumerate() {
-                    write!(f, "{}{item}", if index == 0 { ": " } else { ", " })?;
-                }
-                Ok(())
+            Self::FastForward(sha) => {
+                write!(f, "Fast-forwarding checkout to {}", &sha.as_str()[..7])
             }
-            Self::FixCi { checks, .. } => write!(f, "fix CI: {}", check_names(checks)),
-            Self::UpdateBranch => f.write_str("update branch"),
-            Self::Enqueue { head } => write!(f, "enqueue {}", &head.as_str()[..7]),
+            Self::ResolveThreads(ids) => write!(
+                f,
+                "Resolving {} fixed review thread{}",
+                ids.len(),
+                plural(ids.len())
+            ),
+            Self::HandleComments { batch, .. } => {
+                write!(
+                    f,
+                    "Answering {} review thread{}: {}",
+                    batch.0.len(),
+                    plural(batch.0.len()),
+                    names(batch.0.iter())
+                )
+            }
+            Self::FixCi { checks, .. } => write!(f, "Fixing CI: {}", check_names(checks)),
+            Self::UpdateBranch => f.write_str("Updating the branch with its base"),
+            Self::Enqueue { head } => {
+                write!(f, "Adding {} to the merge queue", &head.as_str()[..7])
+            }
             Self::Merge { head, method } => {
                 let method = match method {
                     MergeMethod::Squash => "squash",
                     MergeMethod::Merge => "merge",
                     MergeMethod::Rebase => "rebase",
                 };
-                write!(f, "merge {} ({method})", &head.as_str()[..7])
+                write!(f, "Merging {} ({method})", &head.as_str()[..7])
             }
             Self::PushLocal { head, .. } => {
-                write!(f, "push local commits up to {}", &head.sha.as_str()[..7])
+                write!(
+                    f,
+                    "Pushing checkout commits up to {}",
+                    &head.sha.as_str()[..7]
+                )
             }
         }
     }
@@ -99,16 +143,15 @@ pub struct Item {
 }
 impl fmt::Display for Item {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "thread {}", self.path)?;
+        write!(f, "{}", self.path)?;
         if let Some(line) = self.line {
             write!(f, ":{line}")?;
         }
-        let author = match &self.actor {
-            Actor::Human(login) | Actor::Bot(login) => login.0.as_str(),
-            Actor::Viewer => "viewer",
-            Actor::Ghost => "ghost",
-        };
-        write!(f, " ({author})")
+        match &self.actor {
+            Actor::Human(login) | Actor::Bot(login) => write!(f, " (@{})", login.0),
+            Actor::Viewer => f.write_str(" (viewer)"),
+            Actor::Ghost => f.write_str(" (ghost)"),
+        }
     }
 }
 struct Rule {
@@ -369,15 +412,15 @@ fn merged(f: &Facts<'_>) -> Option<Verdict> {
 }
 fn closed(f: &Facts<'_>) -> Option<Verdict> {
     (f.snap.lifecycle == Lifecycle::Closed)
-        .then(|| Verdict::Stop("PR is closed without merging".into()))
+        .then(|| Verdict::Stop("PR was closed without merging".into()))
 }
 fn draft(f: &Facts<'_>) -> Option<Verdict> {
     (f.snap.draft || f.snap.merge_state == MergeState::Draft)
-        .then(|| Verdict::Stop("PR is a draft".into()))
+        .then(|| Verdict::Stop("PR is still a draft".into()))
 }
 fn conflict(f: &Facts<'_>) -> Option<Verdict> {
     (f.snap.mergeable == Mergeable::Conflicting || f.snap.merge_state == MergeState::Dirty)
-        .then(|| Verdict::Stop("PR has merge conflicts".into()))
+        .then(|| Verdict::Stop("PR has merge conflicts with its base branch".into()))
 }
 fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
     match &f.snap.ci {
@@ -386,23 +429,28 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
             failing,
             pending,
         } if !pending.is_empty() => Some(Verdict::Wait(format!(
-            "CI failing: {}; waiting for {}",
-            check_names(failing),
-            pending.join(", ")
+            "Waiting for {} more check{} before fixing {}",
+            pending.len(),
+            plural(pending.len()),
+            if failing.is_empty() {
+                "CI".to_owned()
+            } else {
+                check_names(failing)
+            }
         ))),
         Ci::Rollup {
             state: RollupState::Failure | RollupState::Error,
             failing,
             ..
         } if failing.is_empty() => Some(Verdict::Stop(
-            "CI failed, but GitHub reported no failing check".into(),
+            "CI failed, but GitHub didn't say which check".into(),
         )),
         Ci::Rollup {
             state: RollupState::Failure | RollupState::Error,
             failing,
             ..
         } if f.snap.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS => Some(Verdict::Stop(format!(
-            "CI still failing after 3 fix attempts: {}",
+            "CI still fails after 3 fix attempts: {}",
             check_names(failing)
         ))),
         _ => None,
@@ -411,7 +459,7 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
 fn in_queue(f: &Facts<'_>) -> Option<Verdict> {
     match &f.snap.queue {
         QueueStatus::Queued { state, position } => Some(Verdict::Wait(format!(
-            "in merge queue: position {position}, {state}"
+            "In the merge queue at position {position}, {state}"
         ))),
         _ => None,
     }
@@ -421,17 +469,19 @@ fn dequeued(f: &Facts<'_>) -> Option<Verdict> {
         QueueStatus::Removed {
             reason,
             before_commit,
-        } if *before_commit == f.snap.head.sha && !reason.eq_ignore_ascii_case("merged") => {
-            Some(Verdict::Stop(format!("removed from merge queue: {reason}")))
-        }
+        } if *before_commit == f.snap.head.sha && !reason.eq_ignore_ascii_case("merged") => Some(
+            Verdict::Stop(format!("Merge queue removed the PR: {reason}")),
+        ),
         _ => None,
     }
 }
 fn local_upstream(f: &Facts<'_>) -> Option<Verdict> {
     match &f.local?.upstream_branch {
-        None => Some(Verdict::Stop("local branch has no upstream".into())),
+        None => Some(Verdict::Stop(
+            "Checkout's branch doesn't track a remote branch".into(),
+        )),
         Some(b) if *b != f.snap.head.branch => Some(Verdict::Stop(format!(
-            "wrong upstream branch {b}; expected {}",
+            "Checkout tracks {b}, but the PR branch is {}",
             f.snap.head.branch
         ))),
         _ => None,
@@ -439,17 +489,21 @@ fn local_upstream(f: &Facts<'_>) -> Option<Verdict> {
 }
 fn local_dirty(f: &Facts<'_>) -> Option<Verdict> {
     let local = f.local?;
-    (!local.dirty.is_empty())
-        .then(|| Verdict::Stop(format!("local tree is dirty: {}", local.dirty.join(", "))))
+    (!local.dirty.is_empty()).then(|| {
+        Verdict::Stop(format!(
+            "Checkout has uncommitted changes: {}",
+            names(local.dirty.iter())
+        ))
+    })
 }
 fn local_diverged(f: &Facts<'_>) -> Option<Verdict> {
     let local = f.local?;
     match local.relation {
         Relation::Ahead => Some(Verdict::Stop(
-            "local branch has unpushed commits; push or reset".into(),
+            "Checkout has commits that aren't on GitHub; push or reset them".into(),
         )),
         Relation::Pushed => Some(Verdict::Wait(format!(
-            "waiting for GitHub to show pushed head {}",
+            "Waiting for GitHub to show the push ({})",
             &local.head.as_str()[..7]
         ))),
         Relation::Unpushed => Some(Verdict::Act(Action::PushLocal {
@@ -460,7 +514,7 @@ fn local_diverged(f: &Facts<'_>) -> Option<Verdict> {
             },
         })),
         Relation::Diverged => Some(Verdict::Stop(format!(
-            "local head {} and PR head {} diverged",
+            "Checkout ({}) and the PR ({}) have diverged",
             &local.head.as_str()[..7],
             &f.snap.head.sha.as_str()[..7]
         ))),
@@ -523,36 +577,61 @@ fn ci_pending(f: &Facts<'_>) -> Option<Verdict> {
             state: RollupState::Pending | RollupState::Expected,
             pending,
             ..
-        } => Some(Verdict::Wait(format!("CI pending: {}", pending.join(", ")))),
+        } => Some(Verdict::Wait(if pending.is_empty() {
+            "Waiting for CI".into()
+        } else {
+            format!("Waiting for CI: {}", names(pending.iter()))
+        })),
         _ => None,
     }
 }
 fn merge_state(f: &Facts<'_>) -> Option<Verdict> {
     if f.snap.mergeable == Mergeable::Unknown {
-        return Some(Verdict::Wait("mergeability unknown".into()));
+        return Some(Verdict::Wait(
+            "Waiting for GitHub to check mergeability".into(),
+        ));
     }
     match f.snap.merge_state {
         MergeState::Clean | MergeState::HasHooks => None,
         MergeState::Behind if matches!(f.snap.route, MergeRoute::Queue { .. }) => None,
-        x => Some(Verdict::Wait(format!("merge state: {x:?}"))),
+        state => Some(Verdict::Wait(
+            match state {
+                MergeState::Behind => "Branch is behind its base",
+                MergeState::Blocked => "Waiting for branch protection rules to allow the merge",
+                MergeState::Dirty => "PR has merge conflicts with its base branch",
+                MergeState::Draft => "PR is still a draft",
+                MergeState::Unknown => "Waiting for GitHub to work out the merge state",
+                MergeState::Unstable => "Waiting: some checks are failing or still running",
+                MergeState::Clean | MergeState::HasHooks => unreachable!(),
+            }
+            .into(),
+        )),
     }
 }
 fn unresolved_threads(f: &Facts<'_>) -> Option<Verdict> {
     let n = f.snap.threads.iter().filter(|t| !t.resolved).count();
-    (n > 0).then(|| Verdict::Wait(format!("{n} unresolved review threads")))
+    (n > 0).then(|| {
+        Verdict::Wait(format!(
+            "Waiting on {n} unresolved review thread{}",
+            plural(n)
+        ))
+    })
 }
 fn review_requests(f: &Facts<'_>) -> Option<Verdict> {
     (!f.snap.review_requests.is_empty()).then(|| {
         Verdict::Wait(format!(
-            "pending review requests: {:?}",
-            f.snap.review_requests
+            "Waiting for review from {}",
+            names(f.snap.review_requests.iter())
         ))
     })
 }
 fn review_decision(f: &Facts<'_>) -> Option<Verdict> {
     match f.snap.review_decision {
-        Some(d @ (ReviewDecision::ChangesRequested | ReviewDecision::ReviewRequired)) => {
-            Some(Verdict::Wait(format!("review decision: {d:?}")))
+        Some(ReviewDecision::ChangesRequested) => {
+            Some(Verdict::Wait("Waiting: changes were requested".into()))
+        }
+        Some(ReviewDecision::ReviewRequired) => {
+            Some(Verdict::Wait("Waiting for an approving review".into()))
         }
         _ => None,
     }
@@ -605,6 +684,44 @@ fn unhandled(s: &Snapshot) -> Batch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn name_lists_limit_the_displayed_names() {
+        let all = ["a", "b", "c", "d", "e"];
+        for (count, expected) in [
+            "",
+            "a",
+            "a and b",
+            "a, b and c",
+            "a, b, c and 1 more",
+            "a, b, c and 2 more",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(names(all[..count].iter()), expected);
+        }
+    }
+
+    #[test]
+    fn review_requests_display_plain_names() {
+        let mut w = World::new();
+        w.snap.review_requests = vec![
+            Reviewer::User(Login("alice".into())),
+            Reviewer::Bot(Login("bot".into())),
+            Reviewer::Team("platform".into()),
+            Reviewer::Unknown,
+        ];
+        let message = w.decision().verdict.to_string();
+        assert_eq!(
+            message,
+            "wait: Waiting for review from @alice, @bot, team platform and 1 more"
+        );
+        assert!(!message.contains("User("));
+        assert!(!message.contains("Login("));
+        assert!(!message.contains("Bot("));
+        assert_eq!(Reviewer::Unknown.to_string(), "an unknown reviewer");
+    }
+
     struct World {
         snap: Snapshot,
         local: LocalState,
@@ -712,7 +829,7 @@ mod tests {
         assert_eq!(decision.rule, "in-queue");
         assert_eq!(
             decision.verdict,
-            Verdict::Wait("in merge queue: position 2, awaiting checks".into())
+            Verdict::Wait("In the merge queue at position 2, awaiting checks".into())
         );
     }
     #[test]
@@ -727,7 +844,7 @@ mod tests {
         };
         assert_eq!(
             w.decision().verdict,
-            Verdict::Stop("removed from merge queue: checks failed".into())
+            Verdict::Stop("Merge queue removed the PR: checks failed".into())
         );
         w.snap.head.sha = Sha::parse(&"b".repeat(40)).unwrap();
         assert_eq!(
@@ -781,7 +898,7 @@ mod tests {
         );
         assert_eq!(
             w.decision().verdict.to_string(),
-            "handle 1 items: thread sandbox/stats.py:3 (github-actions)"
+            "Answering 1 review thread: sandbox/stats.py:3 (@github-actions)"
         );
     }
     #[test]
@@ -825,7 +942,7 @@ mod tests {
         assert_eq!(w.decision().rule, "ci-failed");
         assert_eq!(
             w.decision().verdict,
-            Verdict::Wait("CI failing: build; waiting for test".into())
+            Verdict::Wait("Waiting for 1 more check before fixing build".into())
         );
     }
     #[test]
@@ -860,12 +977,15 @@ mod tests {
                 head: w.snap.head.clone(),
             })
         );
-        assert_eq!(w.decision().verdict.to_string(), "fix CI: build, external");
+        assert_eq!(
+            w.decision().verdict.to_string(),
+            "Fixing CI: build and external"
+        );
         w.snap.ci_fix_attempts = 3;
         assert_eq!(w.decision().rule, "ci-failed");
         assert_eq!(
             w.decision().verdict,
-            Verdict::Stop("CI still failing after 3 fix attempts: build, external".into())
+            Verdict::Stop("CI still fails after 3 fix attempts: build and external".into())
         );
     }
     #[test]
@@ -880,7 +1000,7 @@ mod tests {
             assert_eq!(w.decision().rule, "ci-failed");
             assert_eq!(
                 w.decision().verdict,
-                Verdict::Stop("CI failed, but GitHub reported no failing check".into())
+                Verdict::Stop("CI failed, but GitHub didn't say which check".into())
             );
         }
     }

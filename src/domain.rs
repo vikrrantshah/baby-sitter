@@ -56,6 +56,15 @@ pub enum Reviewer {
     Team(String),
     Unknown,
 }
+impl fmt::Display for Reviewer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User(login) | Self::Bot(login) => write!(f, "@{}", login.0),
+            Self::Team(slug) => write!(f, "team {slug}"),
+            Self::Unknown => f.write_str("an unknown reviewer"),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifecycle {
     Open,
