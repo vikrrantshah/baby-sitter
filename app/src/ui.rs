@@ -725,7 +725,7 @@ impl AppView {
         };
         let merged = Reading {
             verb: Some("Merged"),
-            detail: None,
+            detail: Some("Merged".into()),
             badge: Met,
             merged: true,
         };
@@ -1333,12 +1333,16 @@ impl AppView {
                     .when_some(time_left, |d, left| {
                         d.child(div().text_size(px(12.)).text_color(muted()).child(left))
                     })
-                    .when_some(dismiss, |d, dismiss| d.child(dismiss))
-                    .child(open)
-                    .child(match action {
-                        Some(action) => action.into_any_element(),
-                        // Keeps the GitHub button aligned with rows that have an action.
-                        None => div().size(px(34.)).into_any_element(),
+                    .map(|d| match (action, dismiss) {
+                        // The rightmost slot holds the row's main action; a merged row's is Dismiss.
+                        (None, Some(dismiss)) => d.child(open).child(dismiss),
+                        (action, dismiss) => d
+                            .when_some(dismiss, |d, dismiss| d.child(dismiss))
+                            .child(open)
+                            .child(match action {
+                                Some(action) => action.into_any_element(),
+                                None => div().size(px(34.)).into_any_element(),
+                            }),
                     }),
             )
             .into_any_element()
