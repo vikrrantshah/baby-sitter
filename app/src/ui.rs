@@ -1237,16 +1237,29 @@ impl AppView {
             });
         });
         let title = div()
-            .text_size(px(16.))
-            .line_height(relative(1.3))
-            .font_semibold()
-            .text_color(ink())
-            .child(row.title.clone());
-        let place = if row.is_draft {
-            format!("{} #{}, draft", row.pr.repo, row.pr.number)
-        } else {
-            format!("{} #{}", row.pr.repo, row.pr.number)
-        };
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(16.))
+                    .line_height(relative(1.3))
+                    .font_semibold()
+                    .text_color(ink())
+                    .child(row.title.clone()),
+            )
+            .when(row.is_draft, |title| {
+                title.child(
+                    div()
+                        .id(SharedString::from(format!("draft-{}", row.pr)))
+                        .flex_shrink_0()
+                        .text_color(muted())
+                        .child(Icon::new(IconName::GitPullRequestDraft).size(px(16.)))
+                        .tooltip(|window, cx| Tooltip::new("Draft").build(window, cx)),
+                )
+            });
+        let place = format!("{} #{}", row.pr.repo, row.pr.number);
         let gates = self.gates.get(&row.pr);
         let status = reading.verb.map(|verb| {
             div()
