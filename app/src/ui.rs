@@ -99,6 +99,10 @@ pub struct AppView {
     handles: HashMap<PrRef, SitHandle>,
     event_tx: async_channel::Sender<SitEvent>,
     error: Option<String>,
+    /// A failed refresh; the previous list stays on screen.
+    refresh_error: Option<String>,
+    loading_repos: bool,
+    loading_prs: bool,
     _subscriptions: Vec<Subscription>,
     _events: Task<()>,
     _clock: Task<()>,
@@ -267,6 +271,9 @@ impl AppView {
             handles: HashMap::new(),
             event_tx,
             error,
+            refresh_error: None,
+            loading_repos: false,
+            loading_prs: false,
             _subscriptions: subscriptions,
             _events: events,
             _clock: clock,
@@ -431,22 +438,34 @@ impl AppView {
             .count()
     }
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading_repos || self.loading_prs {
+            return;
+        }
         self.load_repos(window, cx);
         self.load_prs(window, cx);
     }
     fn load_repos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.repos = Load::Loading;
+        if !matches!(self.repos, Load::Ready(_)) {
+            self.repos = Load::Loading;
+        }
+        self.loading_repos = true;
         let env = self.env.clone();
         self.repo_task = Some(cx.spawn_in(window, async move |view, cx| {
             let result = cx
                 .background_spawn(async move { gh::list_repos(&env).map_err(|e| format!("{e:#}")) })
                 .await;
             let _ = view.update_in(cx, |this, window, cx| {
+                this.loading_repos = false;
                 match result {
                     Ok(repos) => {
+                        this.refresh_error = None;
                         this.repos = Load::Ready(repos);
                         this.update_org_choices(window, cx);
                         this.load_avatars(window, cx);
+                    }
+                    Err(error) if matches!(this.repos, Load::Ready(_)) => {
+                        this.refresh_error =
+                            Some(format!("Could not refresh repositories: {error}"));
                     }
                     Err(error) => this.repos = Load::Error(error),
                 }
@@ -520,7 +539,10 @@ impl AppView {
         }));
     }
     fn load_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.prs = Load::Loading;
+        if !matches!(self.prs, Load::Ready(_)) {
+            self.prs = Load::Loading;
+        }
+        self.loading_prs = true;
         let env = self.env.clone();
         self.pr_task = Some(cx.spawn_in(window, async move |view, cx| {
             let result = cx
@@ -529,11 +551,17 @@ impl AppView {
                 )
                 .await;
             let _ = view.update_in(cx, |this, window, cx| {
+                this.loading_prs = false;
                 match result {
                     Ok(mut prs) => {
+                        this.refresh_error = None;
                         prs.retain(|row| !this.dismissed_merged.contains(&row.pr));
                         this.prs = Load::Ready(prs);
                         this.sweep_worktrees(window, cx);
+                    }
+                    Err(error) if matches!(this.prs, Load::Ready(_)) => {
+                        this.refresh_error =
+                            Some(format!("Could not refresh pull requests: {error}"));
                     }
                     Err(error) => this.prs = Load::Error(error),
                 }
@@ -1482,9 +1510,9 @@ impl AppView {
                             .child(self.babysitting_status()),
                     )
                     .child(
-                        round_button(
+                        round_button_with(
                             "refresh".into(),
-                            IconName::RefreshCw,
+                            refresh_icon(self.loading_repos || self.loading_prs),
                             "Refresh",
                             raised(),
                             ink(),
@@ -1665,6 +1693,16 @@ fn round_button(
     hover: Hsla,
     cx: &App,
 ) -> Button {
+    round_button_with(id, Icon::new(icon).size(px(14.)), label, tint, hover, cx)
+}
+fn round_button_with(
+    id: SharedString,
+    child: impl IntoElement,
+    label: &'static str,
+    tint: Hsla,
+    hover: Hsla,
+    cx: &App,
+) -> Button {
     Button::new(id)
         .custom(
             ButtonCustomVariant::new(cx)
@@ -1679,7 +1717,21 @@ fn round_button(
         .p_0()
         .accessibility_label(label)
         .tooltip(label)
-        .child(Icon::new(icon).size(px(14.)))
+        .child(child)
+}
+/// The refresh icon, turning while a repository or pull request load is in flight.
+fn refresh_icon(spinning: bool) -> AnyElement {
+    let icon = Icon::new(IconName::RefreshCw).size(px(14.));
+    if spinning {
+        icon.with_animation(
+            "refresh-spin",
+            Animation::new(Duration::from_millis(900)).repeat(),
+            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+        )
+        .into_any_element()
+    } else {
+        icon.into_any_element()
+    }
 }
 /// A borderless round button showing only an icon, for secondary row actions.
 fn icon_button(id: SharedString, icon: IconName, label: &'static str, size: Pixels) -> Button {
@@ -1975,20 +2027,23 @@ impl Render for AppView {
                     .flex()
                     .flex_col()
                     .child(header)
-                    .when_some(self.error.clone(), |d, error| {
-                        d.child(
-                            div()
-                                .mx(px(ROW_INSET))
-                                .mt(px(16.))
-                                .px(px(14.))
-                                .py(px(10.))
-                                .rounded(px(6.))
-                                .bg(danger().opacity(0.14))
-                                .text_color(danger())
-                                .text_size(px(13.))
-                                .child(error),
-                        )
-                    })
+                    .when_some(
+                        self.error.clone().or(self.refresh_error.clone()),
+                        |d, error| {
+                            d.child(
+                                div()
+                                    .mx(px(ROW_INSET))
+                                    .mt(px(16.))
+                                    .px(px(14.))
+                                    .py(px(10.))
+                                    .rounded(px(6.))
+                                    .bg(danger().opacity(0.14))
+                                    .text_color(danger())
+                                    .text_size(px(13.))
+                                    .child(error),
+                            )
+                        },
+                    )
                     .child(div().flex_1().min_h_0().child(body)),
             )
     }
