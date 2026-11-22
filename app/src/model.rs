@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{
-    collections::BTreeMap,
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -136,6 +137,30 @@ pub struct PrRow {
     pub url: String,
     pub is_draft: bool,
     pub updated_at: String,
+}
+
+pub fn dashboard_rows<'a>(
+    prs: &'a [PrRow],
+    sits: impl Iterator<Item = &'a PrRef>,
+    selected: &BTreeMap<RepoName, RepoSettings>,
+    filter: Option<&RepoName>,
+) -> Vec<Cow<'a, PrRow>> {
+    let existing: BTreeSet<_> = prs.iter().map(|row| &row.pr).collect();
+    let mut rows: Vec<_> = prs.iter().map(Cow::Borrowed).collect();
+    rows.extend(sits.filter(|pr| !existing.contains(*pr)).map(|pr| {
+        Cow::Owned(PrRow {
+            pr: pr.clone(),
+            title: format!("Pull request #{}", pr.number),
+            url: pr.url(),
+            is_draft: false,
+            updated_at: String::new(),
+        })
+    }));
+    rows.retain(|row| {
+        selected.contains_key(&row.pr.repo) && filter.is_none_or(|repo| &row.pr.repo == repo)
+    });
+    rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    rows
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -303,6 +328,55 @@ pub fn classify(code: Option<i32>, stderr: &str, cancel_requested: bool) -> Outc
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn row(pr: &str, updated_at: &str) -> PrRow {
+        let pr: PrRef = pr.parse().unwrap();
+        PrRow {
+            url: pr.url(),
+            title: format!("PR {}", pr.number),
+            pr,
+            is_draft: false,
+            updated_at: updated_at.into(),
+        }
+    }
+
+    #[test]
+    fn dashboard_excludes_all_rows_without_selected_repositories() {
+        let prs = [row("owner/one#1", "2026-01-01")];
+        let sits = BTreeMap::from([(
+            "owner/two#2".parse().unwrap(),
+            SitState::Finished(Outcome::Merged),
+        )]);
+        assert!(dashboard_rows(&prs, sits.keys(), &BTreeMap::new(), None).is_empty());
+    }
+
+    #[test]
+    fn dashboard_only_shows_selected_repository_and_sorts_rows() {
+        let prs = [
+            row("owner/one#1", "2026-01-01"),
+            row("owner/two#2", "2026-01-03"),
+            row("owner/one#3", "2026-01-02"),
+        ];
+        let selected = BTreeMap::from([("owner/one".parse().unwrap(), RepoSettings::default())]);
+        let rows = dashboard_rows(&prs, std::iter::empty(), &selected, None);
+        assert_eq!(
+            rows.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
+            [3, 1]
+        );
+        let other = "owner/two".parse().unwrap();
+        assert!(dashboard_rows(&prs, std::iter::empty(), &selected, Some(&other)).is_empty());
+    }
+
+    #[test]
+    fn dashboard_includes_missing_sit_for_selected_repository() {
+        let pr: PrRef = "owner/one#7".parse().unwrap();
+        let selected = BTreeMap::from([(pr.repo.clone(), RepoSettings::default())]);
+        let rows = dashboard_rows(&[], std::iter::once(&pr), &selected, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pr, pr);
+        assert_eq!(rows[0].title, "Pull request #7");
+        assert_eq!(rows[0].url, pr.url());
+    }
+
     #[test]
     fn failed_reason_keeps_the_last_five_nonempty_lines() {
         let stderr = format!("{}\n\npanic: broken\n\n", "progress\n".repeat(240));
