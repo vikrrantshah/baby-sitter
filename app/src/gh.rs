@@ -55,6 +55,7 @@ fn output(mut command: Command) -> Result<Vec<u8>> {
 #[derive(Deserialize)]
 struct Repo {
     full_name: RepoName,
+    archived: bool,
 }
 pub fn list_repos(env: &ChildEnv) -> Result<Vec<RepoName>> {
     let mut command = env.command("gh");
@@ -69,6 +70,7 @@ pub fn list_repos(env: &ChildEnv) -> Result<Vec<RepoName>> {
     let mut repos: Vec<_> = pages
         .into_iter()
         .flatten()
+        .filter(|repo| !repo.archived)
         .map(|repo| repo.full_name)
         .collect();
     repos.sort();
