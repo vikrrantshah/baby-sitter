@@ -983,7 +983,7 @@ impl AppView {
         let filters = div()
             .flex_shrink_0()
             .px(px(ROW_INSET))
-            .py(px(16.))
+            .pb(px(16.))
             .border_b_1()
             .border_color(divider())
             .flex()
@@ -1207,11 +1207,13 @@ impl AppView {
         };
         let dismiss = matches!(state, Some(SitState::Finished(_))).then(|| {
             let pr = row.pr.clone();
-            icon_button(
+            round_button(
                 SharedString::from(format!("dismiss-{pr}")),
                 IconName::X,
                 "Dismiss",
-                px(34.),
+                muted(),
+                ink(),
+                cx,
             )
             .on_click(cx.listener(move |this, _, window, cx| this.dismiss(pr.clone(), window, cx)))
         });
@@ -1331,8 +1333,8 @@ impl AppView {
                     .when_some(time_left, |d, left| {
                         d.child(div().text_size(px(12.)).text_color(muted()).child(left))
                     })
-                    .child(open)
                     .when_some(dismiss, |d, dismiss| d.child(dismiss))
+                    .child(open)
                     .child(match action {
                         Some(action) => action.into_any_element(),
                         // Keeps the GitHub button aligned with rows that have an action.
@@ -1466,7 +1468,7 @@ impl AppView {
         let filters = div()
             .flex_shrink_0()
             .px(px(ROW_INSET))
-            .py(px(16.))
+            .pb(px(16.))
             .border_b_1()
             .border_color(divider())
             .flex()
@@ -1667,8 +1669,6 @@ fn header(title: &'static str, detail: Option<&'static str>) -> Div {
         .flex()
         .items_start()
         .gap(px(16.))
-        .border_b_1()
-        .border_color(divider())
         .child(
             drag_area()
                 .flex_1()
