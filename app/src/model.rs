@@ -123,6 +123,64 @@ impl Default for RepoSettings {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepoScope {
+    All,
+    Allowed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RepoListItem {
+    Org {
+        name: String,
+        allowed: usize,
+        total: usize,
+    },
+    Repo(RepoName),
+}
+
+pub fn repo_list(
+    repos: &[RepoName],
+    selected: &BTreeMap<RepoName, RepoSettings>,
+    org: Option<&str>,
+    scope: RepoScope,
+    text: &str,
+) -> Vec<RepoListItem> {
+    let text = text.to_lowercase();
+    let mut groups: BTreeMap<&str, Vec<(&RepoName, bool)>> = BTreeMap::new();
+    for repo in repos {
+        if org.is_some_and(|org| org != repo.owner) {
+            continue;
+        }
+        let allowed = selected.contains_key(repo);
+        if scope == RepoScope::Allowed && !allowed {
+            continue;
+        }
+        if !text.is_empty() && !repo.to_string().to_lowercase().contains(&text) {
+            continue;
+        }
+        groups.entry(&repo.owner).or_default().push((repo, allowed));
+    }
+
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_cached_key(|(owner, _)| owner.to_lowercase());
+    let mut items = Vec::with_capacity(repos.len() + groups.len());
+    for (owner, mut repos) in groups {
+        repos.sort_by_cached_key(|(repo, _)| repo.name.to_lowercase());
+        items.push(RepoListItem::Org {
+            name: owner.to_owned(),
+            allowed: repos.iter().filter(|(_, allowed)| *allowed).count(),
+            total: repos.len(),
+        });
+        items.extend(
+            repos
+                .into_iter()
+                .map(|(repo, _)| RepoListItem::Repo(repo.clone())),
+        );
+    }
+    items
+}
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -337,6 +395,95 @@ mod tests {
             is_draft: false,
             updated_at: updated_at.into(),
         }
+    }
+
+    fn repos(names: &[&str]) -> Vec<RepoName> {
+        names.iter().map(|name| name.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn repo_list_groups_and_orders_repositories_case_insensitively() {
+        let catalog = repos(&["Zulu/zebra", "alpha/Zulu", "Zulu/Alpha", "alpha/aaa"]);
+        let selected = BTreeMap::from([
+            ("alpha/Zulu".parse().unwrap(), RepoSettings::default()),
+            ("Zulu/Alpha".parse().unwrap(), RepoSettings::default()),
+        ]);
+        assert_eq!(
+            repo_list(&catalog, &selected, None, RepoScope::All, ""),
+            vec![
+                RepoListItem::Org {
+                    name: "alpha".into(),
+                    allowed: 1,
+                    total: 2,
+                },
+                RepoListItem::Repo("alpha/aaa".parse().unwrap()),
+                RepoListItem::Repo("alpha/Zulu".parse().unwrap()),
+                RepoListItem::Org {
+                    name: "Zulu".into(),
+                    allowed: 1,
+                    total: 2,
+                },
+                RepoListItem::Repo("Zulu/Alpha".parse().unwrap()),
+                RepoListItem::Repo("Zulu/zebra".parse().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn repo_list_combines_organization_and_allowed_filters() {
+        let catalog = repos(&["alpha/one", "alpha/two", "beta/three"]);
+        let selected = BTreeMap::from([
+            ("alpha/two".parse().unwrap(), RepoSettings::default()),
+            ("beta/three".parse().unwrap(), RepoSettings::default()),
+        ]);
+        assert_eq!(
+            repo_list(&catalog, &selected, Some("alpha"), RepoScope::Allowed, ""),
+            vec![
+                RepoListItem::Org {
+                    name: "alpha".into(),
+                    allowed: 1,
+                    total: 1,
+                },
+                RepoListItem::Repo("alpha/two".parse().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn repo_list_allowed_scope_is_empty_when_nothing_is_allowed() {
+        let catalog = repos(&["alpha/one", "beta/two"]);
+        assert!(repo_list(&catalog, &BTreeMap::new(), None, RepoScope::Allowed, "").is_empty());
+    }
+
+    #[test]
+    fn repo_list_text_filter_hides_empty_organizations_and_counts_shown_repos() {
+        let catalog = repos(&["alpha/needle", "alpha/other", "beta/other"]);
+        let selected = BTreeMap::from([
+            ("alpha/needle".parse().unwrap(), RepoSettings::default()),
+            ("alpha/other".parse().unwrap(), RepoSettings::default()),
+        ]);
+        assert_eq!(
+            repo_list(&catalog, &selected, None, RepoScope::All, "NEEDLE"),
+            vec![
+                RepoListItem::Org {
+                    name: "alpha".into(),
+                    allowed: 1,
+                    total: 1,
+                },
+                RepoListItem::Repo("alpha/needle".parse().unwrap()),
+            ]
+        );
+        assert_eq!(
+            repo_list(&catalog, &selected, None, RepoScope::All, "BETA/"),
+            vec![
+                RepoListItem::Org {
+                    name: "beta".into(),
+                    allowed: 0,
+                    total: 1,
+                },
+                RepoListItem::Repo("beta/other".parse().unwrap()),
+            ]
+        );
     }
 
     #[test]
