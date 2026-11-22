@@ -440,6 +440,10 @@ fn local_diverged(f: &Facts<'_>) -> Option<Verdict> {
         Relation::Ahead => Some(Verdict::Stop(
             "local branch has unpushed commits; push or reset".into(),
         )),
+        Relation::Pushed => Some(Verdict::Wait(format!(
+            "waiting for GitHub to show pushed head {}",
+            &local.head.as_str()[..7]
+        ))),
         Relation::Diverged => Some(Verdict::Stop(format!(
             "local head {} and PR head {} diverged",
             &local.head.as_str()[..7],
@@ -940,6 +944,10 @@ mod tests {
         w.snap.mergeable = Mergeable::Yes;
         w.local.relation = Relation::Ahead;
         assert!(matches!(w.decision().verdict, Verdict::Stop(_)));
+        w.local.relation = Relation::Pushed;
+        let decision = w.decision();
+        assert_eq!(decision.rule, "local-diverged");
+        assert!(matches!(decision.verdict, Verdict::Wait(_)));
     }
     #[test]
     fn gates_report_every_requirement_not_just_the_first_blocker() {

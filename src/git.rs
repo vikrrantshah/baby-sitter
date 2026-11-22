@@ -92,9 +92,12 @@ impl Git {
             None => None,
         }
         .and_then(|s| s.trim().strip_prefix("refs/heads/").map(str::to_owned));
-        if let (Some(remote), Some(branch)) = (&self.remote, &upstream) {
+        let fetched = if let (Some(remote), Some(branch)) = (&self.remote, &upstream) {
             self.run(&["fetch", "--no-tags", remote, branch])?;
-        }
+            Some(Sha::parse(&self.run(&["rev-parse", "FETCH_HEAD"])?)?)
+        } else {
+            None
+        };
         let head = self.head()?;
         let ancestor = |a: &Sha, b: &Sha| {
             proc::succeeds(
@@ -112,7 +115,11 @@ impl Git {
         } else if ancestor(&head, remote_head)? {
             Relation::Behind
         } else if ancestor(remote_head, &head)? {
-            Relation::Ahead
+            if fetched.as_ref() == Some(&head) {
+                Relation::Pushed
+            } else {
+                Relation::Ahead
+            }
         } else {
             Relation::Diverged
         };
