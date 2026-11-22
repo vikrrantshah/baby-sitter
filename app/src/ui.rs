@@ -1,7 +1,7 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, Config, GateState, Outcome, PastSit, PrRef, PrRow, PrScope, RepoListItem, RepoName,
+        self, Config, GateState, Outcome, PastSit, PrFilter, PrRef, PrRow, RepoListItem, RepoName,
         RepoScope, RepoSettings, SitState, VerdictKind,
     },
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
@@ -11,7 +11,7 @@ use crate::{
 use gpui_kit::{assets::IconName, component::StyledExt, prelude::FluentBuilder};
 use gpui_kit::{
     component::{
-        Disableable, Icon, Selectable, Sizable,
+        Disableable, Icon, Selectable, Sizable, Size,
         button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
         input::{Input, InputEvent, InputState},
         select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
@@ -35,8 +35,12 @@ enum Load<T> {
 #[derive(Clone, Eq, PartialEq)]
 enum Page {
     PullRequests,
+    Settings(SettingsPage),
+}
+#[derive(Clone, Eq, PartialEq)]
+enum SettingsPage {
     Repositories,
-    RepoSettings(RepoName),
+    Repo(RepoName),
 }
 #[derive(Clone, Copy)]
 enum Field {
@@ -80,13 +84,12 @@ pub struct AppView {
     prs: Load<Vec<PrRow>>,
     /// Merged PRs dismissed while a GitHub search may still return an older snapshot.
     dismissed_merged: BTreeSet<PrRef>,
-    repo_filter: Entity<InputState>,
     org_select: Entity<SelectState<Vec<PickerChoice<String>>>>,
     org_filter: Option<String>,
     /// Owner login to its downloaded profile picture.
     avatars: BTreeMap<String, PathBuf>,
     scope: RepoScope,
-    pr_scope: PrScope,
+    pr_filter: PrFilter,
     dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
     selected_filter: Option<RepoName>,
     inputs: BTreeMap<RepoName, RepoInputs>,
@@ -127,8 +130,6 @@ impl AppView {
         } else {
             None
         };
-        let repo_filter =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter repositories"));
         let dashboard_filter = cx.new(|cx| {
             SelectState::new(
                 vec![PickerChoice::all("All repositories", IconName::BookMarked)],
@@ -145,12 +146,8 @@ impl AppView {
                 cx,
             )
         });
+        let window_id = window.window_handle().window_id();
         let subscriptions = vec![
-            cx.subscribe(&repo_filter, |_: &mut Self, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
-            }),
             cx.subscribe(
                 &org_select,
                 |this: &mut Self, _, event: &SelectEvent<Vec<PickerChoice<String>>>, cx| {
@@ -167,6 +164,15 @@ impl AppView {
                     cx.notify();
                 },
             ),
+            cx.observe_keystrokes(move |this: &mut Self, event, window, cx| {
+                if window.window_handle().window_id() == window_id
+                    && event.keystroke.key == "escape"
+                    && matches!(this.page, Page::Settings(_))
+                {
+                    this.page = Page::PullRequests;
+                    cx.notify();
+                }
+            }),
         ];
         let (event_tx, event_rx) = async_channel::unbounded::<SitEvent>();
         let events = cx.spawn_in(window, async move |view, cx| {
@@ -248,12 +254,11 @@ impl AppView {
             repos: Load::Loading,
             prs: Load::Loading,
             dismissed_merged: BTreeSet::new(),
-            repo_filter,
             org_select,
             org_filter: None,
             avatars: BTreeMap::new(),
             scope: RepoScope::All,
-            pr_scope: PrScope::default(),
+            pr_filter: PrFilter::default(),
             dashboard_filter,
             selected_filter: None,
             inputs: BTreeMap::new(),
@@ -577,7 +582,7 @@ impl AppView {
             &self.config.history,
             &self.states,
             &self.config.repos,
-            self.pr_scope,
+            PrFilter::All,
             None,
         )
         .into_iter()
@@ -813,7 +818,7 @@ impl AppView {
                 "Turn on to configure"
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.page = Page::RepoSettings(settings_repo.clone());
+                this.page = Page::Settings(SettingsPage::Repo(settings_repo.clone()));
                 cx.notify();
             }));
         div()
@@ -877,7 +882,6 @@ impl AppView {
                     &self.config.repos,
                     self.org_filter.as_deref(),
                     self.scope,
-                    self.repo_filter.read(cx).value().as_ref(),
                 );
                 if items.is_empty() {
                     if self.scope == RepoScope::Watched
@@ -966,7 +970,7 @@ impl AppView {
             )
         };
         let scope = ButtonGroup::new("repo-scope")
-            .small()
+            .with_size(Size::Medium)
             .outline()
             .child(segment("scope-all", "All", RepoScope::All))
             .child(segment("scope-watched", "Watched", RepoScope::Watched))
@@ -989,31 +993,43 @@ impl AppView {
             .flex()
             .items_center()
             .gap(px(12.))
-            .child(scope)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.repo_filter).small()),
-            );
+            .child(header_picker(
+                &self.org_select,
+                "Filter by organization",
+                "All organizations",
+                Size::Medium,
+            ))
+            .child(scope);
         let body = div()
             .size_full()
             .flex()
             .flex_col()
             .child(filters)
             .child(div().flex_1().min_h_0().child(list));
-        (
-            header(
-                "Repositories",
-                Some("Babysits run only in the repositories you watch."),
+        let header = div()
+            .flex_shrink_0()
+            .pt(px(20.))
+            .child(
+                div().px(px(ROW_INSET)).flex().items_start().child(
+                    Button::new("back-to-pull-requests")
+                        .icon(IconName::ChevronLeft)
+                        .label("Pull requests")
+                        .ghost()
+                        .ml(px(-8.))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page = Page::PullRequests;
+                            cx.notify();
+                        })),
+                ),
             )
-            .child(header_picker(
-                &self.org_select,
-                "Filter by organization",
-                "All organizations",
-            )),
-            body,
-        )
+            .child(
+                header(
+                    "Repositories",
+                    Some("Babysits run only in the repositories you watch."),
+                )
+                .pt(px(10.)),
+            );
+        (header, body)
     }
     fn render_repo_settings(&self, repo: &RepoName, cx: &mut Context<Self>) -> (Div, Div) {
         let inputs = self
@@ -1081,7 +1097,7 @@ impl AppView {
                     .ghost()
                     .ml(px(-8.))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.page = Page::Repositories;
+                        this.page = Page::Settings(SettingsPage::Repositories);
                         cx.notify();
                     })),
             )
@@ -1148,7 +1164,7 @@ impl AppView {
             &self.config.history,
             &self.states,
             &self.config.repos,
-            self.pr_scope,
+            self.pr_filter,
             self.selected_filter.as_ref(),
         )
     }
@@ -1177,19 +1193,8 @@ impl AppView {
                     cx.listener(move |this, _, window, cx| this.ask_cancel(pr.clone(), window, cx)),
                 ),
             )
-        } else if reading.merged {
+        } else if reading.merged || !self.config.repos.contains_key(&row.pr.repo) {
             None
-        } else if !self.config.repos.contains_key(&row.pr.repo) {
-            let repo = row.pr.repo.clone();
-            Some(
-                Button::new(SharedString::from(format!("watch-{repo}")))
-                    .label("Watch repo")
-                    .small()
-                    .outline()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.toggle_repo(repo.clone(), true, window, cx)
-                    })),
-            )
         } else {
             Some(
                 round_button(
@@ -1378,7 +1383,7 @@ impl AppView {
                     .child(Self::retry_prs_button(cx))
             }
             _ if rows.is_empty() => {
-                if self.pr_scope == PrScope::Watched && self.config.repos.is_empty() {
+                if self.pr_filter == PrFilter::All && self.config.repos.is_empty() {
                     message(
                         "No watched repositories",
                         Some("Watch a repository to see its pull requests.".into()),
@@ -1388,7 +1393,7 @@ impl AppView {
                             .label("Choose repositories")
                             .primary()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.page = Page::Repositories;
+                                this.page = Page::Settings(SettingsPage::Repositories);
                                 cx.notify();
                             })),
                     )
@@ -1398,25 +1403,22 @@ impl AppView {
                         Some("Choose All repositories to see the rest.".into()),
                     )
                 } else {
-                    match self.pr_scope {
-                        PrScope::Watched => message(
-                            "No open pull requests",
-                            Some(
-                                "None of your watched repositories has an open pull request from you."
-                                    .into(),
-                            ),
+                    match self.pr_filter {
+                        PrFilter::Watched => message(
+                            "Nothing is being babysat",
+                            Some("Press play on a pull request to start.".into()),
                         ),
-                        PrScope::Unwatched => {
-                            message("No pull requests in unwatched repositories", None)
+                        PrFilter::Unwatched => {
+                            message("Every listed pull request is being babysat", None)
                         }
-                        PrScope::Merged => message(
+                        PrFilter::Merged => message(
                             "No merged babysits",
                             Some(
                                 "Babysat PRs show here after they merge, until you dismiss them."
                                     .into(),
                             ),
                         ),
-                        PrScope::All => message("No open pull requests", None),
+                        PrFilter::All => message("No open pull requests", None),
                     }
                 }
             }
@@ -1444,13 +1446,72 @@ impl AppView {
                 )
             }
         };
-        let header = header("Pull requests", None).child(header_picker(
-            &self.dashboard_filter,
-            "Filter by repository",
-            "All repositories",
-        ));
-        let segment = |id: &'static str, label: &'static str, scope: PrScope| {
-            let selected = self.pr_scope == scope;
+        let header = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .child(drag_area().h(px(52.)))
+            .child(
+                div()
+                    .px(px(ROW_INSET))
+                    .pb(px(20.))
+                    .flex()
+                    .items_start()
+                    .gap(px(12.))
+                    .child(
+                        drag_area()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .child(pair_mark())
+                                    .child(
+                                        div()
+                                            .text_size(px(24.))
+                                            .font_semibold()
+                                            .text_color(ink())
+                                            .child("Baby Sitter"),
+                                    ),
+                            )
+                            .child(self.babysitting_status()),
+                    )
+                    .child(
+                        round_button(
+                            "refresh".into(),
+                            IconName::RefreshCw,
+                            "Refresh",
+                            raised(),
+                            ink(),
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.refresh(window, cx);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        round_button(
+                            "settings".into(),
+                            IconName::Settings,
+                            "Settings",
+                            raised(),
+                            ink(),
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page = Page::Settings(SettingsPage::Repositories);
+                            cx.notify();
+                        })),
+                    ),
+            );
+        let segment = |id: &'static str, label: &'static str, filter: PrFilter| {
+            let selected = self.pr_filter == filter;
             Button::new(id).selected(selected).child(
                 div()
                     .text_color(if selected { accent() } else { muted() })
@@ -1458,27 +1519,26 @@ impl AppView {
                     .child(label),
             )
         };
-        let scope = ButtonGroup::new("pr-scope")
-            .small()
+        let filter = ButtonGroup::new("pr-filter")
+            .with_size(Size::Medium)
             .outline()
-            .child(segment("pr-scope-all", "All", PrScope::All))
-            .child(segment("pr-scope-watched", "Watched", PrScope::Watched))
+            .child(segment("pr-filter-all", "All", PrFilter::All))
+            .child(segment("pr-filter-watched", "Watched", PrFilter::Watched))
             .child(segment(
-                "pr-scope-unwatched",
+                "pr-filter-unwatched",
                 "Unwatched",
-                PrScope::Unwatched,
+                PrFilter::Unwatched,
             ))
-            .child(segment("pr-scope-merged", "Merged", PrScope::Merged))
-            .on_click(cx.listener(|this, selected: &Vec<usize>, window, cx| {
-                let scopes = [
-                    PrScope::All,
-                    PrScope::Watched,
-                    PrScope::Unwatched,
-                    PrScope::Merged,
+            .child(segment("pr-filter-merged", "Merged", PrFilter::Merged))
+            .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                let filters = [
+                    PrFilter::All,
+                    PrFilter::Watched,
+                    PrFilter::Unwatched,
+                    PrFilter::Merged,
                 ];
-                if let Some(scope) = selected.first().and_then(|index| scopes.get(*index)) {
-                    this.pr_scope = *scope;
-                    this.update_filter(window, cx);
+                if let Some(filter) = selected.first().and_then(|index| filters.get(*index)) {
+                    this.pr_filter = *filter;
                     cx.notify();
                 }
             }));
@@ -1491,7 +1551,13 @@ impl AppView {
             .flex()
             .items_center()
             .gap(px(12.))
-            .child(scope);
+            .child(header_picker(
+                &self.dashboard_filter,
+                "Filter by repository",
+                "All repositories",
+                Size::Medium,
+            ))
+            .child(filter);
         let body = div()
             .size_full()
             .flex()
@@ -1500,7 +1566,7 @@ impl AppView {
             .child(div().flex_1().min_h_0().child(list));
         (header, body)
     }
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+    fn babysitting_status(&self) -> Div {
         let running = self.states.values().filter(|s| s.is_active()).count();
         let needs_you = self.needs_you();
         let watching = match running {
@@ -1508,26 +1574,20 @@ impl AppView {
             1 => "Babysitting 1 pull request.".to_owned(),
             n => format!("Babysitting {n} pull requests."),
         };
-        let nav = |page: Page,
-                   id: &'static str,
-                   icon: IconName,
-                   label: &'static str,
-                   cx: &mut Context<Self>| {
-            let selected = matches!(
-                (&self.page, &page),
-                (Page::PullRequests, Page::PullRequests)
-                    | (
-                        Page::Repositories | Page::RepoSettings(_),
-                        Page::Repositories
-                    )
-            );
-            sidebar_item(id, icon, label, selected, cx).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    this.page = page.clone();
-                    cx.notify();
-                },
-            ))
-        };
+        div()
+            .text_size(px(14.))
+            .line_height(relative(1.5))
+            .text_color(muted())
+            .child(watching)
+            .when(needs_you > 0, |d| {
+                d.child(div().text_color(danger()).child(if needs_you == 1 {
+                    "1 needs you.".to_owned()
+                } else {
+                    format!("{needs_you} need you.")
+                }))
+            })
+    }
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         div()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
@@ -1557,87 +1617,45 @@ impl AppView {
                 div()
                     .px(px(20.))
                     .pt(px(20.))
-                    .text_size(px(14.))
-                    .line_height(relative(1.5))
-                    .text_color(muted())
-                    .child(watching)
-                    .when(needs_you > 0, |d| {
-                        d.child(div().text_color(danger()).child(if needs_you == 1 {
-                            "1 needs you.".to_owned()
-                        } else {
-                            format!("{needs_you} need you.")
-                        }))
-                    }),
+                    .child(self.babysitting_status()),
             )
             .child(
-                div()
-                    .px(px(12.))
-                    .pt(px(28.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .child(nav(
-                        Page::PullRequests,
-                        "nav-prs",
-                        IconName::GitPullRequest,
-                        "Pull requests",
-                        cx,
-                    ))
-                    .child(nav(
-                        Page::Repositories,
-                        "nav-repos",
-                        IconName::BookMarked,
-                        "Repositories",
-                        cx,
-                    )),
-            )
-            .child(div().flex_1())
-            .child(div().p(px(12.)).pb(px(16.)).child(
-                sidebar_item("refresh", IconName::RefreshCw, "Refresh", false, cx).on_click(
-                    cx.listener(|this, _, window, cx| {
-                        this.refresh(window, cx);
-                        cx.notify();
-                    }),
+                div().px(px(12.)).pt(px(28.)).child(
+                    Button::new("nav-repos")
+                        .custom(
+                            ButtonCustomVariant::new(cx)
+                                .foreground(ink())
+                                .hover(raised())
+                                .active(divider()),
+                        )
+                        .w_full()
+                        .h(px(34.))
+                        .accessibility_label("Repositories")
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.))
+                                .px(px(4.))
+                                .text_size(px(14.))
+                                .font_semibold()
+                                .child(
+                                    Icon::new(IconName::BookMarked)
+                                        .size_4()
+                                        .text_color(accent()),
+                                )
+                                .child("Repositories"),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page = Page::Settings(SettingsPage::Repositories);
+                            cx.notify();
+                        })),
                 ),
-            ))
+            )
     }
 }
 
-/// A full-width sidebar row: an icon and a label, lit in the accent when selected.
-fn sidebar_item(
-    id: &'static str,
-    icon: IconName,
-    label: &'static str,
-    selected: bool,
-    cx: &App,
-) -> Button {
-    Button::new(id)
-        .custom(
-            ButtonCustomVariant::new(cx)
-                .foreground(if selected { ink() } else { muted() })
-                .hover(raised())
-                .active(divider()),
-        )
-        .w_full()
-        .h(px(34.))
-        .accessibility_label(label)
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .px(px(4.))
-                .text_size(px(14.))
-                .when(selected, |d| d.font_semibold())
-                .child(Icon::new(icon).size_4().text_color(if selected {
-                    accent()
-                } else {
-                    muted()
-                }))
-                .child(label),
-        )
-}
 /// A round icon-only button: tinted with `tint` at rest, filled further with `hover` under the pointer.
 fn round_button(
     id: SharedString,
@@ -1704,11 +1722,12 @@ fn header(title: &'static str, detail: Option<&'static str>) -> Div {
                 }),
         )
 }
-/// The filter picker at the right of a page header. Every page uses this one so they match.
+/// A filter picker with a fixed width for the page header or dashboard filters.
 fn header_picker<D>(
     state: &Entity<SelectState<D>>,
     label: &'static str,
     placeholder: &'static str,
+    size: Size,
 ) -> Div
 where
     D: SelectDelegate,
@@ -1716,7 +1735,7 @@ where
 {
     div().w(px(240.)).flex_shrink_0().child(
         Select::new(state)
-            .large()
+            .with_size(size)
             .accessibility_label(label)
             .placeholder(placeholder),
     )
@@ -1931,21 +1950,23 @@ impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if matches!(
             &self.page,
-            Page::RepoSettings(repo) if !self.config.repos.contains_key(repo)
+            Page::Settings(SettingsPage::Repo(repo)) if !self.config.repos.contains_key(repo)
         ) {
-            self.page = Page::Repositories;
+            self.page = Page::Settings(SettingsPage::Repositories);
         }
         let (header, body) = match &self.page {
             Page::PullRequests => self.render_dashboard(cx),
-            Page::Repositories => self.render_repos(cx),
-            Page::RepoSettings(repo) => self.render_repo_settings(repo, cx),
+            Page::Settings(SettingsPage::Repositories) => self.render_repos(cx),
+            Page::Settings(SettingsPage::Repo(repo)) => self.render_repo_settings(repo, cx),
         };
         div()
             .size_full()
             .flex()
             .bg(surface())
             .text_color(ink())
-            .child(self.render_sidebar(cx))
+            .when(matches!(self.page, Page::Settings(_)), |d| {
+                d.child(self.render_sidebar(cx))
+            })
             .child(
                 div()
                     .flex_1()

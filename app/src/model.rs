@@ -145,9 +145,7 @@ pub fn repo_list(
     selected: &BTreeMap<RepoName, RepoSettings>,
     org: Option<&str>,
     scope: RepoScope,
-    text: &str,
 ) -> Vec<RepoListItem> {
-    let text = text.to_lowercase();
     let mut groups: BTreeMap<&str, Vec<(&RepoName, bool)>> = BTreeMap::new();
     for repo in repos {
         if org.is_some_and(|org| org != repo.owner) {
@@ -155,9 +153,6 @@ pub fn repo_list(
         }
         let watched = selected.contains_key(repo);
         if scope == RepoScope::Watched && !watched {
-            continue;
-        }
-        if !text.is_empty() && !repo.to_string().to_lowercase().contains(&text) {
             continue;
         }
         groups.entry(&repo.owner).or_default().push((repo, watched));
@@ -190,9 +185,16 @@ pub struct PastSit {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PrScope {
-    All,
+pub enum PrFilter {
     #[default]
+    All,
+    Watched,
+    Unwatched,
+    Merged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrStatus {
     Watched,
     Unwatched,
     Merged,
@@ -220,17 +222,36 @@ pub fn dashboard_rows<'a>(
     prs: &'a [PrRow],
     history: &'a BTreeMap<PrRef, PastSit>,
     sits: &'a BTreeMap<PrRef, SitState>,
-    selected: &BTreeMap<RepoName, RepoSettings>,
-    scope: PrScope,
-    filter: Option<&RepoName>,
+    watched: &BTreeMap<RepoName, RepoSettings>,
+    filter: PrFilter,
+    repo: Option<&RepoName>,
 ) -> Vec<Cow<'a, PrRow>> {
-    let mut existing: BTreeSet<_> = prs.iter().map(|row| &row.pr).collect();
-    let mut rows: Vec<_> = prs.iter().map(Cow::Borrowed).collect();
+    let matches_filter = |pr: &PrRef| {
+        let matches_status = match filter {
+            PrFilter::All => true,
+            PrFilter::Watched => pr_status(sits.get(pr)) == PrStatus::Watched,
+            PrFilter::Unwatched => pr_status(sits.get(pr)) == PrStatus::Unwatched,
+            PrFilter::Merged => pr_status(sits.get(pr)) == PrStatus::Merged,
+        };
+        matches_status && repo.is_none_or(|repo| &pr.repo == repo)
+    };
+    let mut existing = BTreeSet::new();
+    let mut rows: Vec<_> = prs
+        .iter()
+        .filter(|row| {
+            (watched.contains_key(&row.pr.repo)
+                || history.contains_key(&row.pr)
+                || sits.contains_key(&row.pr))
+                && matches_filter(&row.pr)
+                && existing.insert(&row.pr)
+        })
+        .map(Cow::Borrowed)
+        .collect();
     rows.extend(
         history
             .keys()
             .chain(sits.keys())
-            .filter(|pr| existing.insert(*pr))
+            .filter(|pr| matches_filter(pr) && existing.insert(*pr))
             .map(|pr| {
                 Cow::Owned(PrRow {
                     pr: pr.clone(),
@@ -244,18 +265,6 @@ pub fn dashboard_rows<'a>(
                 })
             }),
     );
-    rows.retain(|row| {
-        let watched = selected.contains_key(&row.pr.repo);
-        let in_scope = match scope {
-            PrScope::All => true,
-            PrScope::Watched => watched,
-            PrScope::Unwatched => !watched,
-            PrScope::Merged => {
-                matches!(sits.get(&row.pr), Some(SitState::Finished(Outcome::Merged)))
-            }
-        };
-        in_scope && filter.is_none_or(|repo| &row.pr.repo == repo)
-    });
     rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     rows
 }
@@ -278,6 +287,14 @@ pub enum SitState {
 impl SitState {
     pub fn is_active(&self) -> bool {
         !matches!(self, Self::Finished(_))
+    }
+}
+
+pub fn pr_status(state: Option<&SitState>) -> PrStatus {
+    match state {
+        Some(state) if state.is_active() => PrStatus::Watched,
+        Some(SitState::Finished(Outcome::Merged)) => PrStatus::Merged,
+        _ => PrStatus::Unwatched,
     }
 }
 
@@ -453,7 +470,7 @@ mod tests {
             ("Zulu/Alpha".parse().unwrap(), RepoSettings::default()),
         ]);
         assert_eq!(
-            repo_list(&catalog, &selected, None, RepoScope::All, ""),
+            repo_list(&catalog, &selected, None, RepoScope::All),
             vec![
                 RepoListItem::Org {
                     name: "alpha".into(),
@@ -481,7 +498,7 @@ mod tests {
             ("beta/three".parse().unwrap(), RepoSettings::default()),
         ]);
         assert_eq!(
-            repo_list(&catalog, &selected, Some("alpha"), RepoScope::Watched, ""),
+            repo_list(&catalog, &selected, Some("alpha"), RepoScope::Watched),
             vec![
                 RepoListItem::Org {
                     name: "alpha".into(),
@@ -496,42 +513,11 @@ mod tests {
     #[test]
     fn repo_list_watched_scope_is_empty_when_nothing_is_watched() {
         let catalog = repos(&["alpha/one", "beta/two"]);
-        assert!(repo_list(&catalog, &BTreeMap::new(), None, RepoScope::Watched, "").is_empty());
+        assert!(repo_list(&catalog, &BTreeMap::new(), None, RepoScope::Watched).is_empty());
     }
 
     #[test]
-    fn repo_list_text_filter_hides_empty_organizations_and_counts_shown_repos() {
-        let catalog = repos(&["alpha/needle", "alpha/other", "beta/other"]);
-        let selected = BTreeMap::from([
-            ("alpha/needle".parse().unwrap(), RepoSettings::default()),
-            ("alpha/other".parse().unwrap(), RepoSettings::default()),
-        ]);
-        assert_eq!(
-            repo_list(&catalog, &selected, None, RepoScope::All, "NEEDLE"),
-            vec![
-                RepoListItem::Org {
-                    name: "alpha".into(),
-                    watched: 1,
-                    total: 1,
-                },
-                RepoListItem::Repo("alpha/needle".parse().unwrap()),
-            ]
-        );
-        assert_eq!(
-            repo_list(&catalog, &selected, None, RepoScope::All, "BETA/"),
-            vec![
-                RepoListItem::Org {
-                    name: "beta".into(),
-                    watched: 0,
-                    total: 1,
-                },
-                RepoListItem::Repo("beta/other".parse().unwrap()),
-            ]
-        );
-    }
-
-    #[test]
-    fn dashboard_filters_candidates_by_scope_and_repository() {
+    fn dashboard_filters_candidates_by_status_and_repository() {
         let prs = [
             row("owner/one#1", "2026-01-01"),
             row("owner/two#2", "2026-01-03"),
@@ -573,6 +559,10 @@ mod tests {
         ]);
         let sits = BTreeMap::from([
             (
+                "owner/one#3".parse().unwrap(),
+                SitState::Running { last_line: None },
+            ),
+            (
                 "owner/one#7".parse().unwrap(),
                 SitState::Finished(Outcome::Merged),
             ),
@@ -585,28 +575,68 @@ mod tests {
                 SitState::Finished(Outcome::Stopped("closed".into())),
             ),
             ("owner/one#11".parse().unwrap(), SitState::Preparing),
+            ("owner/two#12".parse().unwrap(), SitState::Cancelling),
         ]);
         let watched = BTreeMap::from([("owner/one".parse().unwrap(), RepoSettings::default())]);
-        for (scope, expected) in [
-            (PrScope::All, vec![1, 2, 3, 7, 8, 9, 10, 11]),
-            (PrScope::Watched, vec![1, 3, 7, 11]),
-            (PrScope::Unwatched, vec![2, 8, 9, 10]),
-            (PrScope::Merged, vec![7, 8]),
+        for (filter, expected) in [
+            (PrFilter::All, vec![1, 3, 7, 8, 9, 10, 11, 12]),
+            (PrFilter::Watched, vec![3, 11, 12]),
+            (PrFilter::Unwatched, vec![1, 9, 10]),
+            (PrFilter::Merged, vec![7, 8]),
         ] {
-            let mut numbers: Vec<_> = dashboard_rows(&prs, &history, &sits, &watched, scope, None)
+            let mut numbers: Vec<_> = dashboard_rows(&prs, &history, &sits, &watched, filter, None)
                 .iter()
                 .map(|row| row.pr.number)
                 .collect();
             numbers.sort_unstable();
-            assert_eq!(numbers, expected, "{scope:?}");
+            assert_eq!(numbers, expected, "{filter:?}");
         }
         let repo = "owner/one".parse().unwrap();
-        let rows = dashboard_rows(&prs, &history, &sits, &watched, PrScope::All, Some(&repo));
+        let rows = dashboard_rows(&prs, &history, &sits, &watched, PrFilter::All, Some(&repo));
         assert_eq!(
             rows.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
             [3, 1, 7, 11]
         );
-        assert_eq!(PrScope::default(), PrScope::Watched);
+        let rows = dashboard_rows(
+            &prs,
+            &history,
+            &sits,
+            &watched,
+            PrFilter::Watched,
+            Some(&repo),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
+            [3, 11]
+        );
+        assert_eq!(PrFilter::default(), PrFilter::All);
+    }
+
+    #[test]
+    fn pr_status_classifies_every_sit_state() {
+        assert_eq!(pr_status(None), PrStatus::Unwatched);
+        for state in [
+            SitState::Preparing,
+            SitState::Running { last_line: None },
+            SitState::Cancelling,
+        ] {
+            assert_eq!(pr_status(Some(&state)), PrStatus::Watched);
+        }
+        assert_eq!(
+            pr_status(Some(&SitState::Finished(Outcome::Merged))),
+            PrStatus::Merged
+        );
+        for outcome in [
+            Outcome::TimedOut,
+            Outcome::Stopped("closed".into()),
+            Outcome::Cancelled,
+            Outcome::Failed("error".into()),
+        ] {
+            assert_eq!(
+                pr_status(Some(&SitState::Finished(outcome))),
+                PrStatus::Unwatched
+            );
+        }
     }
 
     #[test]
@@ -622,7 +652,7 @@ mod tests {
             },
         )]);
         let mut sits = BTreeMap::from([(pr.clone(), SitState::Finished(Outcome::Merged))]);
-        let rows = dashboard_rows(&[], &history, &sits, &watched, PrScope::Merged, None);
+        let rows = dashboard_rows(&[], &history, &sits, &watched, PrFilter::Merged, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pr, pr);
         assert_eq!(rows[0].title, "The original title");
@@ -630,14 +660,14 @@ mod tests {
 
         history.remove(&pr);
         sits.remove(&pr);
-        assert!(dashboard_rows(&[], &history, &sits, &watched, PrScope::All, None).is_empty());
+        assert!(dashboard_rows(&[], &history, &sits, &watched, PrFilter::All, None).is_empty());
         let open = [row("owner/one#7", "2026-01-01")];
-        let rows = dashboard_rows(&open, &history, &sits, &watched, PrScope::Watched, None);
+        let rows = dashboard_rows(&open, &history, &sits, &watched, PrFilter::Unwatched, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "PR 7");
 
         sits.insert(pr.clone(), SitState::Preparing);
-        let rows = dashboard_rows(&[], &history, &sits, &watched, PrScope::Watched, None);
+        let rows = dashboard_rows(&[], &history, &sits, &watched, PrFilter::Watched, None);
         assert_eq!(rows[0].title, "Pull request #7");
     }
 
@@ -654,7 +684,7 @@ mod tests {
             },
         )]);
         let sits = BTreeMap::from([(pr, SitState::Finished(Outcome::Cancelled))]);
-        let rows = dashboard_rows(&prs, &history, &sits, &BTreeMap::new(), PrScope::All, None);
+        let rows = dashboard_rows(&prs, &history, &sits, &BTreeMap::new(), PrFilter::All, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "PR 1");
     }
