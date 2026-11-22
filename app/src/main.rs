@@ -51,7 +51,7 @@ fn run() -> anyhow::Result<()> {
         }
     });
     let env = gh::ChildEnv::new();
-    application().with_assets(assets::Assets).run(move |cx| {
+    application().with_assets(assets::AllAssets).run(move |cx| {
         init(cx);
         theme::install(cx);
         let quit_registry = registry.clone();

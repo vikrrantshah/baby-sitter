@@ -11,7 +11,7 @@ use crate::{
 use gpui_kit::{assets::IconName, component::StyledExt, prelude::FluentBuilder};
 use gpui_kit::{
     component::{
-        Disableable, Selectable, Sizable,
+        Disableable, Icon, Selectable, Sizable,
         button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
         input::{Input, InputEvent, InputState},
         select::{Select, SelectEvent, SelectState},
@@ -1207,7 +1207,11 @@ impl AppView {
             1 => "Babysitting 1 pull request.".to_owned(),
             n => format!("Babysitting {n} pull requests."),
         };
-        let nav = |page: Page, id: &'static str, label: &'static str, cx: &mut Context<Self>| {
+        let nav = |page: Page,
+                   id: &'static str,
+                   icon: IconName,
+                   label: &'static str,
+                   cx: &mut Context<Self>| {
             let selected = matches!(
                 (&self.page, &page),
                 (Page::PullRequests, Page::PullRequests)
@@ -1235,7 +1239,11 @@ impl AppView {
                         .px(px(4.))
                         .text_size(px(14.))
                         .when(selected, |d| d.font_semibold())
-                        .child(led(if selected { glow() } else { rail() }))
+                        .child(Icon::new(icon).size_4().text_color(if selected {
+                            glow()
+                        } else {
+                            dusk()
+                        }))
                         .child(label),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1291,8 +1299,20 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(nav(Page::PullRequests, "nav-prs", "Pull requests", cx))
-                    .child(nav(Page::Repositories, "nav-repos", "Repositories", cx)),
+                    .child(nav(
+                        Page::PullRequests,
+                        "nav-prs",
+                        IconName::GitPullRequest,
+                        "Pull requests",
+                        cx,
+                    ))
+                    .child(nav(
+                        Page::Repositories,
+                        "nav-repos",
+                        IconName::BookMarked,
+                        "Repositories",
+                        cx,
+                    )),
             )
             .child(div().flex_1())
             .child(
@@ -1351,9 +1371,6 @@ fn time_left(seconds: u64) -> String {
         (h, 0) => format!("{h}h left"),
         (h, m) => format!("{h}h {m}m left"),
     }
-}
-fn led(color: Hsla) -> Div {
-    div().size(px(7.)).rounded_full().bg(color)
 }
 /// A crescent: a lit disc with a housing-colored disc over its upper right.
 fn moon_mark() -> Div {
