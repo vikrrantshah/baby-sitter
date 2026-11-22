@@ -14,7 +14,7 @@ use gpui_kit::{
         Disableable, Icon, Selectable, Sizable,
         button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
         input::{Input, InputEvent, InputState},
-        select::{Select, SelectEvent, SelectState},
+        select::{Select, SelectEvent, SelectItem, SelectState},
         switch::Switch,
         tooltip::Tooltip,
     },
@@ -79,8 +79,10 @@ pub struct AppView {
     repos: Load<Vec<RepoName>>,
     prs: Load<Vec<PrRow>>,
     repo_filter: Entity<InputState>,
-    org_select: Entity<SelectState<Vec<String>>>,
+    org_select: Entity<SelectState<Vec<OrgChoice>>>,
     org_filter: Option<String>,
+    /// Owner login to its downloaded profile picture.
+    avatars: BTreeMap<String, PathBuf>,
     scope: RepoScope,
     dashboard_filter: Entity<SelectState<Vec<String>>>,
     selected_filter: Option<RepoName>,
@@ -95,6 +97,7 @@ pub struct AppView {
     _events: Task<()>,
     _clock: Task<()>,
     repo_task: Option<Task<()>>,
+    avatar_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
 }
 
@@ -123,8 +126,7 @@ impl AppView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter repositories"));
         let dashboard_filter =
             cx.new(|cx| SelectState::new(vec!["All repositories".to_string()], None, window, cx));
-        let org_select =
-            cx.new(|cx| SelectState::new(vec!["All organizations".to_string()], None, window, cx));
+        let org_select = cx.new(|cx| SelectState::new(vec![OrgChoice::ALL], None, window, cx));
         let subscriptions = vec![
             cx.subscribe(&repo_filter, |_: &mut Self, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -133,12 +135,9 @@ impl AppView {
             }),
             cx.subscribe(
                 &org_select,
-                |this: &mut Self, _, event: &SelectEvent<Vec<String>>, cx| {
+                |this: &mut Self, _, event: &SelectEvent<Vec<OrgChoice>>, cx| {
                     let SelectEvent::Confirm(value) = event;
-                    this.org_filter = value
-                        .as_ref()
-                        .filter(|name| name.as_str() != "All organizations")
-                        .cloned();
+                    this.org_filter = value.clone().flatten();
                     cx.notify();
                 },
             ),
@@ -206,6 +205,7 @@ impl AppView {
             repo_filter,
             org_select,
             org_filter: None,
+            avatars: BTreeMap::new(),
             scope: RepoScope::All,
             dashboard_filter,
             selected_filter: None,
@@ -219,6 +219,7 @@ impl AppView {
             _events: events,
             _clock: clock,
             repo_task: None,
+            avatar_task: None,
             pr_task: None,
         };
         for (repo, settings) in this.config.repos.clone() {
@@ -382,37 +383,77 @@ impl AppView {
                 .background_spawn(async move { gh::list_repos(&env).map_err(|e| format!("{e:#}")) })
                 .await;
             let _ = view.update_in(cx, |this, window, cx| {
-                this.repos = match result {
+                match result {
                     Ok(repos) => {
-                        let mut owners: Vec<_> = repos
-                            .iter()
-                            .map(|repo| repo.owner.as_str())
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect();
-                        owners.sort_by_cached_key(|owner| owner.to_lowercase());
-                        if this
-                            .org_filter
-                            .as_deref()
-                            .is_some_and(|selected| !owners.contains(&selected))
-                        {
-                            this.org_filter = None;
-                        }
-                        let mut choices = vec!["All organizations".to_owned()];
-                        choices.extend(owners.into_iter().map(str::to_owned));
-                        let selected = this
-                            .org_filter
-                            .clone()
-                            .unwrap_or_else(|| "All organizations".into());
-                        this.org_select.update(cx, |state, cx| {
-                            state.set_items(choices, window, cx);
-                            state.set_selected_value(&selected, window, cx);
-                            cx.notify();
-                        });
-                        Load::Ready(repos)
+                        this.repos = Load::Ready(repos);
+                        this.update_org_choices(window, cx);
+                        this.load_avatars(window, cx);
                     }
-                    Err(error) => Load::Error(error),
-                };
+                    Err(error) => this.repos = Load::Error(error),
+                }
+                cx.notify();
+            });
+        }));
+    }
+    fn owners(&self) -> Vec<String> {
+        let Load::Ready(repos) = &self.repos else {
+            return Vec::new();
+        };
+        let mut owners: Vec<_> = repos
+            .iter()
+            .map(|repo| repo.owner.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        owners.sort_by_cached_key(|owner| owner.to_lowercase());
+        owners
+    }
+    fn update_org_choices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let owners = self.owners();
+        if self
+            .org_filter
+            .as_ref()
+            .is_some_and(|selected| !owners.contains(selected))
+        {
+            self.org_filter = None;
+        }
+        let mut choices = vec![OrgChoice::ALL];
+        choices.extend(owners.into_iter().map(|owner| OrgChoice {
+            avatar: self.avatars.get(&owner).cloned(),
+            owner: Some(owner),
+        }));
+        let selected = self.org_filter.clone();
+        self.org_select.update(cx, |state, cx| {
+            state.set_items(choices, window, cx);
+            state.set_selected_value(&selected, window, cx);
+            cx.notify();
+        });
+    }
+    fn load_avatars(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let missing: Vec<_> = self
+            .owners()
+            .into_iter()
+            .filter(|owner| !self.avatars.contains_key(owner))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let env = self.env.clone();
+        let data = self.data.clone();
+        self.avatar_task = Some(cx.spawn_in(window, async move |view, cx| {
+            let fetched: Vec<_> = cx
+                .background_spawn(async move {
+                    missing
+                        .into_iter()
+                        .filter_map(|owner| {
+                            gh::avatar(&env, &data, &owner).map(|path| (owner, path))
+                        })
+                        .collect()
+                })
+                .await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.avatars.extend(fetched);
+                this.update_org_choices(window, cx);
                 cx.notify();
             });
         }));
@@ -771,10 +812,18 @@ impl AppView {
                                                 div()
                                                     .flex_1()
                                                     .min_w_0()
-                                                    .font_semibold()
-                                                    .text_ellipsis()
-                                                    .text_color(moon())
-                                                    .child(name.clone()),
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(10.))
+                                                    .child(avatar(this.avatars.get(name), 20.))
+                                                    .child(
+                                                        div()
+                                                            .min_w_0()
+                                                            .font_semibold()
+                                                            .text_ellipsis()
+                                                            .text_color(moon())
+                                                            .child(name.clone()),
+                                                    ),
                                             )
                                             .child(
                                                 div()
@@ -848,6 +897,7 @@ impl AppView {
             .child(
                 div().w(px(240.)).flex_shrink_0().child(
                     Select::new(&self.org_select)
+                        .large()
                         .accessibility_label("Filter by organization")
                         .placeholder("All organizations"),
                 ),
@@ -1369,6 +1419,66 @@ fn time_left(seconds: u64) -> String {
         (0, m) => format!("{m}m left"),
         (h, 0) => format!("{h}h left"),
         (h, m) => format!("{h}h {m}m left"),
+    }
+}
+#[derive(Clone)]
+struct OrgChoice {
+    /// `None` is the "All organizations" choice.
+    owner: Option<String>,
+    avatar: Option<PathBuf>,
+}
+impl OrgChoice {
+    const ALL: Self = Self {
+        owner: None,
+        avatar: None,
+    };
+    fn row(&self) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(match self.owner {
+                Some(_) => avatar(self.avatar.as_ref(), 18.),
+                None => Icon::new(IconName::Building2)
+                    .size(px(18.))
+                    .text_color(dusk())
+                    .into_any_element(),
+            })
+            .child(self.title())
+    }
+}
+impl SelectItem for OrgChoice {
+    type Value = Option<String>;
+    fn title(&self) -> SharedString {
+        self.owner
+            .clone()
+            .unwrap_or_else(|| "All organizations".into())
+            .into()
+    }
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(self.row().into_any_element())
+    }
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        self.row()
+    }
+    fn value(&self) -> &Self::Value {
+        &self.owner
+    }
+}
+/// A profile picture, or a blank tile of the same size until it downloads.
+fn avatar(path: Option<&PathBuf>, size: f32) -> AnyElement {
+    match path {
+        Some(path) => img(path.clone())
+            .size(px(size))
+            .flex_shrink_0()
+            .rounded(px(4.))
+            .into_any_element(),
+        None => div()
+            .size(px(size))
+            .flex_shrink_0()
+            .rounded(px(4.))
+            .bg(rail())
+            .into_any_element(),
     }
 }
 /// A crescent: a lit disc with a housing-colored disc over its upper right.

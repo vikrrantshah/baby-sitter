@@ -2,7 +2,10 @@ use crate::model::{PrRef, PrRow, RepoName};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap, ffi::OsString, os::unix::fs::PermissionsExt, path::PathBuf,
+    collections::BTreeMap,
+    ffi::OsString,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -50,6 +53,28 @@ fn output(mut command: Command) -> Result<Vec<u8>> {
         bail!("{}", String::from_utf8_lossy(&result.stderr).trim());
     }
     Ok(result.stdout)
+}
+
+/// Downloads the owner's GitHub profile picture once into `dir/avatars`.
+/// GPUI here has no HTTP client for remote images, so the UI loads the file.
+pub fn avatar(env: &ChildEnv, dir: &Path, owner: &str) -> Option<PathBuf> {
+    let path = dir.join("avatars").join(format!("{owner}.png"));
+    if path.is_file() {
+        return Some(path);
+    }
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let tmp = path.with_extension("download");
+    let mut command = env.command("/usr/bin/curl");
+    command
+        .args(["-sfL", "--max-time", "10", "-o"])
+        .arg(&tmp)
+        .arg(format!("https://github.com/{owner}.png?size=64"));
+    if output(command).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        Some(path)
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        None
+    }
 }
 
 #[derive(Deserialize)]
