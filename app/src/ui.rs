@@ -1375,7 +1375,16 @@ impl AppView {
                     .items_center()
                     .gap(px(12.))
                     .when_some(time_left, |d, left| {
-                        d.child(div().text_size(px(12.)).text_color(muted()).child(left))
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .text_size(px(12.))
+                                .text_color(muted())
+                                .child(Icon::empty().path("icons/timer.svg").size(px(13.)))
+                                .child(left),
+                        )
                     })
                     .map(|d| match (action, dismiss) {
                         // The rightmost slot holds the row's main action; a merged row's is Dismiss.
