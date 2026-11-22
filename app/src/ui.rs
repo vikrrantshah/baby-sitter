@@ -19,7 +19,6 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 enum Load<T> {
@@ -236,14 +235,13 @@ impl AppView {
                         Some(std::mem::replace(value, duration))
                     }
                 });
-                if let Some(previous) = previous {
-                    if !self.save() {
-                        if let Some(settings) = self.config.repos.get_mut(repo) {
-                            match field {
-                                Field::Timeout => settings.timeout = previous,
-                                Field::Interval => settings.interval = previous,
-                            }
-                        }
+                if let Some(previous) = previous
+                    && !self.save()
+                    && let Some(settings) = self.config.repos.get_mut(repo)
+                {
+                    match field {
+                        Field::Timeout => settings.timeout = previous,
+                        Field::Interval => settings.interval = previous,
                     }
                 }
                 if let Some(inputs) = self.inputs.get_mut(repo) {
@@ -396,11 +394,7 @@ impl AppView {
         let Some(settings) = self.config.repos.get(&pr.repo) else {
             return;
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let Some(deadline) = now.checked_add(settings.timeout.as_secs()) else {
+        let Some(deadline) = model::unix_now().checked_add(settings.timeout.as_secs()) else {
             self.error = Some("Timeout is too large".into());
             cx.notify();
             return;
@@ -642,25 +636,31 @@ impl AppView {
         let active = state.is_some_and(SitState::is_active);
         let pr = row.pr.clone();
         let action = if active {
-            Button::new(SharedString::from(format!("cancel-{pr}")))
-                .label(if matches!(state, Some(SitState::Cancelling)) {
-                    "Cancelling"
-                } else {
-                    "Cancel"
-                })
-                .outline()
-                .disabled(matches!(state, Some(SitState::Cancelling)))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.ask_cancel(pr.clone(), window, cx)),
-                )
+            Some(
+                Button::new(SharedString::from(format!("cancel-{pr}")))
+                    .label(if matches!(state, Some(SitState::Cancelling)) {
+                        "Cancelling"
+                    } else {
+                        "Cancel"
+                    })
+                    .outline()
+                    .disabled(matches!(state, Some(SitState::Cancelling)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.ask_cancel(pr.clone(), window, cx)
+                    })),
+            )
+        } else if matches!(state, Some(SitState::Finished(Outcome::Merged))) {
+            None
         } else {
-            Button::new(SharedString::from(format!("start-{pr}")))
-                .label("Start")
-                .primary()
-                .disabled(!selected)
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.start(pr.clone(), window, cx)),
-                )
+            Some(
+                Button::new(SharedString::from(format!("start-{pr}")))
+                    .label("Start")
+                    .primary()
+                    .disabled(!selected)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.start(pr.clone(), window, cx)),
+                    ),
+            )
         };
         let url = row.url.clone();
         let title_id = SharedString::from(format!("title-{}", row.pr));
@@ -671,7 +671,10 @@ impl AppView {
             .font_semibold()
             .child(row.title.clone())
             .on_click(move |_, _, _| {
-                let _ = std::process::Command::new("open").arg(&url).spawn();
+                let url = url.clone();
+                std::thread::spawn(move || {
+                    let _ = std::process::Command::new("open").arg(url).status();
+                });
             });
         let mut content = div()
             .flex()
@@ -723,10 +726,13 @@ impl AppView {
                     .child(div().text_xs().text_color(rgb(0x667085)).child(path_string))
                     .child(Button::new(reveal_id).label("Reveal").small().on_click(
                         move |_, _, _| {
-                            let _ = std::process::Command::new("open")
-                                .arg("-R")
-                                .arg(&path)
-                                .spawn();
+                            let path = path.clone();
+                            std::thread::spawn(move || {
+                                let _ = std::process::Command::new("open")
+                                    .arg("-R")
+                                    .arg(path)
+                                    .status();
+                            });
                         },
                     )),
             );
@@ -739,21 +745,24 @@ impl AppView {
             .items_start()
             .gap_4()
             .child(content)
-            .child(action)
+            .when_some(action, |row, action| row.child(action))
             .into_any_element()
+    }
+    fn retry_prs_button(cx: &mut Context<Self>) -> Button {
+        Button::new("retry-prs")
+            .label("Retry")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.load_prs(window, cx);
+                cx.notify();
+            }))
     }
     fn render_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.dashboard_rows();
         let list = match &self.prs {
             Load::Loading if rows.is_empty() => message("Loading pull requests...", None),
             Load::Error(error) if rows.is_empty() => {
-                let retry = Button::new("retry-prs")
-                    .label("Retry")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.load_prs(window, cx);
-                        cx.notify();
-                    }));
-                message("Could not load pull requests", Some(error.clone())).child(retry)
+                message("Could not load pull requests", Some(error.clone()))
+                    .child(Self::retry_prs_button(cx))
             }
             _ if rows.is_empty() => message(
                 if self.selected_filter.is_some() {
@@ -768,15 +777,9 @@ impl AppView {
                 match &self.prs {
                     Load::Loading => body = body.child(message("Loading pull requests...", None)),
                     Load::Error(error) => {
-                        let retry = Button::new("retry-prs")
-                            .label("Retry")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.load_prs(window, cx);
-                                cx.notify();
-                            }));
                         body = body.child(
                             message("Could not load pull requests", Some(error.clone()))
-                                .child(retry),
+                                .child(Self::retry_prs_button(cx)),
                         );
                     }
                     Load::Ready(_) => {}

@@ -1,5 +1,10 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::{collections::BTreeMap, fmt, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    str::FromStr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct RepoName {
@@ -154,6 +159,13 @@ impl SitState {
     }
 }
 
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let split = s
         .len()
@@ -179,9 +191,9 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 }
 pub fn format_duration(d: Duration) -> String {
     let seconds = d.as_secs();
-    if seconds != 0 && seconds % 3600 == 0 {
+    if seconds != 0 && seconds.is_multiple_of(3600) {
         format!("{}h", seconds / 3600)
-    } else if seconds != 0 && seconds % 60 == 0 {
+    } else if seconds != 0 && seconds.is_multiple_of(60) {
         format!("{}m", seconds / 60)
     } else {
         format!("{seconds}s")
@@ -206,11 +218,17 @@ pub fn lock_held(code: Option<i32>, stderr: &str) -> bool {
 }
 pub fn classify(code: Option<i32>, stderr: &str, cancel_requested: bool) -> Outcome {
     let tail = || {
-        let text = stderr.trim();
-        if text.is_empty() {
+        let mut lines: Vec<_> = stderr
+            .lines()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(5)
+            .collect();
+        if lines.is_empty() {
             "process exited without an error message".to_owned()
         } else {
-            text.to_owned()
+            lines.reverse();
+            lines.join("\n").trim().to_owned()
         }
     };
     match code {
@@ -232,6 +250,16 @@ pub fn classify(code: Option<i32>, stderr: &str, cancel_requested: bool) -> Outc
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_reason_keeps_the_last_five_nonempty_lines() {
+        let stderr = format!("{}\n\npanic: broken\n\n", "progress\n".repeat(240));
+        let Outcome::Failed(reason) = classify(Some(101), &stderr, false) else {
+            panic!("expected failure");
+        };
+        assert_eq!(reason.lines().count(), 5);
+        assert!(reason.ends_with("panic: broken"));
+        assert_eq!(reason.lines().next(), Some("progress"));
+    }
     #[test]
     fn duration_round_trips_and_rejects_invalid_values() {
         for text in ["0s", "1s", "90s", "2m", "2h"] {

@@ -1,6 +1,6 @@
 use crate::{
     gh::{self, ChildEnv},
-    model::{self, Outcome, PrRef, RepoName, RepoSettings, SitState},
+    model::{self, Outcome, PrRef, RepoName, RepoSettings, SitState, unix_now},
 };
 use anyhow::{Context, Result, bail};
 use async_channel::Sender;
@@ -53,12 +53,6 @@ pub fn worktree_path(data: &Path, pr: &PrRef) -> PathBuf {
 }
 fn clone_path(data: &Path, repo: &RepoName) -> PathBuf {
     data.join("repos").join(&repo.owner).join(&repo.name)
-}
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 fn emit(tx: &Sender<SitEvent>, pr: &PrRef, state: SitState) {
     let _ = tx.send_blocking(SitEvent {
@@ -122,6 +116,21 @@ enum Interrupted {
     Cancelled,
     Deadline,
 }
+impl Interrupted {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Deadline => "timed out",
+        }
+    }
+
+    fn outcome(self) -> Outcome {
+        match self {
+            Self::Cancelled => Outcome::Cancelled,
+            Self::Deadline => Outcome::TimedOut,
+        }
+    }
+}
 struct ProcessOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
@@ -155,7 +164,7 @@ impl Runner {
     fn interrupted(&self) -> Option<Interrupted> {
         if self.control.cancelled.load(Ordering::SeqCst) {
             Some(Interrupted::Cancelled)
-        } else if now() >= self.deadline {
+        } else if unix_now() >= self.deadline {
             Some(Interrupted::Deadline)
         } else {
             None
@@ -169,10 +178,7 @@ impl Runner {
     }
     fn run(&self, mut command: Command, mode: ProcessMode) -> Result<ProcessOutput> {
         if let Some(interrupted) = self.interrupted() {
-            bail!(match interrupted {
-                Interrupted::Cancelled => "cancelled",
-                Interrupted::Deadline => "timed out",
-            });
+            bail!(interrupted.message());
         }
         command
             .process_group(0)
@@ -189,7 +195,7 @@ impl Runner {
         }
         let mut child = command
             .spawn()
-            .with_context(|| format!("start {command:?}"))?;
+            .with_context(|| format!("start {}", command.get_program().to_string_lossy()))?;
         let pgid = child.id() as i32;
         registry.insert(self.pr.clone(), pgid);
         drop(registry);
@@ -280,7 +286,7 @@ impl Runner {
                     }
                     drain_until = Some(Instant::now() + Duration::from_secs(1));
                 }
-            } else if Instant::now() >= drain_until.unwrap() {
+            } else if drain_until.is_some_and(|until| Instant::now() >= until) {
                 break;
             }
             if drain_until.is_some() {
@@ -300,15 +306,20 @@ impl Runner {
     fn checked(&self, command: Command) -> Result<Vec<u8>> {
         let output = self.run(command, ProcessMode::Capture)?;
         if let Some(reason) = output.interrupted {
-            bail!(match reason {
-                Interrupted::Cancelled => "cancelled",
-                Interrupted::Deadline => "timed out",
-            });
+            bail!(reason.message());
         }
         if !output.status.success() {
             bail!("{}", output.stderr.trim());
         }
         Ok(output.stdout)
+    }
+    fn repo_lock(&self) -> Arc<Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap()
+            .entry(self.pr.repo.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
     fn prepare(&self) -> Result<Option<Outcome>> {
         let head: gh::PrHead =
@@ -323,22 +334,13 @@ impl Runner {
         if head.is_cross_repository {
             return Ok(Some(Outcome::Failed("fork PRs are not supported".into())));
         }
-        let lock = {
-            let mut locks = self.locks.lock().unwrap();
-            locks
-                .entry(self.pr.repo.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let lock = self.repo_lock();
         let _guard = loop {
             match lock.try_lock() {
                 Ok(guard) => break guard,
                 Err(std::sync::TryLockError::WouldBlock) => {
                     if let Some(reason) = self.interrupted() {
-                        bail!(match reason {
-                            Interrupted::Cancelled => "cancelled",
-                            Interrupted::Deadline => "timed out",
-                        });
+                        bail!(reason.message());
                     }
                     self.pause(Duration::from_millis(100));
                 }
@@ -362,7 +364,7 @@ impl Runner {
             command
                 .args(["repo", "clone", &self.pr.repo.to_string()])
                 .arg(&tmp)
-                .args(["--", "--no-checkout", "--filter=blob:none"]);
+                .args(["--", "--no-checkout"]);
             let result = self
                 .checked(command)
                 .and_then(|_| std::fs::rename(&tmp, &clone).map_err(Into::into));
@@ -404,10 +406,7 @@ impl Runner {
     }
     fn execute(&self) -> Result<Outcome> {
         if let Some(reason) = self.interrupted() {
-            return Ok(match reason {
-                Interrupted::Cancelled => Outcome::Cancelled,
-                Interrupted::Deadline => Outcome::TimedOut,
-            });
+            return Ok(reason.outcome());
         }
         if let Some(outcome) = self.prepare()? {
             return Ok(outcome);
@@ -418,10 +417,7 @@ impl Runner {
             .join("baby-sitter");
         loop {
             if let Some(reason) = self.interrupted() {
-                return Ok(match reason {
-                    Interrupted::Cancelled => Outcome::Cancelled,
-                    Interrupted::Deadline => Outcome::TimedOut,
-                });
+                return Ok(reason.outcome());
             }
             emit(&self.tx, &self.pr, SitState::Running { last_line: None });
             let mut command = self.env.command(&cli);
@@ -429,7 +425,7 @@ impl Runner {
                 .arg(self.pr.url())
                 .args([
                     "--timeout",
-                    &format!("{}s", self.deadline.saturating_sub(now())),
+                    &format!("{}s", self.deadline.saturating_sub(unix_now())),
                     "--interval",
                     &format!("{}s", self.settings.interval.as_secs()),
                 ])
@@ -439,11 +435,9 @@ impl Runner {
                 && output.interrupted.is_none()
             {
                 emit(&self.tx, &self.pr, SitState::Preparing);
-                self.pause(
-                    self.settings
-                        .interval
-                        .min(Duration::from_secs(self.deadline.saturating_sub(now()))),
-                );
+                self.pause(self.settings.interval.min(Duration::from_secs(
+                    self.deadline.saturating_sub(unix_now()),
+                )));
                 continue;
             }
             if matches!(output.interrupted, Some(Interrupted::Deadline)) {
@@ -463,13 +457,7 @@ impl Runner {
             return;
         }
         let clone = clone_path(&self.data, &self.pr.repo);
-        let lock = {
-            let mut locks = self.locks.lock().unwrap();
-            locks
-                .entry(self.pr.repo.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let lock = self.repo_lock();
         let Ok(_guard) = lock.lock() else { return };
         let mut command = self.env.command("git");
         command
@@ -512,8 +500,7 @@ pub fn spawn(
         let outcome = match runner.execute() {
             Ok(outcome) => outcome,
             Err(error) => match runner.interrupted() {
-                Some(Interrupted::Cancelled) => Outcome::Cancelled,
-                Some(Interrupted::Deadline) => Outcome::TimedOut,
+                Some(reason) => reason.outcome(),
                 None => Outcome::Failed(format!("{error:#}")),
             },
         };
@@ -536,9 +523,8 @@ fn notify(env: &ChildEnv, pr: &PrRef, outcome: &Outcome) {
     let (status, body) = match outcome {
         Outcome::Merged => ("Merged", "Pull request merged"),
         Outcome::TimedOut => ("Timed out", "Babysitting timed out"),
-        Outcome::Stopped(reason) | Outcome::Failed(reason) => {
-            ("Needs you", reason.lines().next().unwrap_or(""))
-        }
+        Outcome::Stopped(reason) => ("Needs you", reason.lines().next().unwrap_or("")),
+        Outcome::Failed(reason) => ("Needs you", reason.lines().next_back().unwrap_or("")),
         Outcome::Cancelled => return,
     };
     let _ = env
@@ -623,7 +609,7 @@ mod tests {
             pr: pr.clone(),
             data: dir.clone(),
             env: ChildEnv::new(),
-            deadline: now() + 60,
+            deadline: unix_now() + 60,
             settings: RepoSettings::default(),
             registry: registry.clone(),
             locks: Arc::new(Mutex::new(BTreeMap::new())),
