@@ -1,8 +1,8 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, Config, Outcome, PrRef, PrRow, RepoListItem, RepoName, RepoScope, RepoSettings,
-        STEPS, SitState, VerdictKind,
+        self, Config, GateState, Outcome, PrRef, PrRow, RepoListItem, RepoName, RepoScope,
+        RepoSettings, SitState, VerdictKind,
     },
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
@@ -51,15 +51,15 @@ struct RepoInputs {
     _subscriptions: Vec<Subscription>,
 }
 
-/// How a pull request row reads: the meter level and the status sentence.
+/// How a pull request row's status line reads.
 struct Reading {
-    /// Lit meter segments, counted from the bottom.
-    level: usize,
-    tip: Hsla,
-    breathe: bool,
-    merged: bool,
+    /// The state's name, shown in the badge tooltip. `None` for a pull request
+    /// that was never babysat.
     verb: Option<&'static str>,
     detail: Option<String>,
+    /// The badge that ends the status line, shared with the gate tooltips.
+    badge: GateState,
+    merged: bool,
 }
 
 const SIDEBAR_WIDTH: f32 = 232.;
@@ -88,8 +88,8 @@ pub struct AppView {
     selected_filter: Option<RepoName>,
     inputs: BTreeMap<RepoName, RepoInputs>,
     states: BTreeMap<PrRef, SitState>,
-    /// The checklist step each babysit's latest pass reached.
-    progress: BTreeMap<PrRef, usize>,
+    /// Each babysit's latest gate report; kept after it finishes to show what held it.
+    gates: BTreeMap<PrRef, [GateState; 4]>,
     handles: HashMap<PrRef, SitHandle>,
     event_tx: async_channel::Sender<SitEvent>,
     error: Option<String>,
@@ -182,9 +182,11 @@ impl AppView {
                         if let SitState::Running {
                             last_line: Some(line),
                         } = &event.state
-                            && let Some(step) = model::parse_pass(line).and_then(|pass| pass.step)
+                            && let Some(gates) = model::parse_gates(line)
                         {
-                            this.progress.insert(event.pr.clone(), step);
+                            this.gates.insert(event.pr, gates);
+                            cx.notify();
+                            return;
                         }
                         this.states.insert(event.pr, event.state);
                         cx.notify();
@@ -224,7 +226,7 @@ impl AppView {
             selected_filter: None,
             inputs: BTreeMap::new(),
             states: BTreeMap::new(),
-            progress: BTreeMap::new(),
+            gates: BTreeMap::new(),
             handles: HashMap::new(),
             event_tx,
             error,
@@ -530,7 +532,7 @@ impl AppView {
             return;
         };
         self.states.insert(pr.clone(), SitState::Preparing);
-        self.progress.remove(&pr);
+        self.gates.remove(&pr);
         let handle = sitter::spawn(
             pr.clone(),
             settings,
@@ -606,76 +608,65 @@ impl AppView {
         .detach();
     }
     fn reading(&self, pr: &PrRef) -> Reading {
+        use GateState::{Blocked, Met, Pending, Waiting};
         let state = self.states.get(pr);
-        let reached = self.progress.get(pr).map_or(0, |step| step + 1);
-        let reading = |tip, breathe, verb, detail: Option<&str>| Reading {
-            level: reached.max(1),
-            tip,
-            breathe,
-            merged: false,
+        let reading = |badge, verb, detail: Option<&str>| Reading {
             verb: Some(verb),
             detail: detail.map(str::to_owned),
+            badge,
+            merged: false,
         };
         let merged = Reading {
-            level: STEPS.len(),
-            tip: success(),
-            breathe: false,
-            merged: true,
             verb: Some("Merged"),
             detail: None,
+            badge: Met,
+            merged: true,
         };
         match state {
             None => Reading {
-                level: 0,
-                tip: divider(),
-                breathe: false,
-                merged: false,
                 verb: None,
                 detail: None,
+                badge: Pending,
+                merged: false,
             },
             Some(SitState::Preparing) => {
-                reading(ink(), true, "Preparing", Some("Setting up the worktree"))
+                reading(Waiting, "Preparing", Some("Setting up the worktree"))
             }
             Some(SitState::Running { last_line: None }) => {
-                reading(ink(), true, "Starting", Some("Taking the first snapshot"))
+                reading(Waiting, "Starting", Some("Taking the first snapshot"))
             }
             Some(SitState::Running {
                 last_line: Some(line),
             }) => match model::parse_pass(line) {
                 Some(pass) => match pass.kind {
                     VerdictKind::Done => merged,
-                    VerdictKind::Wait => reading(accent(), true, "Waiting", Some(pass.detail)),
-                    VerdictKind::Act => reading(ink(), true, "Working", Some(pass.detail)),
-                    VerdictKind::Stop => reading(danger(), false, "Stopping", Some(pass.detail)),
+                    VerdictKind::Wait => reading(Waiting, "Waiting", Some(pass.detail)),
+                    VerdictKind::Act => reading(Waiting, "Working", Some(pass.detail)),
+                    VerdictKind::Stop => reading(Blocked, "Stopping", Some(pass.detail)),
                 },
                 None => reading(
-                    ink(),
-                    true,
+                    Waiting,
                     "Running",
                     Some(line.strip_prefix("baby-sitter: ").unwrap_or(line)),
                 ),
             },
             Some(SitState::Cancelling) => reading(
-                muted(),
-                false,
+                Pending,
                 "Cancelling",
                 Some("Waiting for the process to exit"),
             ),
             Some(SitState::Finished(Outcome::Merged)) => merged,
             Some(SitState::Finished(Outcome::TimedOut)) => reading(
-                warning(),
-                false,
+                Waiting,
                 "Timed out",
                 Some("The deadline passed before the merge"),
             ),
             Some(SitState::Finished(Outcome::Stopped(reason))) => {
-                reading(danger(), false, "Stopped", Some(reason))
+                reading(Blocked, "Stopped", Some(reason))
             }
-            Some(SitState::Finished(Outcome::Cancelled)) => {
-                reading(muted(), false, "Cancelled", None)
-            }
+            Some(SitState::Finished(Outcome::Cancelled)) => reading(Pending, "Cancelled", None),
             Some(SitState::Finished(Outcome::Failed(reason))) => {
-                reading(danger(), false, "Failed", Some(reason))
+                reading(Blocked, "Failed", Some(reason))
             }
         }
     }
@@ -1099,71 +1090,84 @@ impl AppView {
             .flatten()
             .map(|deadline| time_left(deadline.saturating_sub(model::unix_now())));
         let url = row.url.clone();
+        let open = icon_button(
+            SharedString::from(format!("open-{}", row.pr)),
+            IconName::Github,
+            "Open on GitHub",
+            px(34.),
+        )
+        .on_click(move |_, _, _| {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                let _ = std::process::Command::new("open").arg(url).status();
+            });
+        });
         let title = div()
-            .id(SharedString::from(format!("title-{}", row.pr)))
-            .cursor_pointer()
             .text_size(px(16.))
             .line_height(relative(1.3))
             .font_semibold()
             .text_color(ink())
-            .hover(|style| style.text_color(accent()))
-            .child(row.title.clone())
-            .on_click(move |_, _, _| {
-                let url = url.clone();
-                std::thread::spawn(move || {
-                    let _ = std::process::Command::new("open").arg(url).status();
-                });
-            });
+            .child(row.title.clone());
         let place = if row.is_draft {
             format!("{} #{}, draft", row.pr.repo, row.pr.number)
         } else {
             format!("{} #{}", row.pr.repo, row.pr.number)
         };
+        let gates = self.gates.get(&row.pr);
         let status = reading.verb.map(|verb| {
             div()
                 .flex()
+                .items_start()
                 .gap(px(8.))
                 .text_size(px(13.))
                 .line_height(relative(1.45))
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .font_medium()
-                        .text_color(if reading.merged {
-                            success()
-                        } else {
-                            reading.tip
-                        })
-                        .child(verb),
-                )
+                .when_some(gates, |line, gates| {
+                    line.child(gate_icons(&row.pr, gates, active))
+                })
                 .when_some(reading.detail.clone(), |line, detail| {
                     line.child(div().min_w_0().text_color(ink()).child(detail))
                 })
+                .child(
+                    div()
+                        .id(SharedString::from(format!("status-{}", row.pr)))
+                        .flex_shrink_0()
+                        .h(px(19.))
+                        .flex()
+                        .items_center()
+                        .child(status_badge(reading.badge))
+                        .tooltip(move |window, cx| Tooltip::new(verb).build(window, cx)),
+                )
         });
         let path = sitter::worktree_path(&self.data, &row.pr);
         let worktree = (!active && path.exists()).then(|| {
-            let shown = path.display().to_string();
+            let folder = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
             div()
                 .flex()
                 .items_center()
-                .gap(px(10.))
+                .gap(px(6.))
                 .text_size(px(12.))
                 .text_color(muted())
-                .child(div().min_w_0().text_ellipsis().child(shown))
+                .child(Icon::new(IconName::FolderGit2).size(px(14.)))
+                .child(folder)
                 .child(
-                    Button::new(SharedString::from(format!("reveal-{}", row.pr)))
-                        .label("Reveal in Finder")
-                        .ghost()
-                        .xsmall()
-                        .on_click(move |_, _, _| {
-                            let path = path.clone();
-                            std::thread::spawn(move || {
-                                let _ = std::process::Command::new("open")
-                                    .arg("-R")
-                                    .arg(path)
-                                    .status();
-                            });
-                        }),
+                    icon_button(
+                        SharedString::from(format!("reveal-{}", row.pr)),
+                        IconName::FolderOpen,
+                        "Reveal in Finder",
+                        px(24.),
+                    )
+                    .on_click(move |_, _, _| {
+                        let path = path.clone();
+                        std::thread::spawn(move || {
+                            let _ = std::process::Command::new("open")
+                                .arg("-R")
+                                .arg(path)
+                                .status();
+                        });
+                    }),
                 )
         });
         let content = div()
@@ -1185,18 +1189,22 @@ impl AppView {
             .flex()
             .items_start()
             .gap(px(20.))
-            .child(meter(&row.pr, &reading))
             .child(content)
             .child(
                 div()
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(px(16.))
+                    .gap(px(12.))
                     .when_some(time_left, |d, left| {
                         d.child(div().text_size(px(12.)).text_color(muted()).child(left))
                     })
-                    .when_some(action, |d, action| d.child(action)),
+                    .child(open)
+                    .child(match action {
+                        Some(action) => action.into_any_element(),
+                        // Keeps the GitHub button aligned with rows that have an action.
+                        None => div().size(px(34.)).into_any_element(),
+                    }),
             )
             .into_any_element()
     }
@@ -1441,6 +1449,18 @@ fn round_button(
         .tooltip(label)
         .child(Icon::new(icon).size(px(14.)))
 }
+/// A borderless round button showing only an icon, for secondary row actions.
+fn icon_button(id: SharedString, icon: IconName, label: &'static str, size: Pixels) -> Button {
+    Button::new(id)
+        .ghost()
+        .rounded(size / 2.)
+        .w(size)
+        .h(size)
+        .p_0()
+        .accessibility_label(label)
+        .tooltip(label)
+        .child(Icon::new(icon).size(px(14.)))
+}
 
 /// The page title row. Its empty space drags the window, since the title bar is hidden.
 fn header(title: &'static str, detail: Option<&'static str>) -> Div {
@@ -1570,6 +1590,83 @@ fn avatar(path: Option<&PathBuf>, size: f32) -> AnyElement {
             .into_any_element(),
     }
 }
+/// The merge requirements in the order the CLI reports them, each with its own icon.
+const GATE_ICONS: [(IconName, &str); 4] = [
+    (IconName::MessageSquare, "Reviews"),
+    (IconName::ListChecks, "Checks"),
+    (IconName::GitBranch, "Branch up to date"),
+    (IconName::GitMerge, "Merge"),
+];
+/// One icon per merge requirement, colored by its state and named in its tooltip.
+/// A waiting requirement pulses while the babysit runs.
+fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
+    div()
+        .flex_shrink_0()
+        .h(px(19.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .children(GATE_ICONS.iter().zip(gates).map(|((icon, name), state)| {
+            let (color, word) = state_style(*state);
+            let label = SharedString::from(format!("{name}: {word}"));
+            let state = *state;
+            let id = SharedString::from(format!("gate-{pr}-{name}"));
+            let mark = Icon::new(*icon).size(px(15.)).text_color(color);
+            let mark = if live && state == GateState::Waiting {
+                mark.with_animation(
+                    id.clone(),
+                    Animation::new(Duration::from_millis(2400))
+                        .repeat()
+                        .with_easing(pulsating_between(0.35, 1.0)),
+                    move |mark, delta| mark.text_color(color.opacity(delta)),
+                )
+                .into_any_element()
+            } else {
+                mark.into_any_element()
+            };
+            div().id(id).child(mark).tooltip(move |window, cx| {
+                let label = label.clone();
+                Tooltip::element(move |_, _| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(status_badge(state))
+                        .child(label.clone())
+                })
+                .build(window, cx)
+            })
+        }))
+}
+/// The color and word for a state, shared by gate icons, tooltips, and status badges.
+fn state_style(state: GateState) -> (Hsla, &'static str) {
+    match state {
+        GateState::Met => (success(), "done"),
+        GateState::Waiting => (warning(), "waiting"),
+        GateState::Blocked => (danger(), "blocked"),
+        GateState::Pending => (muted().opacity(0.45), "not started"),
+    }
+}
+/// A filled circle holding a check, dash, or cross; a hollow ring when not started.
+fn status_badge(state: GateState) -> Div {
+    let (color, _) = state_style(state);
+    let badge = div()
+        .size(px(14.))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center();
+    let glyph = match state {
+        GateState::Met => IconName::Check,
+        GateState::Waiting => IconName::Minus,
+        GateState::Blocked => IconName::X,
+        GateState::Pending => return badge.border_2().border_color(color),
+    };
+    badge
+        .bg(color)
+        .child(Icon::new(glyph).size(px(10.)).text_color(panel()))
+}
 /// The caretaker and the child: a lit disc holding a smaller light one.
 fn pair_mark() -> Div {
     div()
@@ -1597,59 +1694,6 @@ fn pair_mark() -> Div {
                 .border_color(panel())
                 .bg(ink()),
         )
-}
-/// A baby monitor's level meter: one segment per checklist step, lit up to the
-/// step the latest pass reached, read from the bottom.
-fn meter(pr: &PrRef, reading: &Reading) -> AnyElement {
-    let segments = (0..STEPS.len()).rev().map(|index| {
-        let segment = div().w(px(20.)).h(px(5.)).rounded(px(1.));
-        let position = index + 1;
-        if reading.merged {
-            segment.bg(success()).into_any_element()
-        } else if position < reading.level {
-            segment.bg(accent()).into_any_element()
-        } else if position == reading.level && reading.breathe {
-            segment
-                .bg(reading.tip)
-                .with_animation(
-                    SharedString::from(format!("breathe-{pr}")),
-                    Animation::new(Duration::from_millis(2400))
-                        .repeat()
-                        .with_easing(pulsating_between(0.3, 1.0)),
-                    |segment, delta| segment.opacity(delta),
-                )
-                .into_any_element()
-        } else if position == reading.level {
-            segment.bg(reading.tip).into_any_element()
-        } else {
-            segment.bg(divider()).into_any_element()
-        }
-    });
-    let tooltip: Option<SharedString> = if reading.merged {
-        Some("Merged".into())
-    } else {
-        reading.level.checked_sub(1).map(|index| {
-            format!(
-                "Step {} of {}: {}",
-                reading.level,
-                STEPS.len(),
-                STEPS[index]
-            )
-            .into()
-        })
-    };
-    div()
-        .id(SharedString::from(format!("meter-{pr}")))
-        .flex_shrink_0()
-        .pt(px(3.))
-        .flex()
-        .flex_col()
-        .gap(px(3.))
-        .children(segments)
-        .when_some(tooltip, |d, text| {
-            d.tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
-        })
-        .into_any_element()
 }
 fn message(title: &'static str, detail: Option<String>) -> Div {
     div()

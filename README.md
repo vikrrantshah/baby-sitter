@@ -30,7 +30,7 @@ Drag the app to `/Applications` to keep it. The script needs Xcode's command lin
 For development, `cargo build --workspace && target/debug/baby-sitter-app` runs the window without a bundle. Both binaries must sit in the same directory. Outside the bundle the Dock shows the name `baby-sitter-app`, and system notification responses are disabled.
 
 - **Repositories** groups accessible repositories by organization and leaves out archived ones. Filter by organization or watched status, or search by name. Use the toggle to watch a repository and the gear to set its timeout and interval. The default interval is `30s`, not the CLI's `10s`. Each pass makes two GraphQL calls, so six PRs at `10s` use most of the hourly limit of 5,000 points.
-- **Pull requests** lists your open PRs in the repositories you watch. Filter by repository, then press the play button to start a babysit or the stop button to cancel it. Each row shows what the latest pass is doing, and after a stop it shows the reason. The meter beside a row lights one segment per step of the [flow](#flow) that the latest pass reached, from PR state at the bottom to merge at the top. Hover over it to see the step's name.
+- **Pull requests** lists your open PRs in the repositories you watch. Filter by repository, then press the play button to start a babysit or the stop button to cancel it. The GitHub button opens the PR. Each row shows what the latest pass is doing, and after a stop it shows the reason. Before that text, four icons show what the merge still needs: reviews, checks, an up-to-date branch, and the merge itself. Green is done, amber is waiting, red is blocked, and grey is not started; hover over an icon for its name. A badge in the same colors ends the line: a check for merged, a dash while the babysit runs or after a timeout, a cross after a stop or failure, and an empty ring after a cancel. Hover over the badge for the state's name, such as Stopped or Timed out. The app runs the binary with `--gates` to get the icons. After a stop, the row names the PR's worktree folder; the folder button reveals it in Finder.
 - A notification appears when a babysit merges, times out, or stops. A cancel does not notify.
 
 The app keeps its configuration, one clone per repository, and one worktree per PR in `~/Library/Application Support/baby-sitter`. It removes a worktree after a merge. After any other outcome it keeps the worktree and shows its path with a Reveal button.
@@ -56,6 +56,7 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 | `--merge-method` | `squash` | `squash`, `merge`, or `rebase` for direct merges. Merge queues use their configured method. |
 | `--timeout` | `2h` | Deadline for the whole run, including every `gh`, `git`, and `codex` call. |
 | `--interval` | `10s` | Time between snapshots while the run waits. |
+| `--gates` | off | Before every decision, print each merge gate's state: `[gates] reviews=met checks=waiting branch=met merge=pending`. Each rule in `RULES` belongs to one gate. A gate is `blocked` when one of its rules stops the run, `waiting` when one waits or acts, and `met` otherwise. Merge is `pending` until the other three are met, then `waiting` while the binary merges or the PR sits in a queue. |
 
 | Exit code | Meaning |
 |---|---|

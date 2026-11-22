@@ -428,6 +428,7 @@ impl Runner {
                     &format!("{}s", self.deadline.saturating_sub(unix_now())),
                     "--interval",
                     &format!("{}s", self.settings.interval.as_secs()),
+                    "--gates",
                 ])
                 .current_dir(worktree_path(&self.data, &self.pr));
             let output = self.run(command, ProcessMode::Sit)?;

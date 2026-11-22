@@ -90,86 +90,200 @@ impl fmt::Display for Item {
 }
 struct Rule {
     name: &'static str,
+    gate: Gate,
     eval: fn(&Facts<'_>) -> Option<Verdict>,
 }
 const RULES: &[Rule] = &[
     Rule {
         name: "merged",
+        gate: Gate::Merge,
         eval: merged,
     },
     Rule {
         name: "closed",
+        gate: Gate::Merge,
         eval: closed,
     },
     Rule {
         name: "draft",
+        gate: Gate::Merge,
         eval: draft,
     },
     Rule {
         name: "conflict",
+        gate: Gate::Branch,
         eval: conflict,
     },
     Rule {
         name: "ci-failed",
+        gate: Gate::Checks,
         eval: ci_failed,
     },
     Rule {
         name: "in-queue",
+        gate: Gate::Merge,
         eval: in_queue,
     },
     Rule {
         name: "dequeued",
+        gate: Gate::Merge,
         eval: dequeued,
     },
     Rule {
         name: "local-upstream",
+        gate: Gate::Branch,
         eval: local_upstream,
     },
     Rule {
         name: "local-dirty",
+        gate: Gate::Branch,
         eval: local_dirty,
     },
     Rule {
         name: "local-diverged",
+        gate: Gate::Branch,
         eval: local_diverged,
     },
     Rule {
         name: "local-behind",
+        gate: Gate::Branch,
         eval: local_behind,
     },
     Rule {
         name: "resolve-fixed",
+        gate: Gate::Reviews,
         eval: resolve_fixed,
     },
     Rule {
         name: "unhandled-items",
+        gate: Gate::Reviews,
         eval: unhandled_items,
     },
     Rule {
         name: "behind-base",
+        gate: Gate::Branch,
         eval: behind_base,
     },
     Rule {
         name: "ci-pending",
+        gate: Gate::Checks,
         eval: ci_pending,
     },
     Rule {
         name: "merge-state",
+        gate: Gate::Merge,
         eval: merge_state,
     },
     Rule {
         name: "unresolved-threads",
+        gate: Gate::Reviews,
         eval: unresolved_threads,
     },
     Rule {
         name: "review-requests",
+        gate: Gate::Reviews,
         eval: review_requests,
     },
     Rule {
         name: "review-decision",
+        gate: Gate::Reviews,
         eval: review_decision,
     },
 ];
+/// The four requirements a PR meets on its way to merged, as reported by `--gates`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    Reviews,
+    Checks,
+    Branch,
+    Merge,
+}
+impl Gate {
+    const ALL: [Gate; 4] = [Gate::Reviews, Gate::Checks, Gate::Branch, Gate::Merge];
+    fn name(self) -> &'static str {
+        match self {
+            Gate::Reviews => "reviews",
+            Gate::Checks => "checks",
+            Gate::Branch => "branch",
+            Gate::Merge => "merge",
+        }
+    }
+}
+/// Ordered from least to most severe, so the worst rule in a gate decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GateState {
+    /// Merge only: other gates are still open, so merging has not started.
+    Pending,
+    Met,
+    /// A rule waits on GitHub or a person, or the binary is acting on it.
+    Waiting,
+    /// A rule stops the run.
+    Blocked,
+}
+impl GateState {
+    fn name(self) -> &'static str {
+        match self {
+            GateState::Pending => "pending",
+            GateState::Met => "met",
+            GateState::Waiting => "waiting",
+            GateState::Blocked => "blocked",
+        }
+    }
+}
+#[derive(Debug, PartialEq)]
+pub struct Gates([GateState; 4]);
+impl Gates {
+    #[cfg(test)]
+    fn get(&self, gate: Gate) -> GateState {
+        self.0[gate as usize]
+    }
+}
+impl fmt::Display for Gates {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, (gate, state)) in Gate::ALL.iter().zip(self.0).enumerate() {
+            let sep = if index == 0 { "" } else { " " };
+            write!(f, "{sep}{}={}", gate.name(), state.name())?;
+        }
+        Ok(())
+    }
+}
+/// Evaluates every rule, not just the first match, and files each verdict under its gate.
+pub fn gates(f: &Facts<'_>) -> Gates {
+    if f.snap.lifecycle == Lifecycle::Merged {
+        return Gates([GateState::Met; 4]);
+    }
+    let mut states = [GateState::Met; 4];
+    // Only rules that stop the PR or hold it in a queue; merging itself is decided below.
+    let mut merge = None;
+    for rule in RULES {
+        // GitHub's merge state echoes the other gates (BLOCKED while reviews are
+        // missing) and only ever waits, which the merge default below already shows.
+        if rule.name == "merge-state" {
+            continue;
+        }
+        let Some(verdict) = (rule.eval)(f) else {
+            continue;
+        };
+        let state = match verdict {
+            Verdict::Stop(_) => GateState::Blocked,
+            Verdict::Done => GateState::Met,
+            Verdict::Wait(_) | Verdict::Act(_) => GateState::Waiting,
+        };
+        if rule.gate == Gate::Merge {
+            merge = merge.max(Some(state));
+        } else {
+            let slot = &mut states[rule.gate as usize];
+            *slot = (*slot).max(state);
+        }
+    }
+    let others_met = states[..3].iter().all(|s| *s == GateState::Met);
+    states[Gate::Merge as usize] = match merge {
+        Some(state) => state,
+        None if others_met => GateState::Waiting,
+        None => GateState::Pending,
+    };
+    Gates(states)
+}
 pub fn decide(f: &Facts<'_>) -> Decision {
     RULES
         .iter()
@@ -683,5 +797,43 @@ mod tests {
         w.snap.mergeable = Mergeable::Yes;
         w.local.relation = Relation::Ahead;
         assert!(matches!(w.decision().verdict, Verdict::Stop(_)));
+    }
+    #[test]
+    fn gates_report_every_requirement_not_just_the_first_blocker() {
+        let report = |w: &World| {
+            gates(&Facts {
+                snap: &w.snap,
+                local: Some(&w.local),
+                method: MergeMethod::Squash,
+            })
+        };
+        let mut w = World::new();
+        assert_eq!(
+            report(&w).to_string(),
+            "reviews=met checks=met branch=met merge=waiting"
+        );
+        w.snap.threads.push(thread(vec![bot(1)]));
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            pending: vec![],
+        };
+        w.snap.mergeable = Mergeable::Unknown;
+        let g = report(&w);
+        assert_eq!(
+            Gate::ALL.map(|gate| g.get(gate)),
+            [
+                GateState::Waiting,
+                GateState::Waiting,
+                GateState::Met,
+                GateState::Pending
+            ]
+        );
+        w.snap.mergeable = Mergeable::Conflicting;
+        assert_eq!(report(&w).get(Gate::Branch), GateState::Blocked);
+        w.snap.lifecycle = Lifecycle::Closed;
+        assert_eq!(report(&w).get(Gate::Merge), GateState::Blocked);
+        w.snap.lifecycle = Lifecycle::Merged;
+        assert_eq!(report(&w), Gates([GateState::Met; 4]));
     }
 }

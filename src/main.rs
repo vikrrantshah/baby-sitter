@@ -34,6 +34,9 @@ struct Cli {
     /// Time between snapshots while waiting.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     interval: Duration,
+    /// Print each merge gate's state before every decision.
+    #[arg(long)]
+    gates: bool,
 }
 struct Observation {
     snap: Snapshot,
@@ -93,6 +96,9 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
                 anyhow::bail!("{reason}");
             }
             return Ok(());
+        }
+        if cli.gates {
+            eprintln!("[gates] {}", decide::gates(&facts));
         }
         if let (
             Verdict::Act(decide::Action::Enqueue { .. }),

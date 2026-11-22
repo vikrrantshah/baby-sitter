@@ -18,7 +18,7 @@ pub fn panel() -> Hsla {
 pub fn raised() -> Hsla {
     rgb(0x2c2f34).into()
 }
-/// Dividers and unlit meter segments.
+/// Dividers.
 pub fn divider() -> Hsla {
     rgb(0x393c42).into()
 }
@@ -30,7 +30,7 @@ pub fn ink() -> Hsla {
 pub fn muted() -> Hsla {
     rgb(0xa3a6ad).into()
 }
-/// Lit meter segments, selection, start buttons, waiting babysits.
+/// Selection and start buttons.
 pub fn accent() -> Hsla {
     rgb(0x3fb0a3).into()
 }
