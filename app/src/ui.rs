@@ -1,7 +1,8 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, Config, Outcome, PrRef, PrRow, RepoName, RepoSettings, STEPS, SitState, VerdictKind,
+        self, Config, Outcome, PrRef, PrRow, RepoListItem, RepoName, RepoScope, RepoSettings,
+        STEPS, SitState, VerdictKind,
     },
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
@@ -10,11 +11,11 @@ use crate::{
 use gpui_kit::{component::StyledExt, prelude::FluentBuilder};
 use gpui_kit::{
     component::{
-        Disableable, Sizable,
-        button::{Button, ButtonCustomVariant, ButtonVariants},
-        checkbox::Checkbox,
+        Disableable, Selectable, Sizable,
+        button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
         input::{Input, InputEvent, InputState},
         select::{Select, SelectEvent, SelectState},
+        switch::Switch,
         tooltip::Tooltip,
     },
     *,
@@ -31,10 +32,11 @@ enum Load<T> {
     Ready(T),
     Error(String),
 }
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Tab {
+#[derive(Clone, Eq, PartialEq)]
+enum Page {
     PullRequests,
     Repositories,
+    RepoSettings(RepoName),
 }
 #[derive(Clone, Copy)]
 enum Field {
@@ -62,6 +64,7 @@ struct Reading {
 
 const SIDEBAR_WIDTH: f32 = 232.;
 const ROW_INSET: f32 = 32.;
+const REPO_ROW_HEIGHT: f32 = 56.;
 
 pub struct AppView {
     data: PathBuf,
@@ -69,10 +72,13 @@ pub struct AppView {
     env: ChildEnv,
     registry: Registry,
     locks: RepoLocks,
-    tab: Tab,
+    page: Page,
     repos: Load<Vec<RepoName>>,
     prs: Load<Vec<PrRow>>,
     repo_filter: Entity<InputState>,
+    org_select: Entity<SelectState<Vec<String>>>,
+    org_filter: Option<String>,
+    scope: RepoScope,
     dashboard_filter: Entity<SelectState<Vec<String>>>,
     selected_filter: Option<RepoName>,
     inputs: BTreeMap<RepoName, RepoInputs>,
@@ -114,12 +120,25 @@ impl AppView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter repositories"));
         let dashboard_filter =
             cx.new(|cx| SelectState::new(vec!["All repositories".to_string()], None, window, cx));
+        let org_select =
+            cx.new(|cx| SelectState::new(vec!["All organizations".to_string()], None, window, cx));
         let subscriptions = vec![
             cx.subscribe(&repo_filter, |_: &mut Self, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
                 }
             }),
+            cx.subscribe(
+                &org_select,
+                |this: &mut Self, _, event: &SelectEvent<Vec<String>>, cx| {
+                    let SelectEvent::Confirm(value) = event;
+                    this.org_filter = value
+                        .as_ref()
+                        .filter(|name| name.as_str() != "All organizations")
+                        .cloned();
+                    cx.notify();
+                },
+            ),
             cx.subscribe(
                 &dashboard_filter,
                 |this: &mut Self, _, event: &SelectEvent<Vec<String>>, cx| {
@@ -178,10 +197,13 @@ impl AppView {
             env,
             registry,
             locks,
-            tab: Tab::PullRequests,
+            page: Page::PullRequests,
             repos: Load::Loading,
             prs: Load::Loading,
             repo_filter,
+            org_select,
+            org_filter: None,
+            scope: RepoScope::All,
             dashboard_filter,
             selected_filter: None,
             inputs: BTreeMap::new(),
@@ -346,19 +368,46 @@ impl AppView {
             .count()
     }
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.load_repos(cx);
+        self.load_repos(window, cx);
         self.load_prs(window, cx);
     }
-    fn load_repos(&mut self, cx: &mut Context<Self>) {
+    fn load_repos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.repos = Load::Loading;
         let env = self.env.clone();
-        self.repo_task = Some(cx.spawn(async move |view, cx| {
+        self.repo_task = Some(cx.spawn_in(window, async move |view, cx| {
             let result = cx
                 .background_spawn(async move { gh::list_repos(&env).map_err(|e| format!("{e:#}")) })
                 .await;
-            let _ = view.update(cx, |this, cx| {
+            let _ = view.update_in(cx, |this, window, cx| {
                 this.repos = match result {
-                    Ok(repos) => Load::Ready(repos),
+                    Ok(repos) => {
+                        let mut owners: Vec<_> = repos
+                            .iter()
+                            .map(|repo| repo.owner.as_str())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        owners.sort_by_cached_key(|owner| owner.to_lowercase());
+                        if this
+                            .org_filter
+                            .as_deref()
+                            .is_some_and(|selected| !owners.contains(&selected))
+                        {
+                            this.org_filter = None;
+                        }
+                        let mut choices = vec!["All organizations".to_owned()];
+                        choices.extend(owners.into_iter().map(str::to_owned));
+                        let selected = this
+                            .org_filter
+                            .clone()
+                            .unwrap_or_else(|| "All organizations".into());
+                        this.org_select.update(cx, |state, cx| {
+                            state.set_items(choices, window, cx);
+                            state.set_selected_value(&selected, window, cx);
+                            cx.notify();
+                        });
+                        Load::Ready(repos)
+                    }
                     Err(error) => Load::Error(error),
                 };
                 cx.notify();
@@ -587,36 +636,28 @@ impl AppView {
     fn repo_row(&self, repo: &RepoName, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.config.repos.contains_key(repo);
         let count = self.active_count(repo);
-        let checkbox_repo = repo.clone();
-        let checkbox = Checkbox::new(SharedString::from(format!("repo-{repo}")))
-            .label(repo.to_string())
+        let switch_repo = repo.clone();
+        let settings_repo = repo.clone();
+        let switch = Switch::new(SharedString::from(format!("repo-{repo}")))
+            .accessibility_label(format!("Allow {repo}"))
             .checked(selected)
             .disabled(count > 0)
-            .on_change(cx.listener(move |this, checked, window, cx| {
-                this.toggle_repo(checkbox_repo.clone(), *checked, window, cx)
+            .on_click(cx.listener(move |this, checked, window, cx| {
+                this.toggle_repo(switch_repo.clone(), *checked, window, cx)
             }));
-        let inputs = self.inputs.get(repo);
-        let errors = inputs
-            .into_iter()
-            .flat_map(|inputs| [&inputs.timeout_error, &inputs.interval_error])
-            .flatten()
-            .cloned();
-        let field = |label: &'static str, input: &Entity<InputState>, invalid: bool| {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .w(px(132.))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(if invalid { coral() } else { dusk() })
-                        .child(label),
-                )
-                .child(Input::new(input).small())
-        };
+        let settings = Button::new(SharedString::from(format!("settings-{repo}")))
+            .label("Settings")
+            .accessibility_label(format!("Settings for {repo}"))
+            .ghost()
+            .small()
+            .disabled(!selected)
+            .when(!selected, |button| button.tooltip("Turn on to configure"))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.page = Page::RepoSettings(settings_repo.clone());
+                cx.notify();
+            }));
         div()
-            .h(px(68.))
+            .h(px(REPO_ROW_HEIGHT))
             .w_full()
             .px(px(ROW_INSET))
             .border_b_1()
@@ -628,23 +669,18 @@ impl AppView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(checkbox)
-                    .children(errors.map(|error| {
-                        div()
-                            .pl(px(26.))
-                            .text_size(px(12.))
-                            .text_color(coral())
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(error)
-                    })),
+                    .text_ellipsis()
+                    .text_color(moon())
+                    .child(repo.name.clone()),
             )
             .when(count > 0, |row| {
                 row.child(
                     div()
+                        .flex_shrink_0()
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(12.))
+                        .bg(glow().opacity(0.12))
                         .text_size(px(12.))
                         .text_color(glow())
                         .child(if count == 1 {
@@ -654,72 +690,97 @@ impl AppView {
                         }),
                 )
             })
-            .when_some(inputs, |row, inputs| {
-                row.child(field(
-                    "Timeout",
-                    &inputs.timeout,
-                    inputs.timeout_error.is_some(),
-                ))
-                .child(field(
-                    "Interval",
-                    &inputs.interval,
-                    inputs.interval_error.is_some(),
-                ))
-            })
+            .child(switch)
+            .child(settings)
             .into_any_element()
     }
-    /// The page header and body, kept apart so errors can sit between them.
     fn render_repos(&self, cx: &mut Context<Self>) -> (Div, Div) {
-        let body = match &self.repos {
+        let list = match &self.repos {
             Load::Loading => message("Loading repositories…", None),
             Load::Error(error) => {
                 let retry = Button::new("retry-repos")
                     .label("Retry")
                     .outline()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.load_repos(cx);
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.load_repos(window, cx);
                         cx.notify();
                     }));
                 message("Could not load repositories", Some(error.clone())).child(retry)
             }
+            Load::Ready(repos) if repos.is_empty() => message(
+                "No repositories found",
+                Some("Your GitHub account has no repositories it can push to.".into()),
+            ),
             Load::Ready(repos) => {
-                let filter = self.repo_filter.read(cx).value().to_lowercase();
-                let mut filtered: Vec<_> = repos
-                    .iter()
-                    .filter(|repo| {
-                        filter.is_empty() || repo.to_string().to_lowercase().contains(&filter)
-                    })
-                    .cloned()
-                    .collect();
-                filtered.sort_by(|a, b| {
-                    self.config
-                        .repos
-                        .contains_key(b)
-                        .cmp(&self.config.repos.contains_key(a))
-                        .then_with(|| a.cmp(b))
-                });
-                if filtered.is_empty() {
-                    if filter.is_empty() {
+                let items = model::repo_list(
+                    repos,
+                    &self.config.repos,
+                    self.org_filter.as_deref(),
+                    self.scope,
+                    self.repo_filter.read(cx).value().as_ref(),
+                );
+                if items.is_empty() {
+                    if self.scope == RepoScope::Allowed
+                        && !repos
+                            .iter()
+                            .any(|repo| self.config.repos.contains_key(repo))
+                    {
                         message(
-                            "No repositories found",
-                            Some("Your GitHub account has no repositories it can push to.".into()),
+                            "No repositories allowed",
+                            Some(
+                                "Turn on a repository under All to babysit its pull requests."
+                                    .into(),
+                            ),
                         )
                     } else {
                         message(
-                            "No repositories match the filter",
-                            Some("Check the spelling, or clear the filter.".into()),
+                            "No repositories match the filters",
+                            Some("Clear a filter to see more.".into()),
                         )
                     }
                 } else {
-                    let count = filtered.len();
+                    let count = items.len();
                     div().size_full().child(
                         uniform_list(
                             "repo-list",
                             count,
                             cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                                 range
-                                    .filter_map(|index| filtered.get(index))
-                                    .map(|repo| this.repo_row(repo, cx))
+                                    .filter_map(|index| items.get(index))
+                                    .map(|item| match item {
+                                        RepoListItem::Org {
+                                            name,
+                                            allowed,
+                                            total,
+                                        } => div()
+                                            .h(px(REPO_ROW_HEIGHT))
+                                            .w_full()
+                                            .px(px(ROW_INSET))
+                                            .bg(housing())
+                                            .border_b_1()
+                                            .border_color(rail())
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(20.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .font_semibold()
+                                                    .text_ellipsis()
+                                                    .text_color(moon())
+                                                    .child(name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(12.))
+                                                    .text_color(dusk())
+                                                    .child(format!("{allowed} of {total} allowed")),
+                                            )
+                                            .into_any_element(),
+                                        RepoListItem::Repo(repo) => this.repo_row(repo, cx),
+                                    })
                                     .collect::<Vec<_>>()
                             }),
                         )
@@ -728,11 +789,156 @@ impl AppView {
                 }
             }
         };
-        let header = header(
-            "Repositories",
-            Some("Babysits run only in the repositories you allow."),
+        let segment = |id: &'static str, label: &'static str, scope: RepoScope| {
+            let selected = self.scope == scope;
+            Button::new(id).selected(selected).child(
+                div()
+                    .text_color(if selected { glow() } else { dusk() })
+                    .when(selected, |d| d.font_semibold())
+                    .child(label),
+            )
+        };
+        let scope = ButtonGroup::new("repo-scope")
+            .small()
+            .outline()
+            .child(segment("scope-all", "All", RepoScope::All))
+            .child(segment("scope-allowed", "Allowed", RepoScope::Allowed))
+            .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                if let Some(index) = selected.first() {
+                    this.scope = if *index == 0 {
+                        RepoScope::All
+                    } else {
+                        RepoScope::Allowed
+                    };
+                    cx.notify();
+                }
+            }));
+        let filters = div()
+            .flex_shrink_0()
+            .px(px(ROW_INSET))
+            .py(px(16.))
+            .border_b_1()
+            .border_color(rail())
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(
+                div().w(px(190.)).flex_shrink_0().child(
+                    Select::new(&self.org_select)
+                        .small()
+                        .accessibility_label("Filter by organization")
+                        .placeholder("All organizations"),
+                ),
+            )
+            .child(scope)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.repo_filter).small()),
+            );
+        let body = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(filters)
+            .child(div().flex_1().min_h_0().child(list));
+        (
+            header(
+                "Repositories",
+                Some("Babysits run only in the repositories you allow."),
+            ),
+            body,
         )
-        .child(div().w(px(260.)).child(Input::new(&self.repo_filter)));
+    }
+    fn render_repo_settings(&self, repo: &RepoName, cx: &mut Context<Self>) -> (Div, Div) {
+        let inputs = self
+            .inputs
+            .get(repo)
+            .expect("allowed repositories have duration inputs");
+        let field = |label: &'static str, input: &Entity<InputState>, error: &Option<String>| {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_semibold()
+                        .text_color(moon())
+                        .child(label),
+                )
+                .child(Input::new(input))
+                .when_some(error.clone(), |field, error| {
+                    field.child(div().text_size(px(12.)).text_color(coral()).child(error))
+                })
+        };
+        let header = div()
+            .flex_shrink_0()
+            .px(px(ROW_INSET))
+            .pt(px(28.))
+            .pb(px(20.))
+            .border_b_1()
+            .border_color(rail())
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(12.))
+            .child(
+                Button::new("back-to-repositories")
+                    .label("‹ Repositories")
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page = Page::Repositories;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                drag_area()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(24.))
+                            .font_semibold()
+                            .text_color(moon())
+                            .child(repo.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(dusk())
+                            .child("Applies to babysits you start from now on."),
+                    ),
+            );
+        let body = div().size_full().child(
+            div()
+                .id("repo-settings-form")
+                .size_full()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .px(px(ROW_INSET))
+                        .py(px(28.))
+                        .w_full()
+                        .max_w(px(420.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(24.))
+                        .child(field("Timeout", &inputs.timeout, &inputs.timeout_error))
+                        .child(field("Interval", &inputs.interval, &inputs.interval_error))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(dusk())
+                                .child("Use s, m, or h, for example 2h or 30s."),
+                        ),
+                ),
+        );
         (header, body)
     }
     fn dashboard_rows(&self) -> Vec<Cow<'_, PrRow>> {
@@ -905,7 +1111,7 @@ impl AppView {
                             .label("Choose repositories")
                             .primary()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.tab = Tab::Repositories;
+                                this.page = Page::Repositories;
                                 cx.notify();
                             })),
                     )
@@ -963,8 +1169,15 @@ impl AppView {
             1 => "Babysitting 1 pull request.".to_owned(),
             n => format!("Babysitting {n} pull requests."),
         };
-        let nav = |tab: Tab, id: &'static str, label: &'static str, cx: &mut Context<Self>| {
-            let selected = self.tab == tab;
+        let nav = |page: Page, id: &'static str, label: &'static str, cx: &mut Context<Self>| {
+            let selected = matches!(
+                (&self.page, &page),
+                (Page::PullRequests, Page::PullRequests)
+                    | (
+                        Page::Repositories | Page::RepoSettings(_),
+                        Page::Repositories
+                    )
+            );
             Button::new(id)
                 .custom(
                     ButtonCustomVariant::new(cx)
@@ -988,7 +1201,7 @@ impl AppView {
                         .child(label),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.tab = tab;
+                    this.page = page.clone();
                     cx.notify();
                 }))
         };
@@ -1040,8 +1253,8 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(nav(Tab::PullRequests, "nav-prs", "Pull requests", cx))
-                    .child(nav(Tab::Repositories, "nav-repos", "Repositories", cx)),
+                    .child(nav(Page::PullRequests, "nav-prs", "Pull requests", cx))
+                    .child(nav(Page::Repositories, "nav-repos", "Repositories", cx)),
             )
             .child(div().flex_1())
             .child(
@@ -1195,9 +1408,16 @@ fn message(title: &'static str, detail: Option<String>) -> Div {
 }
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (header, body) = match self.tab {
-            Tab::PullRequests => self.render_dashboard(cx),
-            Tab::Repositories => self.render_repos(cx),
+        if matches!(
+            &self.page,
+            Page::RepoSettings(repo) if !self.config.repos.contains_key(repo)
+        ) {
+            self.page = Page::Repositories;
+        }
+        let (header, body) = match &self.page {
+            Page::PullRequests => self.render_dashboard(cx),
+            Page::Repositories => self.render_repos(cx),
+            Page::RepoSettings(repo) => self.render_repo_settings(repo, cx),
         };
         div()
             .size_full()
