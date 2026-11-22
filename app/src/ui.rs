@@ -1316,13 +1316,13 @@ impl AppView {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(moon_mark())
+                    .child(pair_mark())
                     .child(
                         div()
                             .text_size(px(18.))
                             .font_semibold()
                             .text_color(moon())
-                            .child("baby-sitter"),
+                            .child("Baby Sitter"),
                     ),
             )
             .child(
@@ -1481,20 +1481,32 @@ fn avatar(path: Option<&PathBuf>, size: f32) -> AnyElement {
             .into_any_element(),
     }
 }
-/// A crescent: a lit disc with a housing-colored disc over its upper right.
-fn moon_mark() -> Div {
+/// The caretaker and the child: a lit disc holding a smaller mint one.
+fn pair_mark() -> Div {
     div()
         .relative()
-        .size(px(18.))
-        .child(div().absolute().size_full().rounded_full().bg(glow()))
+        .w(px(22.))
+        .h(px(20.))
+        .flex_shrink_0()
         .child(
             div()
                 .absolute()
-                .top(px(-4.))
-                .left(px(6.))
+                .top(px(1.))
+                .left_0()
                 .size(px(16.))
                 .rounded_full()
-                .bg(housing()),
+                .bg(glow()),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(7.))
+                .left(px(9.))
+                .size(px(13.))
+                .rounded_full()
+                .border_2()
+                .border_color(housing())
+                .bg(mint()),
         )
 }
 /// A baby monitor's level meter: one segment per checklist step, lit up to the

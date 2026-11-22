@@ -66,7 +66,7 @@ fn run() -> anyhow::Result<()> {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(760.0), px(480.0))),
             titlebar: Some(TitlebarOptions {
-                title: Some("baby-sitter".into()),
+                title: Some("Baby Sitter".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(16.0), px(18.0))),
             }),
