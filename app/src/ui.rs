@@ -642,7 +642,7 @@ impl AppView {
         let switch_repo = repo.clone();
         let settings_repo = repo.clone();
         let switch = Switch::new(SharedString::from(format!("repo-{repo}")))
-            .accessibility_label(format!("Allow {repo}"))
+            .accessibility_label(format!("Watch {repo}"))
             .checked(selected)
             .disabled(count > 0)
             .on_click(cx.listener(move |this, checked, window, cx| {
@@ -726,16 +726,15 @@ impl AppView {
                     self.repo_filter.read(cx).value().as_ref(),
                 );
                 if items.is_empty() {
-                    if self.scope == RepoScope::Allowed
+                    if self.scope == RepoScope::Watched
                         && !repos
                             .iter()
                             .any(|repo| self.config.repos.contains_key(repo))
                     {
                         message(
-                            "No repositories allowed",
+                            "No watched repositories",
                             Some(
-                                "Turn on a repository under All to babysit its pull requests."
-                                    .into(),
+                                "Turn on a repository under All to watch its pull requests.".into(),
                             ),
                         )
                     } else {
@@ -756,7 +755,7 @@ impl AppView {
                                     .map(|item| match item {
                                         RepoListItem::Org {
                                             name,
-                                            allowed,
+                                            watched,
                                             total,
                                         } => div()
                                             .h(px(REPO_ROW_HEIGHT))
@@ -782,7 +781,7 @@ impl AppView {
                                                     .flex_shrink_0()
                                                     .text_size(px(12.))
                                                     .text_color(dusk())
-                                                    .child(format!("{allowed} of {total} allowed")),
+                                                    .child(format!("{watched} of {total} watched")),
                                             )
                                             .into_any_element(),
                                         RepoListItem::Repo(repo) => this.repo_row(repo, cx),
@@ -808,13 +807,13 @@ impl AppView {
             .small()
             .outline()
             .child(segment("scope-all", "All", RepoScope::All))
-            .child(segment("scope-allowed", "Allowed", RepoScope::Allowed))
+            .child(segment("scope-watched", "Watched", RepoScope::Watched))
             .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
                 if let Some(index) = selected.first() {
                     this.scope = if *index == 0 {
                         RepoScope::All
                     } else {
-                        RepoScope::Allowed
+                        RepoScope::Watched
                     };
                     cx.notify();
                 }
@@ -852,7 +851,7 @@ impl AppView {
         (
             header(
                 "Repositories",
-                Some("Babysits run only in the repositories you allow."),
+                Some("Babysits run only in the repositories you watch."),
             ),
             body,
         )
@@ -861,7 +860,7 @@ impl AppView {
         let inputs = self
             .inputs
             .get(repo)
-            .expect("allowed repositories have duration inputs");
+            .expect("watched repositories have duration inputs");
         let field = |label: &'static str,
                      hint: &'static str,
                      input: &Entity<InputState>,
@@ -1142,8 +1141,8 @@ impl AppView {
             _ if rows.is_empty() => {
                 if self.config.repos.is_empty() {
                     message(
-                        "No repositories allowed",
-                        Some("Allow a repository to see its pull requests.".into()),
+                        "No watched repositories",
+                        Some("Watch a repository to see its pull requests.".into()),
                     )
                     .child(
                         Button::new("choose-repositories")
@@ -1163,7 +1162,7 @@ impl AppView {
                     message(
                         "No open pull requests",
                         Some(
-                            "None of your allowed repositories has an open pull request from you."
+                            "None of your watched repositories has an open pull request from you."
                                 .into(),
                         ),
                     )
