@@ -1846,12 +1846,13 @@ fn avatar(path: Option<&PathBuf>, size: f32) -> AnyElement {
             .into_any_element(),
     }
 }
-/// The merge requirements in the order the CLI reports them, each with its own icon.
-const GATE_ICONS: [(IconName, &str); 4] = [
-    (IconName::MessageSquare, "Reviews"),
-    (IconName::ListChecks, "Checks"),
-    (IconName::GitBranch, "Branch up to date"),
-    (IconName::GitMerge, "Merge"),
+/// The merge requirements in display order, each with its index in the CLI's
+/// `[gates] reviews checks branch merge` report and its own icon.
+const GATE_ICONS: [(usize, IconName, &str); 4] = [
+    (0, IconName::MessageSquare, "Reviews"),
+    (2, IconName::GitBranch, "Branch up to date"),
+    (1, IconName::ListChecks, "Checks"),
+    (3, IconName::GitMerge, "Merge"),
 ];
 /// One icon per merge requirement, colored by its state and named in its tooltip.
 /// A waiting requirement pulses while the babysit runs.
@@ -1862,12 +1863,12 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
         .flex()
         .items_center()
         .gap(px(6.))
-        .children(GATE_ICONS.iter().zip(gates).map(|((icon, name), state)| {
-            let (color, word) = state_style(*state);
+        .children(GATE_ICONS.iter().map(|&(index, icon, name)| {
+            let state = gates[index];
+            let (color, word) = state_style(state);
             let label = SharedString::from(format!("{name}: {word}"));
-            let state = *state;
             let id = SharedString::from(format!("gate-{pr}-{name}"));
-            let mark = Icon::new(*icon).size(px(15.)).text_color(color);
+            let mark = Icon::new(icon).size(px(15.)).text_color(color);
             let mark = if live && state == GateState::Waiting {
                 mark.with_animation(
                     id.clone(),
