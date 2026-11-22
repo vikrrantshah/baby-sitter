@@ -1,17 +1,21 @@
 use crate::{
     gh::{self, ChildEnv},
-    model::{self, Config, Outcome, PrRef, PrRow, RepoName, RepoSettings, SitState},
+    model::{
+        self, Config, Outcome, PrRef, PrRow, RepoName, RepoSettings, STEPS, SitState, VerdictKind,
+    },
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
+    theme::{coral, dusk, glow, housing, mint, moon, night, rail},
 };
 use gpui_kit::{component::StyledExt, prelude::FluentBuilder};
 use gpui_kit::{
     component::{
         Disableable, Sizable,
-        button::{Button, ButtonVariants},
+        button::{Button, ButtonCustomVariant, ButtonVariants},
         checkbox::Checkbox,
         input::{Input, InputEvent, InputState},
         select::{Select, SelectEvent, SelectState},
+        tooltip::Tooltip,
     },
     *,
 };
@@ -19,6 +23,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
+    time::Duration,
 };
 
 enum Load<T> {
@@ -28,8 +33,8 @@ enum Load<T> {
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tab {
-    Dashboard,
-    Repos,
+    PullRequests,
+    Repositories,
 }
 #[derive(Clone, Copy)]
 enum Field {
@@ -43,6 +48,20 @@ struct RepoInputs {
     interval_error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// How a pull request row reads: the meter level and the status sentence.
+struct Reading {
+    /// Lit meter segments, counted from the bottom.
+    level: usize,
+    tip: Hsla,
+    breathe: bool,
+    merged: bool,
+    verb: Option<&'static str>,
+    detail: Option<String>,
+}
+
+const SIDEBAR_WIDTH: f32 = 232.;
+const ROW_INSET: f32 = 32.;
 
 pub struct AppView {
     data: PathBuf,
@@ -58,11 +77,14 @@ pub struct AppView {
     selected_filter: Option<RepoName>,
     inputs: BTreeMap<RepoName, RepoInputs>,
     states: BTreeMap<PrRef, SitState>,
+    /// The checklist step each babysit's latest pass reached.
+    progress: BTreeMap<PrRef, usize>,
     handles: HashMap<PrRef, SitHandle>,
     event_tx: async_channel::Sender<SitEvent>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
     _events: Task<()>,
+    _clock: Task<()>,
     repo_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
 }
@@ -123,11 +145,29 @@ impl AppView {
                                 this.save();
                             }
                         }
+                        if let SitState::Running {
+                            last_line: Some(line),
+                        } = &event.state
+                            && let Some(step) = model::parse_pass(line).and_then(|pass| pass.step)
+                        {
+                            this.progress.insert(event.pr.clone(), step);
+                        }
                         this.states.insert(event.pr, event.state);
                         cx.notify();
                     })
                     .is_err()
                 {
+                    break;
+                }
+            }
+        });
+        // Keeps each babysit's time left current between its own output lines.
+        let clock = cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                if view.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
             }
@@ -138,7 +178,7 @@ impl AppView {
             env,
             registry,
             locks,
-            tab: Tab::Dashboard,
+            tab: Tab::PullRequests,
             repos: Load::Loading,
             prs: Load::Loading,
             repo_filter,
@@ -146,11 +186,13 @@ impl AppView {
             selected_filter: None,
             inputs: BTreeMap::new(),
             states: BTreeMap::new(),
+            progress: BTreeMap::new(),
             handles: HashMap::new(),
             event_tx,
             error,
             _subscriptions: subscriptions,
             _events: events,
+            _clock: clock,
             repo_task: None,
             pr_task: None,
         };
@@ -375,6 +417,7 @@ impl AppView {
             return;
         };
         self.states.insert(pr.clone(), SitState::Preparing);
+        self.progress.remove(&pr);
         let handle = sitter::spawn(
             pr.clone(),
             settings,
@@ -426,8 +469,12 @@ impl AppView {
         cx.notify();
     }
     fn ask_cancel(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
-        let action = matches!(self.states.get(&pr), Some(SitState::Running { last_line: Some(line) }) if line.starts_with('[') && !line.contains("] wait:") && !line.contains("] stop:") && !line.ends_with("] merged"));
-        if !action {
+        let acting = matches!(
+            self.states.get(&pr),
+            Some(SitState::Running { last_line: Some(line) })
+                if model::parse_pass(line).is_some_and(|pass| pass.kind == VerdictKind::Act)
+        );
+        if !acting {
             self.cancel(pr, cx);
             return;
         }
@@ -445,59 +492,192 @@ impl AppView {
         })
         .detach();
     }
+    fn show_repository(&mut self, repo: &RepoName, window: &mut Window, cx: &mut Context<Self>) {
+        let text = repo.to_string();
+        self.repo_filter
+            .update(cx, |state, cx| state.set_value(text, window, cx));
+        self.tab = Tab::Repositories;
+        cx.notify();
+    }
+    fn reading(&self, pr: &PrRef) -> Reading {
+        let state = self.states.get(pr);
+        let reached = self.progress.get(pr).map_or(0, |step| step + 1);
+        let reading = |tip, breathe, verb, detail: Option<&str>| Reading {
+            level: reached.max(1),
+            tip,
+            breathe,
+            merged: false,
+            verb: Some(verb),
+            detail: detail.map(str::to_owned),
+        };
+        let merged = Reading {
+            level: STEPS.len(),
+            tip: mint(),
+            breathe: false,
+            merged: true,
+            verb: Some("Merged"),
+            detail: None,
+        };
+        match state {
+            None => Reading {
+                level: 0,
+                tip: rail(),
+                breathe: false,
+                merged: false,
+                verb: None,
+                detail: None,
+            },
+            Some(SitState::Preparing) => {
+                reading(moon(), true, "Preparing", Some("Setting up the worktree"))
+            }
+            Some(SitState::Running { last_line: None }) => {
+                reading(moon(), true, "Starting", Some("Taking the first snapshot"))
+            }
+            Some(SitState::Running {
+                last_line: Some(line),
+            }) => match model::parse_pass(line) {
+                Some(pass) => match pass.kind {
+                    VerdictKind::Done => merged,
+                    VerdictKind::Wait => reading(glow(), true, "Waiting", Some(pass.detail)),
+                    VerdictKind::Act => reading(moon(), true, "Working", Some(pass.detail)),
+                    VerdictKind::Stop => reading(coral(), false, "Stopping", Some(pass.detail)),
+                },
+                None => reading(
+                    moon(),
+                    true,
+                    "Running",
+                    Some(line.strip_prefix("baby-sitter: ").unwrap_or(line)),
+                ),
+            },
+            Some(SitState::Cancelling) => reading(
+                dusk(),
+                false,
+                "Cancelling",
+                Some("Waiting for the process to exit"),
+            ),
+            Some(SitState::Finished(Outcome::Merged)) => merged,
+            Some(SitState::Finished(Outcome::TimedOut)) => reading(
+                glow(),
+                false,
+                "Timed out",
+                Some("The deadline passed before the merge"),
+            ),
+            Some(SitState::Finished(Outcome::Stopped(reason))) => {
+                reading(coral(), false, "Stopped", Some(reason))
+            }
+            Some(SitState::Finished(Outcome::Cancelled)) => {
+                reading(dusk(), false, "Cancelled", None)
+            }
+            Some(SitState::Finished(Outcome::Failed(reason))) => {
+                reading(coral(), false, "Failed", Some(reason))
+            }
+        }
+    }
+    fn needs_you(&self) -> usize {
+        self.states
+            .values()
+            .filter(|state| {
+                matches!(
+                    state,
+                    SitState::Finished(
+                        Outcome::Stopped(_) | Outcome::Failed(_) | Outcome::TimedOut
+                    )
+                )
+            })
+            .count()
+    }
     fn repo_row(&self, repo: &RepoName, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.config.repos.contains_key(repo);
         let count = self.active_count(repo);
         let checkbox_repo = repo.clone();
-        let label = if count > 0 {
-            format!("{repo}  ·  {count} babysitting")
-        } else {
-            repo.to_string()
-        };
         let checkbox = Checkbox::new(SharedString::from(format!("repo-{repo}")))
-            .label(label)
+            .label(repo.to_string())
             .checked(selected)
             .disabled(count > 0)
             .on_change(cx.listener(move |this, checked, window, cx| {
                 this.toggle_repo(checkbox_repo.clone(), *checked, window, cx)
             }));
-        let mut row = div()
-            .h(px(96.))
+        let inputs = self.inputs.get(repo);
+        let errors = inputs
+            .into_iter()
+            .flat_map(|inputs| [&inputs.timeout_error, &inputs.interval_error])
+            .flatten()
+            .cloned();
+        let field = |label: &'static str, input: &Entity<InputState>, invalid: bool| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .w(px(132.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(if invalid { coral() } else { dusk() })
+                        .child(label),
+                )
+                .child(Input::new(input).small())
+        };
+        div()
+            .h(px(68.))
             .w_full()
-            .px_4()
-            .py_3()
+            .px(px(ROW_INSET))
             .border_b_1()
-            .border_color(rgb(0xe5e9ef))
+            .border_color(rail())
             .flex()
             .items_center()
-            .gap_4()
-            .child(div().flex_1().min_w_0().child(checkbox));
-        if let Some(inputs) = self.inputs.get(repo) {
-            let field =
-                |label: &'static str, input: &Entity<InputState>, error: &Option<String>| {
+            .gap(px(20.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(checkbox)
+                    .children(errors.map(|error| {
+                        div()
+                            .pl(px(26.))
+                            .text_size(px(12.))
+                            .text_color(coral())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(error)
+                    })),
+            )
+            .when(count > 0, |row| {
+                row.child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .w(px(185.))
-                        .child(div().text_xs().text_color(rgb(0x667085)).child(label))
-                        .child(Input::new(input).small())
-                        .when_some(error.clone(), |d, e| {
-                            d.child(div().text_xs().text_color(rgb(0xb42318)).child(e))
-                        })
-                };
-            row = row
-                .child(field("Timeout", &inputs.timeout, &inputs.timeout_error))
-                .child(field("Interval", &inputs.interval, &inputs.interval_error));
-        }
-        row.into_any_element()
+                        .text_size(px(12.))
+                        .text_color(glow())
+                        .child(if count == 1 {
+                            "1 babysit running".to_owned()
+                        } else {
+                            format!("{count} babysits running")
+                        }),
+                )
+            })
+            .when_some(inputs, |row, inputs| {
+                row.child(field(
+                    "Timeout",
+                    &inputs.timeout,
+                    inputs.timeout_error.is_some(),
+                ))
+                .child(field(
+                    "Interval",
+                    &inputs.interval,
+                    inputs.interval_error.is_some(),
+                ))
+            })
+            .into_any_element()
     }
-    fn render_repos(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The page header and body, kept apart so errors can sit between them.
+    fn render_repos(&self, cx: &mut Context<Self>) -> (Div, Div) {
         let body = match &self.repos {
-            Load::Loading => message("Loading repositories...", None),
+            Load::Loading => message("Loading repositories…", None),
             Load::Error(error) => {
                 let retry = Button::new("retry-repos")
                     .label("Retry")
+                    .outline()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.load_repos(cx);
                         cx.notify();
@@ -521,14 +701,17 @@ impl AppView {
                         .then_with(|| a.cmp(b))
                 });
                 if filtered.is_empty() {
-                    message(
-                        if filter.is_empty() {
-                            "No repositories found"
-                        } else {
-                            "No repositories match the filter"
-                        },
-                        None,
-                    )
+                    if filter.is_empty() {
+                        message(
+                            "No repositories found",
+                            Some("Your GitHub account has no repositories it can push to.".into()),
+                        )
+                    } else {
+                        message(
+                            "No repositories match the filter",
+                            Some("Check the spelling, or clear the filter.".into()),
+                        )
+                    }
                 } else {
                     let count = filtered.len();
                     div().size_full().child(
@@ -547,44 +730,12 @@ impl AppView {
                 }
             }
         };
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_end()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_xl().font_semibold().child("Repositories"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x667085))
-                                    .child("Choose where baby-sitter can run."),
-                            ),
-                    )
-                    .child(div().w(px(280.)).child(Input::new(&self.repo_filter))),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .bg(rgb(0xffffff))
-                    .border_1()
-                    .border_color(rgb(0xe5e9ef))
-                    .rounded_lg()
-                    .child(body),
-            )
-            .into_any_element()
+        let header = header(
+            "Repositories",
+            Some("Babysits run only in the repositories you allow."),
+        )
+        .child(div().w(px(260.)).child(Input::new(&self.repo_filter)));
+        (header, body)
     }
     fn dashboard_rows(&self) -> Vec<Cow<'_, PrRow>> {
         let prs: &[PrRow] = match &self.prs {
@@ -615,41 +766,22 @@ impl AppView {
     }
     fn pr_row(&self, row: &PrRow, cx: &mut Context<Self>) -> AnyElement {
         let state = self.states.get(&row.pr);
-        let (label, color, background, detail) = match state {
-            None => ("Idle", 0x475467, 0xf2f4f7, None),
-            Some(SitState::Preparing) => ("Preparing", 0x175cd3, 0xeff8ff, None),
-            Some(SitState::Running { last_line }) => {
-                ("Running", 0x175cd3, 0xeff8ff, last_line.clone())
-            }
-            Some(SitState::Cancelling) => ("Cancelling", 0xb54708, 0xfffaeb, None),
-            Some(SitState::Finished(Outcome::Merged)) => ("Merged", 0x027a48, 0xecfdf3, None),
-            Some(SitState::Finished(Outcome::TimedOut)) => ("Timed out", 0xb54708, 0xfffaeb, None),
-            Some(SitState::Finished(Outcome::Stopped(reason))) => {
-                ("Stopped", 0xb42318, 0xfef3f2, Some(reason.clone()))
-            }
-            Some(SitState::Finished(Outcome::Cancelled)) => ("Cancelled", 0x475467, 0xf2f4f7, None),
-            Some(SitState::Finished(Outcome::Failed(reason))) => {
-                ("Failed", 0xb42318, 0xfef3f2, Some(reason.clone()))
-            }
-        };
+        let reading = self.reading(&row.pr);
         let selected = self.config.repos.contains_key(&row.pr.repo);
         let active = state.is_some_and(SitState::is_active);
         let pr = row.pr.clone();
         let action = if active {
+            let cancelling = matches!(state, Some(SitState::Cancelling));
             Some(
                 Button::new(SharedString::from(format!("cancel-{pr}")))
-                    .label(if matches!(state, Some(SitState::Cancelling)) {
-                        "Cancelling"
-                    } else {
-                        "Cancel"
-                    })
+                    .label(if cancelling { "Cancelling" } else { "Cancel" })
                     .outline()
-                    .disabled(matches!(state, Some(SitState::Cancelling)))
+                    .disabled(cancelling)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.ask_cancel(pr.clone(), window, cx)
                     })),
             )
-        } else if matches!(state, Some(SitState::Finished(Outcome::Merged))) {
+        } else if reading.merged {
             None
         } else {
             Some(
@@ -662,13 +794,19 @@ impl AppView {
                     ),
             )
         };
+        let time_left = active
+            .then(|| self.config.active.get(&row.pr))
+            .flatten()
+            .map(|deadline| time_left(deadline.saturating_sub(model::unix_now())));
         let url = row.url.clone();
-        let title_id = SharedString::from(format!("title-{}", row.pr));
         let title = div()
-            .id(title_id)
+            .id(SharedString::from(format!("title-{}", row.pr)))
             .cursor_pointer()
-            .text_color(rgb(0x175cd3))
+            .text_size(px(16.))
+            .line_height(relative(1.3))
             .font_semibold()
+            .text_color(moon())
+            .hover(|style| style.text_color(glow()))
             .child(row.title.clone())
             .on_click(move |_, _, _| {
                 let url = url.clone();
@@ -676,56 +814,44 @@ impl AppView {
                     let _ = std::process::Command::new("open").arg(url).status();
                 });
             });
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .flex_1()
-            .min_w_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(title)
-                    .when(row.is_draft, |d| d.child(chip("Draft", 0x475467, 0xf2f4f7))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x667085))
-                            .child(row.pr.to_string()),
-                    )
-                    .child(chip(label, color, background)),
-            )
-            .when_some(detail, |d, text| {
-                d.child(div().text_sm().text_color(rgb(0x344054)).child(text))
-            })
-            .when(!selected, |d| {
-                d.child(
+        let place = if row.is_draft {
+            format!("{} #{}, draft", row.pr.repo, row.pr.number)
+        } else {
+            format!("{} #{}", row.pr.repo, row.pr.number)
+        };
+        let status = reading.verb.map(|verb| {
+            div()
+                .flex()
+                .gap(px(8.))
+                .text_size(px(13.))
+                .line_height(relative(1.45))
+                .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(0x667085))
-                        .child(format!("Select {} in Repos", row.pr.repo)),
+                        .flex_shrink_0()
+                        .font_medium()
+                        .text_color(if reading.merged { mint() } else { reading.tip })
+                        .child(verb),
                 )
-            });
+                .when_some(reading.detail.clone(), |line, detail| {
+                    line.child(div().min_w_0().text_color(moon()).child(detail))
+                })
+        });
         let path = sitter::worktree_path(&self.data, &row.pr);
-        if !active && path.exists() {
-            let path_string = path.display().to_string();
-            let reveal_id = SharedString::from(format!("reveal-{}", row.pr));
-            content = content.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_xs().text_color(rgb(0x667085)).child(path_string))
-                    .child(Button::new(reveal_id).label("Reveal").small().on_click(
-                        move |_, _, _| {
+        let worktree = (!active && path.exists()).then(|| {
+            let shown = path.display().to_string();
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .text_size(px(12.))
+                .text_color(dusk())
+                .child(div().min_w_0().text_ellipsis().child(shown))
+                .child(
+                    Button::new(SharedString::from(format!("reveal-{}", row.pr)))
+                        .label("Reveal in Finder")
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, _| {
                             let path = path.clone();
                             std::thread::spawn(move || {
                                 let _ = std::process::Command::new("open")
@@ -733,49 +859,90 @@ impl AppView {
                                     .arg(path)
                                     .status();
                             });
-                        },
-                    )),
-            );
-        }
+                        }),
+                )
+        });
+        let allow = (!selected).then(|| {
+            let repo = row.pr.repo.clone();
+            Button::new(SharedString::from(format!("allow-{}", row.pr)))
+                .label(format!("Allow babysits in {repo}"))
+                .link()
+                .small()
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.show_repository(&repo, window, cx)),
+                )
+        });
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(title)
+            .child(div().text_size(px(13.)).text_color(dusk()).child(place))
+            .when_some(status, |d, status| d.child(div().pt(px(6.)).child(status)))
+            .when_some(worktree, |d, worktree| d.child(worktree))
+            .when_some(allow, |d, allow| {
+                d.child(div().pt(px(4.)).flex().child(allow))
+            });
         div()
-            .p_4()
+            .px(px(ROW_INSET))
+            .flex_shrink_0()
+            .py(px(18.))
             .border_b_1()
-            .border_color(rgb(0xe5e9ef))
+            .border_color(rail())
             .flex()
             .items_start()
-            .gap_4()
+            .gap(px(20.))
+            .child(meter(&row.pr, &reading))
             .child(content)
-            .when_some(action, |row, action| row.child(action))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .when_some(time_left, |d, left| {
+                        d.child(div().text_size(px(12.)).text_color(dusk()).child(left))
+                    })
+                    .when_some(action, |d, action| d.child(action)),
+            )
             .into_any_element()
     }
     fn retry_prs_button(cx: &mut Context<Self>) -> Button {
         Button::new("retry-prs")
             .label("Retry")
+            .outline()
             .on_click(cx.listener(|this, _, window, cx| {
                 this.load_prs(window, cx);
                 cx.notify();
             }))
     }
-    fn render_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_dashboard(&self, cx: &mut Context<Self>) -> (Div, Div) {
         let rows = self.dashboard_rows();
         let list = match &self.prs {
-            Load::Loading if rows.is_empty() => message("Loading pull requests...", None),
+            Load::Loading if rows.is_empty() => message("Loading pull requests…", None),
             Load::Error(error) if rows.is_empty() => {
                 message("Could not load pull requests", Some(error.clone()))
                     .child(Self::retry_prs_button(cx))
             }
-            _ if rows.is_empty() => message(
+            _ if rows.is_empty() => {
                 if self.selected_filter.is_some() {
-                    "No pull requests match this repository"
+                    message(
+                        "No pull requests in this repository",
+                        Some("Choose All repositories to see the rest.".into()),
+                    )
                 } else {
-                    "No open pull requests"
-                },
-                None,
-            ),
+                    message(
+                        "No open pull requests",
+                        Some("Open a pull request on GitHub, then press Refresh.".into()),
+                    )
+                }
+            }
             _ => {
                 let mut body = div().size_full().flex().flex_col();
                 match &self.prs {
-                    Load::Loading => body = body.child(message("Loading pull requests...", None)),
+                    Load::Loading => body = body.child(message("Loading pull requests…", None)),
                     Load::Error(error) => {
                         body = body.child(
                             message("Could not load pull requests", Some(error.clone()))
@@ -796,162 +963,286 @@ impl AppView {
                 )
             }
         };
+        let header = header("Pull requests", None).child(
+            div()
+                .w(px(240.))
+                .child(Select::new(&self.dashboard_filter).placeholder("All repositories")),
+        );
+        (header, list)
+    }
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+        let running = self.states.values().filter(|s| s.is_active()).count();
+        let needs_you = self.needs_you();
+        let watching = match running {
+            0 => "No babysits running.".to_owned(),
+            1 => "Babysitting 1 pull request.".to_owned(),
+            n => format!("Babysitting {n} pull requests."),
+        };
+        let nav = |tab: Tab, id: &'static str, label: &'static str, cx: &mut Context<Self>| {
+            let selected = self.tab == tab;
+            Button::new(id)
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .foreground(if selected { moon() } else { dusk() })
+                        .hover(rgb(0x222440).into())
+                        .active(rail()),
+                )
+                .w_full()
+                .h(px(34.))
+                .accessibility_label(label)
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .px(px(4.))
+                        .text_size(px(14.))
+                        .when(selected, |d| d.font_semibold())
+                        .child(led(if selected { glow() } else { rail() }))
+                        .child(label),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tab = tab;
+                    cx.notify();
+                }))
+        };
         div()
-            .flex_1()
-            .min_h_0()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap_4()
+            .bg(housing())
+            .border_r_1()
+            .border_color(rail())
+            .child(drag_area().h(px(52.)))
             .child(
                 div()
+                    .px(px(20.))
                     .flex()
-                    .justify_between()
-                    .items_end()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(moon_mark())
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_xl().font_semibold().child("Pull requests"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x667085))
-                                    .child("Your open pull requests and babysits."),
-                            ),
-                    )
-                    .child(div().w(px(260.)).child(
-                        Select::new(&self.dashboard_filter).placeholder("All repositories"),
-                    )),
+                            .text_size(px(18.))
+                            .font_semibold()
+                            .text_color(moon())
+                            .child("baby-sitter"),
+                    ),
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .bg(rgb(0xffffff))
-                    .border_1()
-                    .border_color(rgb(0xe5e9ef))
-                    .rounded_lg()
-                    .child(list),
+                    .px(px(20.))
+                    .pt(px(20.))
+                    .text_size(px(14.))
+                    .line_height(relative(1.5))
+                    .text_color(dusk())
+                    .child(watching)
+                    .when(needs_you > 0, |d| {
+                        d.child(div().text_color(coral()).child(if needs_you == 1 {
+                            "1 needs you.".to_owned()
+                        } else {
+                            format!("{needs_you} need you.")
+                        }))
+                    }),
             )
-            .into_any_element()
+            .child(
+                div()
+                    .px(px(12.))
+                    .pt(px(28.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(nav(Tab::PullRequests, "nav-prs", "Pull requests", cx))
+                    .child(nav(Tab::Repositories, "nav-repos", "Repositories", cx)),
+            )
+            .child(div().flex_1())
+            .child(
+                div().p(px(20.)).child(
+                    Button::new("refresh")
+                        .label("Refresh")
+                        .outline()
+                        .w_full()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.refresh(window, cx);
+                            cx.notify();
+                        })),
+                ),
+            )
     }
 }
 
-fn chip(label: &'static str, color: u32, background: u32) -> Div {
+/// The page title row. Its empty space drags the window, since the title bar is hidden.
+fn header(title: &'static str, detail: Option<&'static str>) -> Div {
     div()
-        .px_2()
-        .py_1()
-        .rounded_full()
-        .text_xs()
-        .text_color(rgb(color))
-        .bg(rgb(background))
-        .child(label)
+        .flex_shrink_0()
+        .px(px(ROW_INSET))
+        .pt(px(36.))
+        .pb(px(20.))
+        .flex()
+        .items_end()
+        .gap(px(16.))
+        .border_b_1()
+        .border_color(rail())
+        .child(
+            drag_area()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(24.))
+                        .font_semibold()
+                        .text_color(moon())
+                        .child(title),
+                )
+                .when_some(detail, |d, detail| {
+                    d.child(div().text_size(px(13.)).text_color(dusk()).child(detail))
+                }),
+        )
+}
+fn drag_area() -> Div {
+    div().on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+}
+fn time_left(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => "Under a minute left".to_owned(),
+        (0, m) => format!("{m}m left"),
+        (h, 0) => format!("{h}h left"),
+        (h, m) => format!("{h}h {m}m left"),
+    }
+}
+fn led(color: Hsla) -> Div {
+    div().size(px(7.)).rounded_full().bg(color)
+}
+/// A crescent: a lit disc with a housing-colored disc over its upper right.
+fn moon_mark() -> Div {
+    div()
+        .relative()
+        .size(px(18.))
+        .child(div().absolute().size_full().rounded_full().bg(glow()))
+        .child(
+            div()
+                .absolute()
+                .top(px(-4.))
+                .left(px(6.))
+                .size(px(16.))
+                .rounded_full()
+                .bg(housing()),
+        )
+}
+/// A baby monitor's level meter: one segment per checklist step, lit up to the
+/// step the latest pass reached, read from the bottom.
+fn meter(pr: &PrRef, reading: &Reading) -> AnyElement {
+    let segments = (0..STEPS.len()).rev().map(|index| {
+        let segment = div().w(px(20.)).h(px(5.)).rounded(px(1.));
+        let position = index + 1;
+        if reading.merged {
+            segment.bg(mint()).into_any_element()
+        } else if position < reading.level {
+            segment.bg(glow()).into_any_element()
+        } else if position == reading.level && reading.breathe {
+            segment
+                .bg(reading.tip)
+                .with_animation(
+                    SharedString::from(format!("breathe-{pr}")),
+                    Animation::new(Duration::from_millis(2400))
+                        .repeat()
+                        .with_easing(pulsating_between(0.3, 1.0)),
+                    |segment, delta| segment.opacity(delta),
+                )
+                .into_any_element()
+        } else if position == reading.level {
+            segment.bg(reading.tip).into_any_element()
+        } else {
+            segment.bg(rail()).into_any_element()
+        }
+    });
+    let tooltip: Option<SharedString> = if reading.merged {
+        Some("Merged".into())
+    } else {
+        reading.level.checked_sub(1).map(|index| {
+            format!(
+                "Step {} of {}: {}",
+                reading.level,
+                STEPS.len(),
+                STEPS[index]
+            )
+            .into()
+        })
+    };
+    div()
+        .id(SharedString::from(format!("meter-{pr}")))
+        .flex_shrink_0()
+        .pt(px(3.))
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .children(segments)
+        .when_some(tooltip, |d, text| {
+            d.tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+        })
+        .into_any_element()
 }
 fn message(title: &'static str, detail: Option<String>) -> Div {
     div()
-        .p_6()
+        .px(px(ROW_INSET))
+        .py(px(28.))
         .flex()
         .flex_col()
-        .gap_2()
-        .text_sm()
-        .text_color(rgb(0x667085))
-        .child(div().font_semibold().text_color(rgb(0x344054)).child(title))
+        .items_start()
+        .gap(px(8.))
+        .max_w(px(620.))
+        .text_size(px(14.))
+        .text_color(dusk())
+        .child(
+            div()
+                .text_size(px(16.))
+                .font_semibold()
+                .text_color(moon())
+                .child(title),
+        )
         .when_some(detail, |d, text| d.child(text))
 }
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let nav = |tab: Tab,
-                   id: &'static str,
-                   label: &'static str,
-                   selected: bool,
-                   cx: &mut Context<Self>| {
-            let button =
-                Button::new(id)
-                    .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tab = tab;
-                        cx.notify();
-                    }));
-            if selected {
-                button.primary()
-            } else {
-                button.ghost()
-            }
+        let (header, body) = match self.tab {
+            Tab::PullRequests => self.render_dashboard(cx),
+            Tab::Repositories => self.render_repos(cx),
         };
         div()
             .size_full()
-            .bg(rgb(0xf6f8fb))
-            .text_color(rgb(0x101828))
             .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(70.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_6()
-                    .bg(rgb(0xffffff))
-                    .border_b_1()
-                    .border_color(rgb(0xe5e9ef))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_6()
-                            .child(div().font_bold().text_lg().child("baby-sitter"))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .child(nav(
-                                        Tab::Dashboard,
-                                        "dashboard-tab",
-                                        "Dashboard",
-                                        self.tab == Tab::Dashboard,
-                                        cx,
-                                    ))
-                                    .child(nav(
-                                        Tab::Repos,
-                                        "repos-tab",
-                                        "Repos",
-                                        self.tab == Tab::Repos,
-                                        cx,
-                                    )),
-                            ),
-                    )
-                    .child(Button::new("refresh").label("Refresh").outline().on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.refresh(window, cx);
-                            cx.notify();
-                        }),
-                    )),
-            )
+            .bg(night())
+            .text_color(moon())
+            .child(self.render_sidebar(cx))
             .child(
                 div()
                     .flex_1()
-                    .min_h_0()
+                    .min_w_0()
+                    .h_full()
                     .flex()
                     .flex_col()
-                    .gap_3()
-                    .p_6()
+                    .child(header)
                     .when_some(self.error.clone(), |d, error| {
                         d.child(
                             div()
-                                .p_3()
-                                .rounded_md()
-                                .bg(rgb(0xfef3f2))
-                                .text_color(rgb(0xb42318))
-                                .text_sm()
+                                .mx(px(ROW_INSET))
+                                .mt(px(16.))
+                                .px(px(14.))
+                                .py(px(10.))
+                                .rounded(px(6.))
+                                .bg(coral().opacity(0.14))
+                                .text_color(coral())
+                                .text_size(px(13.))
                                 .child(error),
                         )
                     })
-                    .child(match self.tab {
-                        Tab::Dashboard => self.render_dashboard(cx),
-                        Tab::Repos => self.render_repos(cx),
-                    }),
+                    .child(div().flex_1().min_h_0().child(body)),
             )
     }
 }

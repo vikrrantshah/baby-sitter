@@ -159,6 +159,59 @@ impl SitState {
     }
 }
 
+/// The CLI's decision checklist in precedence order, as shown by the progress meter.
+pub const STEPS: [&str; 8] = [
+    "PR state",
+    "Merge queue",
+    "Local checkout",
+    "Fixed threads",
+    "Review threads",
+    "Base branch",
+    "Merge gate",
+    "Merge",
+];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerdictKind {
+    Done,
+    Stop,
+    Wait,
+    Act,
+}
+/// One `[rule] verdict` line the CLI prints per pass.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Pass<'a> {
+    /// Index into [`STEPS`], or `None` for a rule this app does not know.
+    pub step: Option<usize>,
+    pub kind: VerdictKind,
+    pub detail: &'a str,
+}
+/// Rule names mirror `RULES` in the CLI's `src/decide.rs`.
+pub fn parse_pass(line: &str) -> Option<Pass<'_>> {
+    let (rule, verdict) = line.strip_prefix('[')?.split_once("] ")?;
+    let step = match rule {
+        "merged" | "closed" | "draft" | "conflict" | "ci-failed" => Some(0),
+        "in-queue" | "dequeued" => Some(1),
+        "local-upstream" | "local-dirty" | "local-diverged" | "local-behind" => Some(2),
+        "resolve-fixed" => Some(3),
+        "unhandled-items" => Some(4),
+        "behind-base" => Some(5),
+        "ci-pending" | "merge-state" | "unresolved-threads" | "review-requests"
+        | "review-decision" => Some(6),
+        "merge" | "enqueue" => Some(7),
+        _ => None,
+    };
+    let (kind, detail) = if verdict == "merged" {
+        (VerdictKind::Done, "")
+    } else if let Some(reason) = verdict.strip_prefix("stop: ") {
+        (VerdictKind::Stop, reason)
+    } else if let Some(reason) = verdict.strip_prefix("wait: ") {
+        (VerdictKind::Wait, reason)
+    } else {
+        (VerdictKind::Act, verdict)
+    };
+    Some(Pass { step, kind, detail })
+}
+
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -324,6 +377,38 @@ mod tests {
             Some(1),
             "baby-sitter: stopped: something else\n"
         ));
+    }
+    #[test]
+    fn pass_lines_map_rules_to_checklist_steps() {
+        assert_eq!(
+            parse_pass("[ci-pending] wait: CI pending: build"),
+            Some(Pass {
+                step: Some(6),
+                kind: VerdictKind::Wait,
+                detail: "CI pending: build"
+            })
+        );
+        assert_eq!(
+            parse_pass("[local-dirty] stop: local tree is dirty: a.rs").map(|p| (p.step, p.kind)),
+            Some((Some(2), VerdictKind::Stop))
+        );
+        assert_eq!(
+            parse_pass("[enqueue] enqueue abc1234 (queue merges with squash)")
+                .map(|p| (p.step, p.kind)),
+            Some((Some(7), VerdictKind::Act))
+        );
+        assert_eq!(
+            parse_pass("[merged] merged").map(|p| (p.step, p.kind)),
+            Some((Some(0), VerdictKind::Done))
+        );
+        assert_eq!(
+            parse_pass("[new-rule] fix something").map(|p| (p.step, p.kind)),
+            Some((None, VerdictKind::Act))
+        );
+        assert_eq!(
+            parse_pass("baby-sitter: warning: re-review request failed"),
+            None
+        );
     }
     #[test]
     fn config_round_trip_and_pr_url() {
