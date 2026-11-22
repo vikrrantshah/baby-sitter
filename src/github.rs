@@ -1,6 +1,8 @@
 use crate::{domain::*, proc, wire};
 use anyhow::{Context, bail};
 use std::{process::Command, time::Instant};
+
+const MAX_JOB_LOG_BYTES: usize = 60_000;
 pub struct Gh {
     pub pr: PrRef,
     deadline: Instant,
@@ -74,6 +76,17 @@ impl Gh {
             bail!("base branch changed during snapshot");
         }
         wire::parse_snapshot(out.as_bytes())
+    }
+    pub fn failed_job_log(&self, job_id: u64) -> anyhow::Result<String> {
+        let path = format!("repos/{}/actions/jobs/{job_id}/logs", self.repo());
+        let raw = proc::run_tail(
+            Command::new("gh").args(["api", "--allow-escape-sequences", &path]),
+            MAX_JOB_LOG_BYTES,
+            self.deadline,
+        )?;
+        let mut log = strip_terminal_escapes(&raw);
+        truncate_job_log(&mut log);
+        Ok(log)
     }
     fn mutation(&self, query: &str, fields: &[(&str, &str)]) -> anyhow::Result<()> {
         let mut cmd = Command::new("gh");
@@ -163,5 +176,73 @@ impl Gh {
             self.deadline,
         )?;
         Ok(())
+    }
+}
+
+/// Actions logs carry ANSI color codes; they waste prompt space and can drive a terminal.
+fn strip_terminal_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                if chars.next() == Some('[') {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn truncate_job_log(log: &mut String) {
+    const MAX_LOG_BYTES: usize = MAX_JOB_LOG_BYTES;
+    const MAX_LOG_LINES: usize = 400;
+    let end = log.strip_suffix('\n').map_or(log.len(), str::len);
+    let line_start = log[..end]
+        .rmatch_indices('\n')
+        .nth(MAX_LOG_LINES - 1)
+        .map_or(0, |(index, _)| index + 1);
+    let mut start = line_start.max(log.len().saturating_sub(MAX_LOG_BYTES));
+    while !log.is_char_boundary(start) {
+        start += 1;
+    }
+    log.drain(..start);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_logs_keep_the_last_400_lines() {
+        let mut log = (1..=405).map(|n| format!("line {n}\n")).collect::<String>();
+        truncate_job_log(&mut log);
+        assert_eq!(log.lines().count(), 400);
+        assert!(log.starts_with("line 6\n"));
+        assert!(log.ends_with("line 405\n"));
+    }
+
+    #[test]
+    fn job_logs_drop_terminal_escapes() {
+        assert_eq!(
+            strip_terminal_escapes("\u{1b}[31mFAIL\u{1b}[0m: test_mean\r\nok\u{1b}=\n"),
+            "FAIL: test_mean\nok\n"
+        );
+    }
+
+    #[test]
+    fn job_logs_keep_the_last_60_kb_without_splitting_utf8() {
+        let mut log = format!("{}end", "\u{1F600}".repeat(20_000));
+        truncate_job_log(&mut log);
+        assert!(log.len() <= 60_000);
+        assert!(log.ends_with("end"));
+        assert_eq!(log.chars().next(), Some('\u{1F600}'));
     }
 }

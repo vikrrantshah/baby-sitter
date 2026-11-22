@@ -1,5 +1,5 @@
 use crate::{codex, decide::Action, domain::*, git::Git, github::Gh, proc};
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use std::{
     fs::{self, File, OpenOptions},
     time::Instant,
@@ -62,7 +62,10 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 env.git.head()? == head.sha,
                 "codex changed HEAD; inspect the checkout"
             );
-            if env.git.commit_all()? {
+            if env
+                .git
+                .commit_all_with("baby-sitter: address review feedback")?
+            {
                 env.git.push(&head.branch)?;
             }
             for r in &resolved {
@@ -86,6 +89,68 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Action::FixCi { checks, head } => {
+            ensure!(
+                env.git.head()? == head.sha,
+                "local HEAD moved since snapshot"
+            );
+            ensure!(
+                env.git.is_clean()?,
+                "working tree became dirty since snapshot"
+            );
+            let names = check_names(&checks);
+            let mut checks_with_logs = Vec::with_capacity(checks.len());
+            for check in checks {
+                let log = match &check.source {
+                    CheckSource::Actions { job_id } => {
+                        optional_job_log(env.gh.failed_job_log(*job_id))
+                            .with_context(|| format!("fetching log for {}", check.name))?
+                    }
+                    CheckSource::External { .. } => None,
+                };
+                checks_with_logs.push((check, log));
+            }
+            let result = codex::fix_ci(
+                &env.git.root,
+                &env.git.state_dir(),
+                &checks_with_logs,
+                env.deadline,
+            );
+            ensure!(
+                env.git.head()? == head.sha,
+                "codex changed HEAD; inspect the checkout"
+            );
+            let protected = env.git.ci_configuration_changes()?;
+            ensure!(
+                protected.is_empty(),
+                "codex edited CI configuration: {}; changes left uncommitted for inspection",
+                protected.join(", ")
+            );
+            let result = result?;
+            if result.outcome == codex::CiFixOutcome::NeedsHuman {
+                bail!("CI failed: {names}: {}", result.summary.trim());
+            }
+            ensure!(
+                env.git
+                    .commit_all_with(&ci_commit_message(&result.summary))?,
+                "codex reported a fix but changed nothing"
+            );
+            let protected = env.git.committed_ci_changes(&head.sha)?;
+            ensure!(
+                protected.is_empty(),
+                "fix commit touches CI configuration: {}; commit left local, not pushed",
+                protected.join(", ")
+            );
+            env.git.push(&head.branch)
+        }
+    }
+}
+
+fn optional_job_log(result: anyhow::Result<String>) -> anyhow::Result<Option<String>> {
+    match result {
+        Ok(log) => Ok(Some(log)),
+        Err(error) if error.downcast_ref::<proc::TimedOut>().is_some() => Err(error),
+        Err(_) => Ok(None),
     }
 }
 
@@ -97,4 +162,72 @@ fn reply_body(resolution: &codex::Resolution) -> String {
     }
     .render();
     format!("{}\n\n{marker}", resolution.reply)
+}
+
+fn ci_commit_message(summary: &str) -> String {
+    const MAX_SUBJECT: usize = 67;
+    let summary = summary.trim();
+    let (first_line, rest) = summary.split_once('\n').unwrap_or((summary, ""));
+    let first_line = first_line.trim();
+    let subject = if first_line.chars().count() <= MAX_SUBJECT {
+        first_line.to_owned()
+    } else {
+        let cut: String = first_line.chars().take(MAX_SUBJECT).collect();
+        cut.rsplit_once(' ')
+            .map_or(cut.clone(), |(head, _)| head.to_owned())
+    };
+    let rest = rest.trim();
+    let body = if rest.is_empty() && subject == first_line {
+        String::new()
+    } else {
+        format!("{}\n\n", if rest.is_empty() { first_line } else { rest })
+    };
+    format!("fix: {}\n\n{body}Baby-Sitter: fix-ci", subject.trim_end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_job_logs_do_not_hide_timeouts() {
+        assert_eq!(
+            optional_job_log(Ok("build failed".into())).unwrap(),
+            Some("build failed".into())
+        );
+        assert_eq!(
+            optional_job_log(Err(anyhow::anyhow!("log not found"))).unwrap(),
+            None
+        );
+        assert!(
+            optional_job_log(Err(proc::TimedOut.into()))
+                .unwrap_err()
+                .downcast_ref::<proc::TimedOut>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ci_fix_commit_subject_breaks_at_a_word_and_keeps_detail() {
+        let message = ci_commit_message(
+            "Fixed an off-by-one error in calc.py so mean([1, 2, 3, 4]) now divides by four",
+        );
+        let subject = message.lines().next().unwrap();
+        assert_eq!(
+            subject,
+            "fix: Fixed an off-by-one error in calc.py so mean([1, 2, 3, 4]) now"
+        );
+        assert!(message.contains(
+            "\n\nFixed an off-by-one error in calc.py so mean([1, 2, 3, 4]) now divides by four\n\n"
+        ));
+        assert!(message.ends_with("\n\nBaby-Sitter: fix-ci"));
+        assert_eq!(
+            ci_commit_message(" correct the divisor in mean \nLogs showed 2.0 != 2.5."),
+            "fix: correct the divisor in mean\n\nLogs showed 2.0 != 2.5.\n\nBaby-Sitter: fix-ci"
+        );
+        assert_eq!(
+            ci_commit_message("repair tests"),
+            "fix: repair tests\n\nBaby-Sitter: fix-ci"
+        );
+    }
 }

@@ -1,6 +1,8 @@
 use crate::domain::*;
 use std::fmt;
 
+const MAX_CI_FIX_ATTEMPTS: u32 = 3;
+
 pub struct Facts<'a> {
     pub snap: &'a Snapshot,
     pub local: Option<&'a LocalState>,
@@ -32,10 +34,22 @@ impl fmt::Display for Verdict {
 pub enum Action {
     FastForward(Sha),
     ResolveThreads(Vec<ThreadId>),
-    HandleComments { batch: Batch, head: Head },
+    HandleComments {
+        batch: Batch,
+        head: Head,
+    },
+    FixCi {
+        checks: Vec<FailedCheck>,
+        head: Head,
+    },
     UpdateBranch,
-    Enqueue { head: Sha },
-    Merge { head: Sha, method: MergeMethod },
+    Enqueue {
+        head: Sha,
+    },
+    Merge {
+        head: Sha,
+        method: MergeMethod,
+    },
 }
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -49,6 +63,7 @@ impl fmt::Display for Action {
                 }
                 Ok(())
             }
+            Self::FixCi { checks, .. } => write!(f, "fix CI: {}", check_names(checks)),
             Self::UpdateBranch => f.write_str("update branch"),
             Self::Enqueue { head } => write!(f, "enqueue {}", &head.as_str()[..7]),
             Self::Merge { head, method } => {
@@ -158,6 +173,11 @@ const RULES: &[Rule] = &[
         name: "unhandled-items",
         gate: Gate::Reviews,
         eval: unhandled_items,
+    },
+    Rule {
+        name: "fix-ci",
+        gate: Gate::Checks,
+        eval: fix_ci,
     },
     Rule {
         name: "behind-base",
@@ -356,8 +376,27 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
         Ci::Rollup {
             state: RollupState::Failure | RollupState::Error,
             failing,
+            pending,
+        } if !pending.is_empty() => Some(Verdict::Wait(format!(
+            "CI failing: {}; waiting for {}",
+            check_names(failing),
+            pending.join(", ")
+        ))),
+        Ci::Rollup {
+            state: RollupState::Failure | RollupState::Error,
+            failing,
             ..
-        } => Some(Verdict::Stop(format!("CI failed: {}", failing.join(", ")))),
+        } if failing.is_empty() => Some(Verdict::Stop(
+            "CI failed, but GitHub reported no failing check".into(),
+        )),
+        Ci::Rollup {
+            state: RollupState::Failure | RollupState::Error,
+            failing,
+            ..
+        } if f.snap.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS => Some(Verdict::Stop(format!(
+            "CI still failing after 3 fix attempts: {}",
+            check_names(failing)
+        ))),
         _ => None,
     }
 }
@@ -436,6 +475,24 @@ fn unhandled_items(f: &Facts<'_>) -> Option<Verdict> {
             head: f.snap.head.clone(),
         })
     })
+}
+fn fix_ci(f: &Facts<'_>) -> Option<Verdict> {
+    match &f.snap.ci {
+        Ci::Rollup {
+            state: RollupState::Failure | RollupState::Error,
+            failing,
+            pending,
+        } if !failing.is_empty()
+            && pending.is_empty()
+            && f.snap.ci_fix_attempts < MAX_CI_FIX_ATTEMPTS =>
+        {
+            Some(Verdict::Act(Action::FixCi {
+                checks: failing.clone(),
+                head: f.snap.head.clone(),
+            }))
+        }
+        _ => None,
+    }
 }
 fn behind_base(f: &Facts<'_>) -> Option<Verdict> {
     (f.snap.merge_state == MergeState::Behind && f.snap.route == MergeRoute::Direct)
@@ -553,6 +610,7 @@ mod tests {
                     review_decision: Some(ReviewDecision::Approved),
                     review_requests: vec![],
                     ci: Ci::NoChecks,
+                    ci_fix_attempts: 0,
                     threads: vec![],
                     reviews: vec![],
                 },
@@ -731,6 +789,91 @@ mod tests {
         w.snap.threads.clear();
         assert_eq!(w.decision().rule, "ci-pending");
         w.snap.ci = Ci::NoChecks;
+        assert_eq!(w.decision().rule, "merge");
+    }
+    #[test]
+    fn failing_ci_waits_for_pending_checks_before_checking_the_attempt_limit() {
+        let mut w = World::new();
+        w.snap.ci_fix_attempts = 3;
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Failure,
+            failing: vec![FailedCheck {
+                name: "build".into(),
+                source: CheckSource::Actions { job_id: 17 },
+            }],
+            pending: vec!["test".into()],
+        };
+        assert_eq!(w.decision().rule, "ci-failed");
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Wait("CI failing: build; waiting for test".into())
+        );
+    }
+    #[test]
+    fn failing_ci_is_fixed_after_local_and_review_work() {
+        let mut w = World::new();
+        let checks = vec![
+            FailedCheck {
+                name: "build".into(),
+                source: CheckSource::Actions { job_id: 17 },
+            },
+            FailedCheck {
+                name: "external".into(),
+                source: CheckSource::External { url: None },
+            },
+        ];
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Error,
+            failing: checks.clone(),
+            pending: vec![],
+        };
+        w.local.dirty.push(" M file".into());
+        assert_eq!(w.decision().rule, "local-dirty");
+        w.local.dirty.clear();
+        w.snap.threads.push(thread(vec![bot(1)]));
+        assert_eq!(w.decision().rule, "unhandled-items");
+        w.snap.threads.clear();
+        assert_eq!(w.decision().rule, "fix-ci");
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Act(Action::FixCi {
+                checks,
+                head: w.snap.head.clone(),
+            })
+        );
+        assert_eq!(w.decision().verdict.to_string(), "fix CI: build, external");
+        w.snap.ci_fix_attempts = 3;
+        assert_eq!(w.decision().rule, "ci-failed");
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Stop("CI still failing after 3 fix attempts: build, external".into())
+        );
+    }
+    #[test]
+    fn failed_ci_without_identified_checks_stops_instead_of_merging_or_fixing() {
+        for state in [RollupState::Failure, RollupState::Error] {
+            let mut w = World::new();
+            w.snap.ci = Ci::Rollup {
+                state,
+                failing: vec![],
+                pending: vec![],
+            };
+            assert_eq!(w.decision().rule, "ci-failed");
+            assert_eq!(
+                w.decision().verdict,
+                Verdict::Stop("CI failed, but GitHub reported no failing check".into())
+            );
+        }
+    }
+    #[test]
+    fn successful_ci_does_not_trigger_a_fix() {
+        let mut w = World::new();
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Success,
+            failing: vec![],
+            pending: vec![],
+        };
+        w.snap.ci_fix_attempts = 3;
         assert_eq!(w.decision().rule, "merge");
     }
     #[test]

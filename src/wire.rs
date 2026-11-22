@@ -10,7 +10,8 @@ pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$
  mergeQueueEntry{state position}
  timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{__typename ... on RemovedFromMergeQueueEvent{reason beforeCommit{oid}}}}
  reviewRequests(first:100){pageInfo{hasNextPage} nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login} ... on Team{slug}}}}
- commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:100){nodes{__typename ... on CheckRun{name conclusion status} ... on StatusContext{context state}}}}}}}
+ commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name conclusion status databaseId detailsUrl checkSuite{app{slug}}} ... on StatusContext{context state targetUrl}}}}}}}
+ recent: commits(last:20){nodes{commit{oid message}}}
  reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(last:100){pageInfo{hasPreviousPage} nodes{databaseId author{__typename login} body url}}}}
  reviews(last:100){pageInfo{hasPreviousPage} nodes{author{__typename login} state}}
  }}}"#;
@@ -138,6 +139,22 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
     if Sha::parse(string(commit, "oid")?)? != head.sha {
         bail!("head commit changed during snapshot");
     }
+    let recent = p["recent"]["nodes"]
+        .as_array()
+        .context("missing recent commits")?;
+    let recent_head = &recent.last().context("PR has no recent head commit")?["commit"];
+    if Sha::parse(string(recent_head, "oid")?)? != head.sha {
+        bail!("head commit changed during snapshot");
+    }
+    let mut ci_fix_attempts = 0;
+    for node in recent.iter().rev().take(20) {
+        if string(&node["commit"], "message")?
+            .lines()
+            .any(|line| line == "Baby-Sitter: fix-ci")
+        {
+            ci_fix_attempts += 1;
+        }
+    }
     let rollup = &commit["statusCheckRollup"];
     let ci = if rollup.is_null() {
         Ci::NoChecks
@@ -145,10 +162,7 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
         let state = parse_enum!(string(rollup,"state")?, "SUCCESS" => RollupState::Success, "FAILURE" => RollupState::Failure, "ERROR" => RollupState::Error, "PENDING" => RollupState::Pending, "EXPECTED" => RollupState::Expected);
         let mut failing = Vec::new();
         let mut pending = Vec::new();
-        for c in rollup["contexts"]["nodes"]
-            .as_array()
-            .context("missing check contexts")?
-        {
+        for c in nodes(rollup, "contexts", "hasNextPage")? {
             match string(c, "__typename")? {
                 "CheckRun" => {
                     let name = string(c, "name")?.to_owned();
@@ -164,13 +178,28 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
                                 | "STARTUP_FAILURE"
                         )
                     ) {
-                        failing.push(name);
+                        let source =
+                            if c["checkSuite"]["app"]["slug"].as_str() == Some("github-actions") {
+                                CheckSource::Actions {
+                                    job_id: number(c, "databaseId")?,
+                                }
+                            } else {
+                                CheckSource::External {
+                                    url: c["detailsUrl"].as_str().map(str::to_owned),
+                                }
+                            };
+                        failing.push(FailedCheck { name, source });
                     }
                 }
                 "StatusContext" => {
                     let name = string(c, "context")?.to_owned();
                     match string(c, "state")? {
-                        "FAILURE" | "ERROR" => failing.push(name),
+                        "FAILURE" | "ERROR" => failing.push(FailedCheck {
+                            name,
+                            source: CheckSource::External {
+                                url: c["targetUrl"].as_str().map(str::to_owned),
+                            },
+                        }),
                         "PENDING" | "EXPECTED" => pending.push(name),
                         _ => {}
                     }
@@ -216,6 +245,7 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
         review_decision,
         review_requests: requests,
         ci,
+        ci_fix_attempts,
         threads,
         reviews,
     })
@@ -224,10 +254,18 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn top_level_feedback_does_not_block_merge() {
+    fn fixture() -> Value {
         let mut v: Value =
             serde_json::from_slice(include_bytes!("../tests/fixtures/cli-15102.json")).unwrap();
+        let p = &mut v["data"]["repository"]["pullRequest"];
+        p["recent"] = serde_json::json!({"nodes":[{"commit":{
+            "oid": p["headRefOid"], "message":"existing commit"
+        }}]});
+        v
+    }
+    #[test]
+    fn top_level_feedback_does_not_block_merge() {
+        let mut v = fixture();
         let p = &mut v["data"]["repository"]["pullRequest"];
         p["state"] = "OPEN".into();
         p["mergeStateStatus"] = "CLEAN".into();
@@ -253,14 +291,14 @@ mod tests {
     }
     #[test]
     fn parses_public_response_and_rejects_truncation() {
-        let raw = include_bytes!("../tests/fixtures/cli-15102.json");
-        let snapshot = parse_snapshot(raw).unwrap();
+        let original = fixture();
+        let raw = serde_json::to_vec(&original).unwrap();
+        let snapshot = parse_snapshot(&raw).unwrap();
         assert!(matches!(
             snapshot.threads[0].comments()[0].actor,
             Actor::Bot(_)
         ));
         assert!(snapshot.review_requests.contains(&Reviewer::Unknown));
-        let original: Value = serde_json::from_slice(raw).unwrap();
         for (connection, page) in [
             ("reviewThreads", "hasNextPage"),
             ("reviewRequests", "hasNextPage"),
@@ -277,6 +315,15 @@ mod tests {
             );
         }
         let mut modified = original.clone();
+        modified["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+            ["contexts"]["pageInfo"]["hasNextPage"] = Value::Bool(true);
+        assert!(
+            parse_snapshot(&serde_json::to_vec(&modified).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("contexts is truncated")
+        );
+        let mut modified = original.clone();
         modified["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]["pageInfo"]
             ["hasPreviousPage"] = Value::Bool(true);
         assert!(parse_snapshot(&serde_json::to_vec(&modified).unwrap()).is_err());
@@ -292,8 +339,7 @@ mod tests {
     }
     #[test]
     fn parses_queue_route_entry_and_removal() {
-        let mut v: Value =
-            serde_json::from_slice(include_bytes!("../tests/fixtures/cli-15102.json")).unwrap();
+        let mut v = fixture();
         v["data"]["repository"]["mergeQueue"] =
             serde_json::json!({"configuration":{"mergeMethod":"SQUASH"}});
         v["data"]["repository"]["pullRequest"]["mergeQueueEntry"] =
@@ -325,5 +371,119 @@ mod tests {
                 before_commit: Sha::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
             }
         );
+    }
+    #[test]
+    fn parses_failed_check_sources_and_recent_fix_commits() {
+        let mut v = fixture();
+        let ci: Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/ci-failures.json")).unwrap();
+        let p = &mut v["data"]["repository"]["pullRequest"];
+        p["recent"] = ci["recent"].clone();
+        p["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = ci["rollup"].clone();
+        let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(snapshot.ci_fix_attempts, 2);
+        assert_eq!(
+            snapshot.ci,
+            Ci::Rollup {
+                state: RollupState::Failure,
+                failing: vec![
+                    FailedCheck {
+                        name: "build".into(),
+                        source: CheckSource::Actions { job_id: 42 },
+                    },
+                    FailedCheck {
+                        name: "analysis".into(),
+                        source: CheckSource::External {
+                            url: Some("https://example.com/analysis".into()),
+                        },
+                    },
+                    FailedCheck {
+                        name: "deploy".into(),
+                        source: CheckSource::External { url: None },
+                    },
+                ],
+                pending: vec!["tests".into()],
+            }
+        );
+        let p = &mut v["data"]["repository"]["pullRequest"];
+        p["recent"]["nodes"][0]["commit"]["message"] = "fix: first\n\nBaby-Sitter: fix-ci".into();
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .ci_fix_attempts,
+            3
+        );
+        v["data"]["repository"]["pullRequest"]["recent"]["nodes"][2]["commit"]["message"] =
+            "fix: manual\n\nNot-Baby-Sitter: fix-ci".into();
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .ci_fix_attempts,
+            2
+        );
+    }
+    #[test]
+    fn counts_fix_commits_separated_by_a_merge() {
+        let mut v = fixture();
+        let p = &mut v["data"]["repository"]["pullRequest"];
+        p["recent"]["nodes"] = serde_json::json!([
+            {"commit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","message":"fix: build\n\nBaby-Sitter: fix-ci"}},
+            {"commit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","message":"Merge base branch"}},
+            {"commit":{"oid":p["headRefOid"],"message":"fix: tests\n\nBaby-Sitter: fix-ci"}}
+        ]);
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .ci_fix_attempts,
+            2
+        );
+    }
+    #[test]
+    fn ignores_fix_commits_older_than_the_last_twenty() {
+        let mut v = fixture();
+        let p = &mut v["data"]["repository"]["pullRequest"];
+        let mut recent = vec![serde_json::json!({"commit":{
+            "oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "message":"old fix\n\nBaby-Sitter: fix-ci"
+        }})];
+        recent.extend((0..17).map(|_| {
+            serde_json::json!({"commit":{
+                "oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "message":"ordinary commit"
+            }})
+        }));
+        recent.extend([
+            serde_json::json!({"commit":{
+                "oid":"cccccccccccccccccccccccccccccccccccccccc",
+                "message":"fix build\n\nBaby-Sitter: fix-ci"
+            }}),
+            serde_json::json!({"commit":{
+                "oid":"dddddddddddddddddddddddddddddddddddddddd", "message":"merge base"
+            }}),
+            serde_json::json!({"commit":{
+                "oid":p["headRefOid"], "message":"fix tests\n\nBaby-Sitter: fix-ci"
+            }}),
+        ]);
+        p["recent"]["nodes"] = recent.into();
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .ci_fix_attempts,
+            2
+        );
+    }
+    #[test]
+    fn rejects_inconsistent_recent_head_and_missing_actions_job_id() {
+        let mut v = fixture();
+        v["data"]["repository"]["pullRequest"]["recent"]["nodes"][0]["commit"]["oid"] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
+
+        let mut v = fixture();
+        let ci: Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/ci-failures.json")).unwrap();
+        let rollup = &mut v["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"];
+        *rollup = ci["rollup"].clone();
+        rollup["contexts"]["nodes"][0]["databaseId"] = Value::Null;
+        assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
     }
 }

@@ -6,7 +6,7 @@ Visual version of the flow: [`design.html`](design.html).
 
 ## Requirements
 
-- `gh`, authenticated as the account that replies and merges.
+- `gh` 2.97.0 or later, authenticated as the account that replies and merges. Job logs use `gh api --allow-escape-sequences`.
 - `git`, with the PR's head branch checked out and tracking its remote branch.
 - `codex`, logged in.
 
@@ -71,11 +71,12 @@ Each pass takes a fresh snapshot of the PR. For an open PR, it also observes the
 ```mermaid
 flowchart TD
   START([Start]) --> SNAP["1 · Take a snapshot<br/>PR and open PR checkout"]
-  SNAP --> T{{"2 · Merged, closed, draft,<br/>conflicting, or CI failed?"}}
+  SNAP --> T{{"2 · Merged, closed, draft, conflicting,<br/>or failing CI with pending checks or at its limit?"}}
   T -- merged --> DONE([Exit 0])
-  T -- other --> STOP([Stop, exit 1])
+  T -- "closed, draft, conflict, or fix limit" --> STOP([Stop, exit 1])
+  T -- "CI failing with checks pending" --> WAIT["Wait --interval"] --> NEXT
   T -- no --> Q{{"3 · Queue status?"}}
-  Q -- queued --> WAIT["Wait --interval"] --> NEXT
+  Q -- queued --> WAIT
   Q -- "removed at current head" --> STOP
   Q -- otherwise --> L{{"4 · Local checkout in sync?"}}
   L -- behind --> FF["Fast-forward"] --> NEXT
@@ -86,11 +87,18 @@ flowchart TD
   UH -- yes --> HC
   subgraph CODEX ["Codex"]
     HC["Edit code, draft replies<br/>fixed, declined, or needs_human"]
+    FC["Fix CI code or return needs_human"]
   end
   HC --> PUSH["Commit and push"] --> REPLY["Reply in threads with markers"] --> RR["Request re-review"] --> NEXT
-  UH -- no --> BE{{"7 · Direct merge behind base?"}}
+  UH -- no --> CF{{"7 · CI failed?"}}
+  CF -- yes --> LOG["Fetch failed Actions job logs"] --> FC
+  FC -- fixed --> GUARD{{"CI configuration changed?"}}
+  GUARD -- no --> CP["Commit and push"] --> NEXT
+  GUARD -- yes --> STOP
+  FC -- "needs human" --> STOP
+  CF -- no --> BE{{"8 · Direct merge behind base?"}}
   BE -- yes --> UP["Update branch"] --> NEXT
-  BE -- no --> G{{"8 · Anything blocks the merge?"}}
+  BE -- no --> G{{"9 · Anything blocks the merge?"}}
   G -- yes --> WAIT
   G -- no --> MERGE["Merge or enqueue the snapshot's head SHA"] --> NEXT
   NEXT(("Next pass")) -.-> SNAP
@@ -100,13 +108,16 @@ The rules live in one ordered table, `RULES` in `src/decide.rs`. The table order
 
 | Step | Rules | Result when a rule matches |
 |---|---|---|
-| 2 | `merged`, `closed`, `draft`, `conflict`, `ci-failed` | Exit 0 for `merged`. Stop for the others. |
+| 2 | `merged`, `closed`, `draft`, `conflict`, `ci-failed` | Exit 0 for `merged`. Wait for pending checks when CI is failing. Stop for the others or after three failed CI fixes. |
 | 3 | `in-queue`, `dequeued` | Wait while queued. Stop if the current head was removed for a reason other than `merged`. |
 | 4 | `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Fast-forward when behind. Stop for the others. |
 | 5 | `resolve-fixed` | Resolve threads whose newest marker says `fixed`. |
 | 6 | `unhandled-items` | Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
-| 7 | `behind-base` | Run `gh pr update-branch` for direct merges. Skip this rule for merge queues. |
-| 8 | `ci-pending`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision` | Wait, then take a new snapshot. |
+| 7 | `fix-ci` | Send failed Actions job logs and external check URLs to Codex, then commit and push a code fix. |
+| 8 | `behind-base` | Run `gh pr update-branch` for direct merges. Skip this rule for merge queues. |
+| 9 | `ci-pending`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision` | Wait, then take a new snapshot. |
+
+CI fix commits carry the `Baby-Sitter: fix-ci` trailer. The binary stops if CI still fails after three fix commits among the PR's last 20 commits. Codex must not edit CI configuration or weaken tests, and must return `needs_human` for non-code causes. The binary checks for protected CI configuration changes in the working tree before committing and in the commit before pushing. It leaves unsafe changes uncommitted or the unsafe commit local for inspection.
 
 ## Review threads and replies
 
@@ -154,6 +165,6 @@ For a merge queue, the binary enqueues the snapshot's head SHA and uses the queu
 
 ## Known limits
 
-- The binary does not fix failing CI or merge conflicts. It stops and names the cause.
+- The binary does not fix merge conflicts or non-code CI failures. It stops and names the cause.
 - A PR with more than 100 review threads, comments in a thread, reviews, or review requests stops the run. The binary does not act on a partial view.
 - A lost re-review request is not retried.

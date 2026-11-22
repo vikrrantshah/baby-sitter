@@ -1,0 +1,21 @@
+{
+  "recent": {
+    "nodes": [
+      {"commit": {"oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "message": "feature: add code"}},
+      {"commit": {"oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "message": "fix: build\n\nBaby-Sitter: fix-ci"}},
+      {"commit": {"oid": "e24371c72fe2c0095cf8f914918c0fc3adfd869c", "message": "fix: tests\n\nBaby-Sitter: fix-ci"}}
+    ]
+  },
+  "rollup": {
+    "state": "FAILURE",
+    "contexts": {
+      "pageInfo": {"hasNextPage": false},
+      "nodes": [
+        {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "FAILURE", "databaseId": 42, "checkSuite": {"app": {"slug": "github-actions"}}, "detailsUrl": "https://example.com/actions/42"},
+        {"__typename": "CheckRun", "name": "analysis", "status": "COMPLETED", "conclusion": "FAILURE", "databaseId": 99, "checkSuite": {"app": {"slug": "external"}}, "detailsUrl": "https://example.com/analysis"},
+        {"__typename": "StatusContext", "context": "deploy", "state": "ERROR", "targetUrl": null},
+        {"__typename": "CheckRun", "name": "tests", "status": "IN_PROGRESS", "conclusion": null, "databaseId": 43, "checkSuite": {"app": {"slug": "github-actions"}}, "detailsUrl": null}
+      ]
+    }
+  }
+}

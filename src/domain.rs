@@ -130,11 +130,28 @@ pub enum RollupState {
     Expected,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedCheck {
+    pub name: String,
+    pub source: CheckSource,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckSource {
+    Actions { job_id: u64 },
+    External { url: Option<String> },
+}
+pub fn check_names(checks: &[FailedCheck]) -> String {
+    checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ci {
     NoChecks,
     Rollup {
         state: RollupState,
-        failing: Vec<String>,
+        failing: Vec<FailedCheck>,
         pending: Vec<String>,
     },
 }
@@ -165,6 +182,7 @@ pub struct Snapshot {
     pub review_decision: Option<ReviewDecision>,
     pub review_requests: Vec<Reviewer>,
     pub ci: Ci,
+    pub ci_fix_attempts: u32,
     pub threads: Vec<Thread>,
     pub reviews: Vec<Review>,
 }
