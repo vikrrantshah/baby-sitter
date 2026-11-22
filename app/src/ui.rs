@@ -336,6 +336,7 @@ impl AppView {
         } else {
             self.inputs.remove(&repo);
         }
+        self.update_filter(window, cx);
         cx.notify();
     }
     fn active_count(&self, repo: &RepoName) -> usize {
@@ -384,11 +385,15 @@ impl AppView {
         }));
     }
     fn update_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut repos = BTreeSet::new();
-        if let Load::Ready(prs) = &self.prs {
-            repos.extend(prs.iter().map(|row| row.pr.repo.clone()));
-        }
-        repos.extend(self.states.keys().map(|pr| pr.repo.clone()));
+        let prs = match &self.prs {
+            Load::Ready(prs) => prs.as_slice(),
+            _ => &[],
+        };
+        let repos: BTreeSet<_> =
+            model::dashboard_rows(prs, self.states.keys(), &self.config.repos, None)
+                .into_iter()
+                .map(|row| row.pr.repo.clone())
+                .collect();
         if self
             .selected_filter
             .as_ref()
@@ -491,13 +496,6 @@ impl AppView {
             }
         })
         .detach();
-    }
-    fn show_repository(&mut self, repo: &RepoName, window: &mut Window, cx: &mut Context<Self>) {
-        let text = repo.to_string();
-        self.repo_filter
-            .update(cx, |state, cx| state.set_value(text, window, cx));
-        self.tab = Tab::Repositories;
-        cx.notify();
     }
     fn reading(&self, pr: &PrRef) -> Reading {
         let state = self.states.get(pr);
@@ -742,32 +740,16 @@ impl AppView {
             Load::Ready(rows) => rows,
             _ => &[],
         };
-        let existing: BTreeSet<_> = prs.iter().map(|row| &row.pr).collect();
-        let mut rows: Vec<_> = prs.iter().map(Cow::Borrowed).collect();
-        rows.extend(
-            self.states
-                .keys()
-                .filter(|pr| !existing.contains(*pr))
-                .map(|pr| {
-                    Cow::Owned(PrRow {
-                        pr: pr.clone(),
-                        title: format!("Pull request #{}", pr.number),
-                        url: pr.url(),
-                        is_draft: false,
-                        updated_at: String::new(),
-                    })
-                }),
-        );
-        if let Some(filter) = &self.selected_filter {
-            rows.retain(|row| &row.pr.repo == filter);
-        }
-        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        rows
+        model::dashboard_rows(
+            prs,
+            self.states.keys(),
+            &self.config.repos,
+            self.selected_filter.as_ref(),
+        )
     }
     fn pr_row(&self, row: &PrRow, cx: &mut Context<Self>) -> AnyElement {
         let state = self.states.get(&row.pr);
         let reading = self.reading(&row.pr);
-        let selected = self.config.repos.contains_key(&row.pr.repo);
         let active = state.is_some_and(SitState::is_active);
         let pr = row.pr.clone();
         let action = if active {
@@ -788,7 +770,6 @@ impl AppView {
                 Button::new(SharedString::from(format!("start-{pr}")))
                     .label("Start")
                     .primary()
-                    .disabled(!selected)
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.start(pr.clone(), window, cx)),
                     ),
@@ -862,16 +843,6 @@ impl AppView {
                         }),
                 )
         });
-        let allow = (!selected).then(|| {
-            let repo = row.pr.repo.clone();
-            Button::new(SharedString::from(format!("allow-{}", row.pr)))
-                .label(format!("Allow babysits in {repo}"))
-                .link()
-                .small()
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.show_repository(&repo, window, cx)),
-                )
-        });
         let content = div()
             .flex_1()
             .min_w_0()
@@ -881,10 +852,7 @@ impl AppView {
             .child(title)
             .child(div().text_size(px(13.)).text_color(dusk()).child(place))
             .when_some(status, |d, status| d.child(div().pt(px(6.)).child(status)))
-            .when_some(worktree, |d, worktree| d.child(worktree))
-            .when_some(allow, |d, allow| {
-                d.child(div().pt(px(4.)).flex().child(allow))
-            });
+            .when_some(worktree, |d, worktree| d.child(worktree));
         div()
             .px(px(ROW_INSET))
             .flex_shrink_0()
@@ -927,7 +895,21 @@ impl AppView {
                     .child(Self::retry_prs_button(cx))
             }
             _ if rows.is_empty() => {
-                if self.selected_filter.is_some() {
+                if self.config.repos.is_empty() {
+                    message(
+                        "No repositories allowed",
+                        Some("Allow a repository to see its pull requests.".into()),
+                    )
+                    .child(
+                        Button::new("choose-repositories")
+                            .label("Choose repositories")
+                            .primary()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.tab = Tab::Repositories;
+                                cx.notify();
+                            })),
+                    )
+                } else if self.selected_filter.is_some() {
                     message(
                         "No pull requests in this repository",
                         Some("Choose All repositories to see the rest.".into()),
@@ -935,7 +917,10 @@ impl AppView {
                 } else {
                     message(
                         "No open pull requests",
-                        Some("Open a pull request on GitHub, then press Refresh.".into()),
+                        Some(
+                            "None of your allowed repositories has an open pull request from you."
+                                .into(),
+                        ),
                     )
                 }
             }
