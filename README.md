@@ -18,17 +18,19 @@ cargo install --path .
 
 ## Desktop app
 
-`baby-sitter-app` is a macOS window that runs the same binary for you, one process per PR. You don't need a terminal per PR.
+`Baby Sitter.app` is a macOS window that runs the same binary for you, one process per PR. You don't need a terminal per PR.
 
 ```sh
-cargo build --workspace
-target/debug/baby-sitter-app
+app/bundle.sh                       # builds target/release/Baby Sitter.app
+open "target/release/Baby Sitter.app"
 ```
 
-Both binaries must sit in the same directory. `cargo install --path . && cargo install --path app` also works.
+Drag the app to `/Applications` to keep it. The script needs Xcode's command line tools for `iconutil` and `codesign`. The bundle holds both binaries, the Dock name, and the icon rendered from `app/assets/icon.svg`.
+
+For development, `cargo build --workspace && target/debug/baby-sitter-app` runs the window without a bundle. Both binaries must sit in the same directory. Outside the bundle the Dock shows the name `baby-sitter-app`, and system notification responses are disabled.
 
 - **Repositories** groups accessible repositories by organization and leaves out archived ones. Filter by organization or watched status, or search by name. Use the toggle to watch a repository and the gear to set its timeout and interval. The default interval is `30s`, not the CLI's `10s`. Each pass makes two GraphQL calls, so six PRs at `10s` use most of the hourly limit of 5,000 points.
-- **Pull requests** lists your open PRs in the repositories you watch. Filter by repository, then press Start or Cancel on a row. Each row shows what the latest pass is doing, and after a stop it shows the reason. The meter beside a row lights one segment per step of the [flow](#flow) that the latest pass reached, from PR state at the bottom to merge at the top. Hover over it to see the step's name.
+- **Pull requests** lists your open PRs in the repositories you watch. Filter by repository, then press the play button to start a babysit or the stop button to cancel it. Each row shows what the latest pass is doing, and after a stop it shows the reason. The meter beside a row lights one segment per step of the [flow](#flow) that the latest pass reached, from PR state at the bottom to merge at the top. Hover over it to see the step's name.
 - A notification appears when a babysit merges, times out, or stops. A cancel does not notify.
 
 The app keeps its configuration, one clone per repository, and one worktree per PR in `~/Library/Application Support/baby-sitter`. It removes a worktree after a merge. After any other outcome it keeps the worktree and shows its path with a Reveal button.

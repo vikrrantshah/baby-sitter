@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- The sidebar mark (pair_mark in app/src/ui.rs) scaled 24x onto the macOS icon grid. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#1f2124"/>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="184.5" fill="none" stroke="#393c42" stroke-width="1"/>
+  <circle cx="440" cy="488" r="192" fill="#3fb0a3"/>
+  <circle cx="620" cy="596" r="156" fill="#1f2124"/>
+  <circle cx="620" cy="596" r="108" fill="#ecece8"/>
+</svg>

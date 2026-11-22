@@ -54,6 +54,7 @@ fn run() -> anyhow::Result<()> {
     application().with_assets(assets::AllAssets).run(move |cx| {
         init(cx);
         theme::install(cx);
+        set_dock_icon();
         let quit_registry = registry.clone();
         cx.on_app_quit(move |_| {
             sitter::terminate_all(&quit_registry);
@@ -80,3 +81,23 @@ fn run() -> anyhow::Result<()> {
     });
     Ok(())
 }
+
+/// Sets the Dock and app switcher icon when the binary runs outside the app bundle,
+/// such as from `cargo run`. The bundle gets the same icon from its Info.plist.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../assets/icon.svg"));
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    // SAFETY: called on the main thread with a valid image.
+    unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+}
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {}
