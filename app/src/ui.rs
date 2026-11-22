@@ -8,7 +8,7 @@ use crate::{
     store,
     theme::{coral, dusk, glow, housing, mint, moon, night, rail},
 };
-use gpui_kit::{component::StyledExt, prelude::FluentBuilder};
+use gpui_kit::{assets::IconName, component::StyledExt, prelude::FluentBuilder};
 use gpui_kit::{
     component::{
         Disableable, Selectable, Sizable,
@@ -65,6 +65,9 @@ struct Reading {
 const SIDEBAR_WIDTH: f32 = 232.;
 const ROW_INSET: f32 = 32.;
 const REPO_ROW_HEIGHT: f32 = 56.;
+const SETTINGS_LABEL_WIDTH: f32 = 120.;
+const SETTINGS_COLUMN_GAP: f32 = 24.;
+const SETTINGS_INPUT_WIDTH: f32 = 360.;
 
 pub struct AppView {
     data: PathBuf,
@@ -646,12 +649,15 @@ impl AppView {
                 this.toggle_repo(switch_repo.clone(), *checked, window, cx)
             }));
         let settings = Button::new(SharedString::from(format!("settings-{repo}")))
-            .label("Settings")
+            .icon(IconName::Settings)
             .accessibility_label(format!("Settings for {repo}"))
             .ghost()
-            .small()
             .disabled(!selected)
-            .when(!selected, |button| button.tooltip("Turn on to configure"))
+            .tooltip(if selected {
+                "Settings"
+            } else {
+                "Turn on to configure"
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.page = Page::RepoSettings(settings_repo.clone());
                 cx.notify();
@@ -856,7 +862,14 @@ impl AppView {
             .inputs
             .get(repo)
             .expect("allowed repositories have duration inputs");
-        let field = |label: &'static str, input: &Entity<InputState>, error: &Option<String>| {
+        let field = |label: &'static str,
+                     hint: &'static str,
+                     input: &Entity<InputState>,
+                     error: &Option<String>| {
+            let note = match error {
+                Some(error) => div().text_color(coral()).child(error.clone()),
+                None => div().text_color(dusk()).child(hint),
+            };
             div()
                 .w_full()
                 .flex()
@@ -864,32 +877,51 @@ impl AppView {
                 .gap(px(6.))
                 .child(
                     div()
-                        .text_size(px(13.))
-                        .font_semibold()
-                        .text_color(moon())
-                        .child(label),
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(SETTINGS_COLUMN_GAP))
+                        .child(
+                            div()
+                                .w(px(SETTINGS_LABEL_WIDTH))
+                                .flex_shrink_0()
+                                .text_size(px(14.))
+                                .font_semibold()
+                                .text_color(moon())
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .max_w(px(SETTINGS_INPUT_WIDTH))
+                                .child(Input::new(input)),
+                        ),
                 )
-                .child(Input::new(input))
-                .when_some(error.clone(), |field, error| {
-                    field.child(div().text_size(px(12.)).text_color(coral()).child(error))
-                })
+                .child(
+                    note.ml(px(SETTINGS_LABEL_WIDTH + SETTINGS_COLUMN_GAP))
+                        .max_w(px(SETTINGS_INPUT_WIDTH))
+                        .text_size(px(12.))
+                        .line_height(relative(1.4)),
+                )
         };
         let header = div()
             .flex_shrink_0()
             .px(px(ROW_INSET))
-            .pt(px(28.))
+            .pt(px(20.))
             .pb(px(20.))
             .border_b_1()
             .border_color(rail())
             .flex()
             .flex_col()
             .items_start()
-            .gap(px(12.))
+            .gap(px(10.))
             .child(
                 Button::new("back-to-repositories")
-                    .label("‹ Repositories")
+                    .icon(IconName::ChevronLeft)
+                    .label("Repositories")
                     .ghost()
-                    .small()
+                    .ml(px(-8.))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.page = Page::Repositories;
                         cx.notify();
@@ -900,10 +932,11 @@ impl AppView {
                     .w_full()
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
+                    .gap(px(6.))
                     .child(
                         div()
                             .text_size(px(24.))
+                            .line_height(relative(1.2))
                             .font_semibold()
                             .text_color(moon())
                             .child(repo.to_string()),
@@ -925,18 +958,24 @@ impl AppView {
                         .px(px(ROW_INSET))
                         .py(px(28.))
                         .w_full()
-                        .max_w(px(420.))
+                        .max_w(px(SETTINGS_LABEL_WIDTH
+                            + SETTINGS_COLUMN_GAP
+                            + SETTINGS_INPUT_WIDTH))
                         .flex()
                         .flex_col()
-                        .gap(px(24.))
-                        .child(field("Timeout", &inputs.timeout, &inputs.timeout_error))
-                        .child(field("Interval", &inputs.interval, &inputs.interval_error))
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(dusk())
-                                .child("Use s, m, or h, for example 2h or 30s."),
-                        ),
+                        .gap(px(20.))
+                        .child(field(
+                            "Timeout",
+                            "How long to wait for the merge, for example 2h.",
+                            &inputs.timeout,
+                            &inputs.timeout_error,
+                        ))
+                        .child(field(
+                            "Interval",
+                            "How long to wait between checks, for example 30s.",
+                            &inputs.interval,
+                            &inputs.interval_error,
+                        )),
                 ),
         );
         (header, body)
