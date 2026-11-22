@@ -67,10 +67,7 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
             }
             for r in &resolved {
                 let body = reply_body(r);
-                match &r.item.id {
-                    ItemId::Thread(id) => env.gh.reply_to_thread(id, &body)?,
-                    _ => env.gh.comment(&body)?,
-                }
+                env.gh.reply_to_thread(&r.item.id, &body)?;
             }
             let mut reviewers: Vec<_> = resolved
                 .iter()
@@ -99,56 +96,5 @@ fn reply_body(resolution: &codex::Resolution) -> String {
         answers: resolution.item.answers,
     }
     .render();
-    match (&resolution.item.id, &resolution.item.actor) {
-        (ItemId::Comment(_) | ItemId::Review(_), Actor::Human(login) | Actor::Bot(login)) => {
-            format!(
-                "In reply to @{}: {}\n\n{}\n\n{marker}",
-                login.0, resolution.item.url, resolution.reply
-            )
-        }
-        _ => format!("{}\n\n{marker}", resolution.reply),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::decide::Item;
-
-    #[test]
-    fn top_level_replies_link_and_mention_the_author() {
-        for id in [
-            ItemId::Comment(CommentId(123)),
-            ItemId::Review(ReviewId(456)),
-        ] {
-            let resolution = codex::Resolution {
-                item: Item {
-                    id,
-                    answers: 123,
-                    rereview: None,
-                    actor: Actor::Human(Login("alice".into())),
-                    url: "https://github.com/o/r/pull/1#issuecomment-123".into(),
-                    path: None,
-                    line: None,
-                    context: String::new(),
-                },
-                outcome: Outcome::Fixed,
-                reply: "Fixed.".into(),
-            };
-            let body = reply_body(&resolution);
-            assert!(body.starts_with(
-                "In reply to @alice: https://github.com/o/r/pull/1#issuecomment-123\n\nFixed.\n\n"
-            ));
-            assert!(
-                body.ends_with(
-                    &Marker {
-                        item: resolution.item.id.clone(),
-                        outcome: Outcome::Fixed,
-                        answers: 123,
-                    }
-                    .render()
-                )
-            );
-        }
-    }
+    format!("{}\n\n{marker}", resolution.reply)
 }

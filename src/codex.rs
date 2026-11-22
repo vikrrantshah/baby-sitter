@@ -38,7 +38,7 @@ pub fn run(
     let value = serde_json::json!({"type":"object","additionalProperties":false,"properties":{"results":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","enum":ids},"outcome":{"type":"string","enum":["fixed","declined","needs_human"]},"reply":{"type":"string"}},"required":["id","outcome","reply"]}}},"required":["results"]});
     fs::write(&schema, serde_json::to_vec(&value)?)?;
     let prompt = format!(
-        "Edit files only. Do not run git or gh. Return exactly one result per item id. Use fixed only when the code addresses the feedback. Reply text is posted verbatim as the viewer.\n\n{}",
+        "Edit files only. Do not run git or gh. Each item is an unanswered review thread. Return exactly one result per thread id. Use fixed only when the code addresses the feedback. Reply text is posted verbatim in the thread as the viewer.\n\n{}",
         batch
             .0
             .iter()
@@ -63,7 +63,7 @@ pub fn run(
             .context("parsing codex output")?;
     let mut results = BTreeMap::new();
     for r in result.results {
-        let id: ItemId = r.id.parse()?;
+        let id: ThreadId = r.id.parse()?;
         if r.reply.trim().is_empty() {
             bail!("empty reply for {id}");
         }

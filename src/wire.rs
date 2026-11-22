@@ -12,8 +12,7 @@ pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$
  reviewRequests(first:100){pageInfo{hasNextPage} nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login} ... on Team{slug}}}}
  commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:100){nodes{__typename ... on CheckRun{name conclusion status} ... on StatusContext{context state}}}}}}}
  reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(last:100){pageInfo{hasPreviousPage} nodes{databaseId author{__typename login} body url}}}}
- comments(last:100){pageInfo{hasPreviousPage} nodes{databaseId author{__typename login} body url}}
- reviews(last:100){pageInfo{hasPreviousPage} nodes{databaseId author{__typename login} state body url}}
+ reviews(last:100){pageInfo{hasPreviousPage} nodes{author{__typename login} state}}
  }}}"#;
 fn string<'a>(v: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     v[key]
@@ -200,13 +199,9 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
             comments,
         )?);
     }
-    let comments = nodes(p, "comments", "hasPreviousPage")?
-        .iter()
-        .map(|c| comment(c, viewer))
-        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut reviews = Vec::new();
     for r in nodes(p, "reviews", "hasPreviousPage")? {
-        reviews.push(Review { id: ReviewId(number(r,"databaseId")?), actor: actor(&r["author"], viewer)?, state: parse_enum!(string(r,"state")?, "APPROVED" => ReviewState::Approved, "CHANGES_REQUESTED" => ReviewState::ChangesRequested, "COMMENTED" => ReviewState::Commented, "DISMISSED" => ReviewState::Dismissed, "PENDING" => ReviewState::Pending), body: string(r,"body")?.into(), url: string(r,"url")?.into() });
+        reviews.push(Review { actor: actor(&r["author"], viewer)?, state: parse_enum!(string(r,"state")?, "APPROVED" => ReviewState::Approved, "CHANGES_REQUESTED" => ReviewState::ChangesRequested, "COMMENTED" => ReviewState::Commented, "DISMISSED" => ReviewState::Dismissed, "PENDING" => ReviewState::Pending) });
     }
     Ok(Snapshot {
         pr_id: string(p, "id")?.into(),
@@ -222,7 +217,6 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
         review_requests: requests,
         ci,
         threads,
-        comments,
         reviews,
     })
 }
@@ -230,6 +224,33 @@ pub fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn top_level_feedback_does_not_block_merge() {
+        let mut v: Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/cli-15102.json")).unwrap();
+        let p = &mut v["data"]["repository"]["pullRequest"];
+        p["state"] = "OPEN".into();
+        p["mergeStateStatus"] = "CLEAN".into();
+        p["reviewDecision"] = "APPROVED".into();
+        p["reviewRequests"]["nodes"] = serde_json::json!([]);
+        p["reviewThreads"]["nodes"] = serde_json::json!([]);
+        p["comments"] = serde_json::json!({"pageInfo":{"hasPreviousPage":false},"nodes":[{
+            "databaseId":1,"author":{"__typename":"User","login":"alice"},
+            "body":"Top-level feedback","url":"https://example.com/comment"
+        }]});
+        p["reviews"]["nodes"] = serde_json::json!([{
+            "databaseId":2,"author":{"__typename":"User","login":"alice"},
+            "state":"APPROVED","body":"Review feedback","url":"https://example.com/review"
+        }]);
+        let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let facts = crate::decide::Facts {
+            snap: &snapshot,
+            local: None,
+            method: MergeMethod::Squash,
+        };
+        assert_eq!(crate::decide::decide(&facts).rule, "merge");
+        assert!(crate::decide::explain(&facts).contains("unhandled-items      pass"));
+    }
     #[test]
     fn parses_public_response_and_rejects_truncation() {
         let raw = include_bytes!("../tests/fixtures/cli-15102.json");
@@ -243,7 +264,6 @@ mod tests {
         for (connection, page) in [
             ("reviewThreads", "hasNextPage"),
             ("reviewRequests", "hasNextPage"),
-            ("comments", "hasPreviousPage"),
             ("reviews", "hasPreviousPage"),
         ] {
             let mut modified = original.clone();
