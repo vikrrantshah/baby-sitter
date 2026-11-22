@@ -810,19 +810,6 @@ impl AppView {
             }
         }
     }
-    fn needs_you(&self) -> usize {
-        self.states
-            .values()
-            .filter(|state| {
-                matches!(
-                    state,
-                    SitState::Finished(
-                        Outcome::Stopped(_) | Outcome::Failed(_) | Outcome::TimedOut
-                    )
-                )
-            })
-            .count()
-    }
     fn repo_row(&self, repo: &RepoName, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.config.repos.contains_key(repo);
         let count = self.active_count(repo);
@@ -1495,30 +1482,23 @@ impl AppView {
                     .px(px(ROW_INSET))
                     .pb(px(20.))
                     .flex()
-                    .items_start()
+                    .items_center()
                     .gap(px(12.))
                     .child(
                         drag_area()
                             .flex_1()
                             .min_w_0()
                             .flex()
-                            .flex_col()
-                            .gap(px(4.))
+                            .items_center()
+                            .gap(px(10.))
+                            .child(pair_mark())
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(10.))
-                                    .child(pair_mark())
-                                    .child(
-                                        div()
-                                            .text_size(px(24.))
-                                            .font_semibold()
-                                            .text_color(ink())
-                                            .child("Baby Sitter"),
-                                    ),
-                            )
-                            .child(self.babysitting_status()),
+                                    .text_size(px(24.))
+                                    .font_semibold()
+                                    .text_color(ink())
+                                    .child("Baby Sitter"),
+                            ),
                     )
                     .child(
                         round_button_with(
@@ -1605,27 +1585,6 @@ impl AppView {
             .child(div().flex_1().min_h_0().child(list));
         (header, body)
     }
-    fn babysitting_status(&self) -> Div {
-        let running = self.states.values().filter(|s| s.is_active()).count();
-        let needs_you = self.needs_you();
-        let watching = match running {
-            0 => "No babysits running.".to_owned(),
-            1 => "Babysitting 1 pull request.".to_owned(),
-            n => format!("Babysitting {n} pull requests."),
-        };
-        div()
-            .text_size(px(14.))
-            .line_height(relative(1.5))
-            .text_color(muted())
-            .child(watching)
-            .when(needs_you > 0, |d| {
-                d.child(div().text_color(danger()).child(if needs_you == 1 {
-                    "1 needs you.".to_owned()
-                } else {
-                    format!("{needs_you} need you.")
-                }))
-            })
-    }
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         div()
             .w(px(SIDEBAR_WIDTH))
@@ -1651,12 +1610,6 @@ impl AppView {
                             .text_color(ink())
                             .child("Baby Sitter"),
                     ),
-            )
-            .child(
-                div()
-                    .px(px(20.))
-                    .pt(px(20.))
-                    .child(self.babysitting_status()),
             )
             .child(
                 div().px(px(12.)).pt(px(28.)).child(
