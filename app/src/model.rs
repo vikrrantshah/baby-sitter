@@ -127,14 +127,14 @@ impl Default for RepoSettings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepoScope {
     All,
-    Allowed,
+    Watched,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepoListItem {
     Org {
         name: String,
-        allowed: usize,
+        watched: usize,
         total: usize,
     },
     Repo(RepoName),
@@ -153,14 +153,14 @@ pub fn repo_list(
         if org.is_some_and(|org| org != repo.owner) {
             continue;
         }
-        let allowed = selected.contains_key(repo);
-        if scope == RepoScope::Allowed && !allowed {
+        let watched = selected.contains_key(repo);
+        if scope == RepoScope::Watched && !watched {
             continue;
         }
         if !text.is_empty() && !repo.to_string().to_lowercase().contains(&text) {
             continue;
         }
-        groups.entry(&repo.owner).or_default().push((repo, allowed));
+        groups.entry(&repo.owner).or_default().push((repo, watched));
     }
 
     let mut groups: Vec<_> = groups.into_iter().collect();
@@ -170,7 +170,7 @@ pub fn repo_list(
         repos.sort_by_cached_key(|(repo, _)| repo.name.to_lowercase());
         items.push(RepoListItem::Org {
             name: owner.to_owned(),
-            allowed: repos.iter().filter(|(_, allowed)| *allowed).count(),
+            watched: repos.iter().filter(|(_, watched)| *watched).count(),
             total: repos.len(),
         });
         items.extend(
@@ -413,14 +413,14 @@ mod tests {
             vec![
                 RepoListItem::Org {
                     name: "alpha".into(),
-                    allowed: 1,
+                    watched: 1,
                     total: 2,
                 },
                 RepoListItem::Repo("alpha/aaa".parse().unwrap()),
                 RepoListItem::Repo("alpha/Zulu".parse().unwrap()),
                 RepoListItem::Org {
                     name: "Zulu".into(),
-                    allowed: 1,
+                    watched: 1,
                     total: 2,
                 },
                 RepoListItem::Repo("Zulu/Alpha".parse().unwrap()),
@@ -430,18 +430,18 @@ mod tests {
     }
 
     #[test]
-    fn repo_list_combines_organization_and_allowed_filters() {
+    fn repo_list_combines_organization_and_watched_filters() {
         let catalog = repos(&["alpha/one", "alpha/two", "beta/three"]);
         let selected = BTreeMap::from([
             ("alpha/two".parse().unwrap(), RepoSettings::default()),
             ("beta/three".parse().unwrap(), RepoSettings::default()),
         ]);
         assert_eq!(
-            repo_list(&catalog, &selected, Some("alpha"), RepoScope::Allowed, ""),
+            repo_list(&catalog, &selected, Some("alpha"), RepoScope::Watched, ""),
             vec![
                 RepoListItem::Org {
                     name: "alpha".into(),
-                    allowed: 1,
+                    watched: 1,
                     total: 1,
                 },
                 RepoListItem::Repo("alpha/two".parse().unwrap()),
@@ -450,9 +450,9 @@ mod tests {
     }
 
     #[test]
-    fn repo_list_allowed_scope_is_empty_when_nothing_is_allowed() {
+    fn repo_list_watched_scope_is_empty_when_nothing_is_watched() {
         let catalog = repos(&["alpha/one", "beta/two"]);
-        assert!(repo_list(&catalog, &BTreeMap::new(), None, RepoScope::Allowed, "").is_empty());
+        assert!(repo_list(&catalog, &BTreeMap::new(), None, RepoScope::Watched, "").is_empty());
     }
 
     #[test]
@@ -467,7 +467,7 @@ mod tests {
             vec![
                 RepoListItem::Org {
                     name: "alpha".into(),
-                    allowed: 1,
+                    watched: 1,
                     total: 1,
                 },
                 RepoListItem::Repo("alpha/needle".parse().unwrap()),
@@ -478,7 +478,7 @@ mod tests {
             vec![
                 RepoListItem::Org {
                     name: "beta".into(),
-                    allowed: 0,
+                    watched: 0,
                     total: 1,
                 },
                 RepoListItem::Repo("beta/other".parse().unwrap()),

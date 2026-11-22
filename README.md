@@ -27,8 +27,8 @@ target/debug/baby-sitter-app
 
 Both binaries must sit in the same directory. `cargo install --path . && cargo install --path app` also works.
 
-- **Repositories** groups accessible repositories by organization. Filter by organization or allowed status, or search by name. Use the toggle to allow babysitting and open Settings to set the timeout and interval. The default interval is `30s`, not the CLI's `10s`. Each pass makes two GraphQL calls, so six PRs at `10s` use most of the hourly limit of 5,000 points.
-- **Pull requests** lists your open PRs in the repositories you allowed. Filter by repository, then press Start or Cancel on a row. Each row shows what the latest pass is doing, and after a stop it shows the reason. The meter beside a row lights one segment per step of the [flow](#flow) that the latest pass reached, from PR state at the bottom to merge at the top. Hover over it to see the step's name.
+- **Repositories** groups accessible repositories by organization. Filter by organization or watched status, or search by name. Use the toggle to watch a repository and the gear to set its timeout and interval. The default interval is `30s`, not the CLI's `10s`. Each pass makes two GraphQL calls, so six PRs at `10s` use most of the hourly limit of 5,000 points.
+- **Pull requests** lists your open PRs in the repositories you watch. Filter by repository, then press Start or Cancel on a row. Each row shows what the latest pass is doing, and after a stop it shows the reason. The meter beside a row lights one segment per step of the [flow](#flow) that the latest pass reached, from PR state at the bottom to merge at the top. Hover over it to see the step's name.
 - A notification appears when a babysit merges, times out, or stops. A cancel does not notify.
 
 The app keeps its configuration, one clone per repository, and one worktree per PR in `~/Library/Application Support/baby-sitter`. It removes a worktree after a merge. After any other outcome it keeps the worktree and shows its path with a Reveal button.
