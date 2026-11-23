@@ -1963,18 +1963,22 @@ impl AppView {
                     )
                     .child(gate_icons(
                         &row.pr,
-                        self.gates.get(&row.pr).unwrap_or(
-                            if row.state == PrState::Merged
+                        &{
+                            let merged = row.state == PrState::Merged
                                 || matches!(
                                     self.states.get(&row.pr),
                                     Some(SitState::Finished(Outcome::Merged))
-                                )
-                            {
-                                &[GateState::Met; 4]
+                                );
+                            let mut gates = self.gates.get(&row.pr).copied().unwrap_or(if merged {
+                                [GateState::Met; 4]
                             } else {
-                                &[GateState::Pending; 4]
-                            },
-                        ),
+                                [GateState::Pending; 4]
+                            });
+                            if row.state == PrState::Draft {
+                                gates[3] = GateState::Skipped;
+                            }
+                            gates
+                        },
                         active,
                     ))
                     .when_some(worktree, |line, worktree| line.child(worktree)),
@@ -2664,37 +2668,42 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
         .flex()
         .items_center()
         .gap(px(6.))
-        .children(GATE_ICONS.iter().map(|&(index, icon, name)| {
-            let state = gates[index];
-            let (color, word) = state_style(state);
-            let label = SharedString::from(format!("{name}: {word}"));
-            let id = SharedString::from(format!("gate-{pr}-{name}"));
-            let mark = Icon::new(icon).size(px(15.)).text_color(color);
-            let mark = if live && state == GateState::Waiting {
-                mark.with_animation(
-                    id.clone(),
-                    Animation::new(Duration::from_millis(2400))
-                        .repeat()
-                        .with_easing(pulsating_between(0.35, 1.0)),
-                    move |mark, delta| mark.text_color(color.opacity(delta)),
-                )
-                .into_any_element()
-            } else {
-                mark.into_any_element()
-            };
-            div().id(id).child(mark).tooltip(move |window, cx| {
-                let label = label.clone();
-                Tooltip::element(move |_, _| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(status_badge(state))
-                        .child(label.clone())
-                })
-                .build(window, cx)
-            })
-        }))
+        .children(
+            GATE_ICONS
+                .iter()
+                .filter(|&&(index, _, _)| gates[index] != GateState::Skipped)
+                .map(|&(index, icon, name)| {
+                    let state = gates[index];
+                    let (color, word) = state_style(state);
+                    let label = SharedString::from(format!("{name}: {word}"));
+                    let id = SharedString::from(format!("gate-{pr}-{name}"));
+                    let mark = Icon::new(icon).size(px(15.)).text_color(color);
+                    let mark = if live && state == GateState::Waiting {
+                        mark.with_animation(
+                            id.clone(),
+                            Animation::new(Duration::from_millis(2400))
+                                .repeat()
+                                .with_easing(pulsating_between(0.35, 1.0)),
+                            move |mark, delta| mark.text_color(color.opacity(delta)),
+                        )
+                        .into_any_element()
+                    } else {
+                        mark.into_any_element()
+                    };
+                    div().id(id).child(mark).tooltip(move |window, cx| {
+                        let label = label.clone();
+                        Tooltip::element(move |_, _| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(status_badge(state))
+                                .child(label.clone())
+                        })
+                        .build(window, cx)
+                    })
+                }),
+        )
 }
 /// The color and word for a state, shared by gate icons, tooltips, and status badges.
 fn state_style(state: GateState) -> (Hsla, &'static str) {
