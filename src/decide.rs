@@ -169,124 +169,134 @@ impl fmt::Display for Item {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Precondition,
+    Phase(Gate),
+}
 struct Rule {
     name: &'static str,
-    gate: Gate,
+    stage: Stage,
     eval: fn(&Facts<'_>) -> Option<Verdict>,
 }
 const RULES: &[Rule] = &[
     Rule {
         name: "merged",
-        gate: Gate::Merge,
+        stage: Stage::Precondition,
         eval: merged,
     },
     Rule {
         name: "closed",
-        gate: Gate::Merge,
+        stage: Stage::Precondition,
         eval: closed,
     },
     Rule {
-        name: "ci-failed",
-        gate: Gate::Checks,
-        eval: ci_failed,
-    },
-    Rule {
-        name: "in-queue",
-        gate: Gate::Merge,
-        eval: in_queue,
-    },
-    Rule {
-        name: "dequeued",
-        gate: Gate::Merge,
-        eval: dequeued,
-    },
-    Rule {
         name: "local-upstream",
-        gate: Gate::Branch,
+        stage: Stage::Precondition,
         eval: local_upstream,
     },
     Rule {
         name: "local-dirty",
-        gate: Gate::Branch,
+        stage: Stage::Precondition,
         eval: local_dirty,
     },
     Rule {
         name: "local-diverged",
-        gate: Gate::Branch,
+        stage: Stage::Precondition,
         eval: local_diverged,
     },
     Rule {
         name: "local-behind",
-        gate: Gate::Branch,
+        stage: Stage::Precondition,
         eval: local_behind,
     },
     Rule {
-        name: "conflict",
-        gate: Gate::Branch,
-        eval: conflict,
-    },
-    Rule {
         name: "resolve-fixed",
-        gate: Gate::Reviews,
+        stage: Stage::Phase(Gate::Reviews),
         eval: resolve_fixed,
     },
     Rule {
         name: "unhandled-items",
-        gate: Gate::Reviews,
+        stage: Stage::Phase(Gate::Reviews),
         eval: unhandled_items,
     },
     Rule {
+        name: "mergeability-unknown",
+        stage: Stage::Phase(Gate::Branch),
+        eval: mergeability_unknown,
+    },
+    Rule {
+        name: "conflict",
+        stage: Stage::Phase(Gate::Branch),
+        eval: conflict,
+    },
+    Rule {
+        name: "behind-base",
+        stage: Stage::Phase(Gate::Branch),
+        eval: behind_base,
+    },
+    Rule {
+        name: "ci-failed",
+        stage: Stage::Phase(Gate::Checks),
+        eval: ci_failed,
+    },
+    Rule {
         name: "rerun-cancelled",
-        gate: Gate::Checks,
+        stage: Stage::Phase(Gate::Checks),
         eval: rerun_cancelled,
     },
     Rule {
         name: "fix-ci",
-        gate: Gate::Checks,
+        stage: Stage::Phase(Gate::Checks),
         eval: fix_ci,
     },
     Rule {
-        name: "behind-base",
-        gate: Gate::Branch,
-        eval: behind_base,
-    },
-    Rule {
         name: "ci-pending",
-        gate: Gate::Checks,
+        stage: Stage::Phase(Gate::Checks),
         eval: ci_pending,
     },
     Rule {
         name: "ci-starting",
-        gate: Gate::Checks,
+        stage: Stage::Phase(Gate::Checks),
         eval: ci_starting,
     },
     Rule {
+        name: "in-queue",
+        stage: Stage::Phase(Gate::Merge),
+        eval: in_queue,
+    },
+    Rule {
+        name: "dequeued",
+        stage: Stage::Phase(Gate::Merge),
+        eval: dequeued,
+    },
+    Rule {
         name: "merge-state",
-        gate: Gate::Merge,
+        stage: Stage::Phase(Gate::Merge),
         eval: merge_state,
     },
     Rule {
         name: "unresolved-threads",
-        gate: Gate::Reviews,
+        stage: Stage::Phase(Gate::Merge),
         eval: unresolved_threads,
     },
     Rule {
         name: "review-requests",
-        gate: Gate::Reviews,
+        stage: Stage::Phase(Gate::Merge),
         eval: review_requests,
     },
     Rule {
         name: "review-decision",
-        gate: Gate::Reviews,
+        stage: Stage::Phase(Gate::Merge),
         eval: review_decision,
     },
     Rule {
         name: "draft",
-        gate: Gate::Merge,
+        stage: Stage::Phase(Gate::Merge),
         eval: draft,
     },
 ];
-/// The four requirements a PR meets on its way to merged, as reported by `--gates`.
+/// Phase identifiers in wire order, as reported by `--gates`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gate {
     Reviews,
@@ -295,7 +305,8 @@ pub enum Gate {
     Merge,
 }
 impl Gate {
-    const ALL: [Gate; 4] = [Gate::Reviews, Gate::Checks, Gate::Branch, Gate::Merge];
+    const WIRE_ORDER: [Gate; 4] = [Gate::Reviews, Gate::Checks, Gate::Branch, Gate::Merge];
+    const ORDER: [Gate; 4] = [Gate::Reviews, Gate::Branch, Gate::Checks, Gate::Merge];
     fn name(self) -> &'static str {
         match self {
             Gate::Reviews => "reviews",
@@ -305,10 +316,10 @@ impl Gate {
         }
     }
 }
-/// Gate states. Skipped is assigned after severity aggregation.
+/// Phase states. Skipped applies only to the merge phase of draft PRs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GateState {
-    /// Merge only: other gates are still open, so merging has not started.
+    /// An earlier phase or precondition has not completed.
     Pending,
     Met,
     /// A rule waits on GitHub or a person, or the binary is acting on it.
@@ -319,6 +330,13 @@ pub enum GateState {
     Skipped,
 }
 impl GateState {
+    fn from_verdict(verdict: Verdict) -> Self {
+        match verdict {
+            Verdict::Done => Self::Met,
+            Verdict::Stop(_) => Self::Blocked,
+            Verdict::Wait(_) | Verdict::Act(_) => Self::Waiting,
+        }
+    }
     fn name(self) -> &'static str {
         match self {
             GateState::Pending => "pending",
@@ -339,14 +357,14 @@ impl Gates {
 }
 impl fmt::Display for Gates {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, (gate, state)) in Gate::ALL.iter().zip(self.0).enumerate() {
+        for (index, (gate, state)) in Gate::WIRE_ORDER.iter().zip(self.0).enumerate() {
             let sep = if index == 0 { "" } else { " " };
             write!(f, "{sep}{}={}", gate.name(), state.name())?;
         }
         Ok(())
     }
 }
-/// Evaluates every rule, not just the first match, and files each verdict under its gate.
+/// Reports phases in order, leaving every phase after the first incomplete one pending.
 pub fn gates(f: &Facts<'_>) -> Gates {
     let draft = f.snap.draft || f.snap.merge_state == MergeState::Draft;
     if f.snap.lifecycle == Lifecycle::Merged {
@@ -356,40 +374,39 @@ pub fn gates(f: &Facts<'_>) -> Gates {
         }
         return Gates(states);
     }
-    let mut states = [GateState::Met; 4];
-    // Only rules that stop the PR or hold it in a queue; merging itself is decided below.
-    let mut merge = None;
-    for rule in RULES {
-        // GitHub's merge state echoes the other gates (BLOCKED while reviews are
-        // missing) and only ever waits, which the merge default below already shows.
-        if rule.name == "merge-state" {
-            continue;
-        }
-        let Some(verdict) = (rule.eval)(f) else {
-            continue;
-        };
-        let state = match verdict {
-            Verdict::Stop(_) => GateState::Blocked,
-            Verdict::Done => GateState::Met,
-            Verdict::Wait(_) | Verdict::Act(_) => GateState::Waiting,
-        };
-        if rule.gate == Gate::Merge {
-            merge = merge.max(Some(state));
-        } else {
-            let slot = &mut states[rule.gate as usize];
-            *slot = (*slot).max(state);
+
+    let mut states = [GateState::Pending; 4];
+    for rule in RULES.iter().filter(|r| r.stage == Stage::Precondition) {
+        if let Some(verdict) = (rule.eval)(f) {
+            states[Gate::Branch as usize] = GateState::from_verdict(verdict);
+            return Gates(states);
         }
     }
-    let others_met = states[..3].iter().all(|s| *s == GateState::Met);
-    states[Gate::Merge as usize] = if draft {
-        GateState::Skipped
-    } else {
-        match merge {
-            Some(state) => state,
-            None if others_met => GateState::Waiting,
-            None => GateState::Pending,
+
+    for phase in Gate::ORDER {
+        let state = if phase == Gate::Merge && draft {
+            GateState::Skipped
+        } else {
+            let mut state = GateState::Met;
+            for rule in RULES.iter().filter(|r| r.stage == Stage::Phase(phase)) {
+                if let Some(verdict) = (rule.eval)(f) {
+                    state = state.max(GateState::from_verdict(verdict));
+                    if state == GateState::Blocked {
+                        break;
+                    }
+                }
+            }
+            if phase == Gate::Merge && state == GateState::Met {
+                GateState::Waiting
+            } else {
+                state
+            }
+        };
+        states[phase as usize] = state;
+        if state != GateState::Met {
+            break;
         }
-    };
+    }
     Gates(states)
 }
 pub fn decide(f: &Facts<'_>) -> Decision {
@@ -459,23 +476,26 @@ fn draft(f: &Facts<'_>) -> Option<Verdict> {
         )
     })
 }
-fn has_conflict(f: &Facts<'_>) -> bool {
-    f.snap.mergeable == Mergeable::Conflicting || f.snap.merge_state == MergeState::Dirty
+fn mergeability_unknown(f: &Facts<'_>) -> Option<Verdict> {
+    (f.snap.mergeable == Mergeable::Unknown)
+        .then(|| Verdict::Wait("Waiting for GitHub to check mergeability".into()))
 }
 fn conflict(f: &Facts<'_>) -> Option<Verdict> {
-    has_conflict(f).then(|| {
-        if f.snap.conflict_attempts >= MAX_CONFLICT_ATTEMPTS {
-            Verdict::Stop(format!(
-                "PR still conflicts with {} after 3 resolution attempts",
-                f.snap.base
-            ))
-        } else {
-            Verdict::Act(Action::ResolveConflicts {
-                head: f.snap.head.clone(),
-                base: f.snap.base.clone(),
-            })
-        }
-    })
+    (f.snap.mergeable == Mergeable::Conflicting || f.snap.merge_state == MergeState::Dirty).then(
+        || {
+            if f.snap.conflict_attempts >= MAX_CONFLICT_ATTEMPTS {
+                Verdict::Stop(format!(
+                    "PR still conflicts with {} after 3 resolution attempts",
+                    f.snap.base
+                ))
+            } else {
+                Verdict::Act(Action::ResolveConflicts {
+                    head: f.snap.head.clone(),
+                    base: f.snap.base.clone(),
+                })
+            }
+        },
+    )
 }
 fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
     match &f.snap.ci {
@@ -516,9 +536,6 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn in_queue(f: &Facts<'_>) -> Option<Verdict> {
-    if has_conflict(f) {
-        return None;
-    }
     match &f.snap.queue {
         QueueStatus::Queued { state, position } => Some(Verdict::Wait(format!(
             "In the merge queue at position {position}, {state}"
@@ -527,9 +544,6 @@ fn in_queue(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn dequeued(f: &Facts<'_>) -> Option<Verdict> {
-    if has_conflict(f) {
-        return None;
-    }
     match &f.snap.queue {
         QueueStatus::Removed {
             reason,
@@ -678,11 +692,6 @@ fn ci_starting(f: &Facts<'_>) -> Option<Verdict> {
     .then(|| Verdict::Wait("Waiting for CI to start on the new commit".into()))
 }
 fn merge_state(f: &Facts<'_>) -> Option<Verdict> {
-    if f.snap.mergeable == Mergeable::Unknown {
-        return Some(Verdict::Wait(
-            "Waiting for GitHub to check mergeability".into(),
-        ));
-    }
     match f.snap.merge_state {
         MergeState::Clean | MergeState::HasHooks | MergeState::Draft => None,
         MergeState::Behind if matches!(f.snap.route, MergeRoute::Queue { .. }) => None,
@@ -864,6 +873,13 @@ mod tests {
                 method: MergeMethod::Squash,
             })
         }
+        fn gates(&self) -> Gates {
+            gates(&Facts {
+                snap: &self.snap,
+                local: Some(&self.local),
+                method: MergeMethod::Squash,
+            })
+        }
     }
     #[test]
     fn fresh_head_without_checks_waits_for_ci_and_reports_the_gate() {
@@ -969,7 +985,7 @@ mod tests {
         assert!(local_behind(&facts).is_none());
     }
     #[test]
-    fn queue_waits_before_feedback_and_behind_base() {
+    fn queue_handles_feedback_before_waiting() {
         let mut w = World::new();
         w.snap.route = MergeRoute::Queue {
             method: MergeMethod::Squash,
@@ -981,10 +997,14 @@ mod tests {
         w.snap.merge_state = MergeState::Behind;
         w.snap.threads.push(thread(vec![bot(3)]));
         let decision = w.decision();
-        assert_eq!(decision.rule, "in-queue");
-        assert_eq!(
+        assert_eq!(decision.rule, "unhandled-items");
+        assert!(matches!(
             decision.verdict,
-            Verdict::Wait("In the merge queue at position 2, awaiting checks".into())
+            Verdict::Act(Action::HandleComments { .. })
+        ));
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=waiting checks=pending branch=pending merge=pending"
         );
     }
     #[test]
@@ -1194,28 +1214,31 @@ mod tests {
         );
     }
     #[test]
-    fn draft_skips_only_merge_even_when_other_gates_are_open() {
+    fn draft_merge_stays_pending_until_earlier_phases_are_complete() {
         let mut w = World::new();
-        w.snap.review_decision = Some(ReviewDecision::ReviewRequired);
-        w.snap.ci = Ci::Rollup {
-            state: RollupState::Pending,
-            failing: vec![],
-            cancelled: vec![],
-            pending: vec!["tests".into()],
-        };
-        w.snap.mergeable = Mergeable::Conflicting;
-        w.snap.lifecycle = Lifecycle::Closed;
         for (draft, state) in [(true, MergeState::Clean), (false, MergeState::Draft)] {
             w.snap.draft = draft;
             w.snap.merge_state = state;
-            let facts = Facts {
-                snap: &w.snap,
-                local: Some(&w.local),
-                method: MergeMethod::Squash,
+            w.snap.threads.push(thread(vec![bot(1)]));
+            assert_eq!(
+                w.gates().to_string(),
+                "reviews=waiting checks=pending branch=pending merge=pending"
+            );
+            w.snap.threads.clear();
+            w.snap.ci = Ci::Rollup {
+                state: RollupState::Pending,
+                failing: vec![],
+                cancelled: vec![],
+                pending: vec!["tests".into()],
             };
             assert_eq!(
-                gates(&facts).to_string(),
-                "reviews=waiting checks=waiting branch=waiting merge=skipped"
+                w.gates().to_string(),
+                "reviews=met checks=waiting branch=met merge=pending"
+            );
+            w.snap.ci = Ci::NoChecks;
+            assert_eq!(
+                w.gates().to_string(),
+                "reviews=met checks=met branch=met merge=skipped"
             );
         }
     }
@@ -1495,7 +1518,7 @@ mod tests {
         assert_eq!(w.decision().rule, "review-decision");
         w.snap.review_decision = Some(ReviewDecision::Approved);
         w.snap.mergeable = Mergeable::Unknown;
-        assert_eq!(w.decision().rule, "merge-state");
+        assert_eq!(w.decision().rule, "mergeability-unknown");
         w.snap.mergeable = Mergeable::Yes;
         w.local.relation = Relation::Ahead;
         assert!(matches!(w.decision().verdict, Verdict::Stop(_)));
@@ -1512,44 +1535,310 @@ mod tests {
         ));
     }
     #[test]
-    fn gates_report_every_requirement_not_just_the_first_blocker() {
-        let report = |w: &World| {
-            gates(&Facts {
-                snap: &w.snap,
-                local: Some(&w.local),
-                method: MergeMethod::Squash,
-            })
-        };
+    fn unhandled_comments_block_a_behind_branch_and_pending_ci() {
         let mut w = World::new();
+        w.snap.threads.push(thread(vec![bot(1)]));
+        w.snap.merge_state = MergeState::Behind;
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec!["tests".into()],
+        };
+        assert_eq!(w.decision().rule, "unhandled-items");
         assert_eq!(
-            report(&w).to_string(),
+            w.gates().to_string(),
+            "reviews=waiting checks=pending branch=pending merge=pending"
+        );
+    }
+
+    #[test]
+    fn behind_direct_branch_blocks_pending_ci() {
+        let mut w = World::new();
+        w.snap.merge_state = MergeState::Behind;
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec!["tests".into()],
+        };
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "behind-base",
+                verdict: Verdict::Act(Action::UpdateBranch),
+            }
+        );
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=pending branch=waiting merge=pending"
+        );
+    }
+
+    #[test]
+    fn pending_ci_blocks_merge() {
+        let mut w = World::new();
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec!["tests".into()],
+        };
+        assert_eq!(w.decision().rule, "ci-pending");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=waiting branch=met merge=pending"
+        );
+    }
+
+    #[test]
+    fn queue_waits_in_merge_when_earlier_phases_are_complete() {
+        let mut w = World::new();
+        w.snap.route = MergeRoute::Queue {
+            method: MergeMethod::Squash,
+        };
+        w.snap.merge_state = MergeState::Behind;
+        w.snap.queue = QueueStatus::Queued {
+            state: QueueEntryState::Queued,
+            position: 2,
+        };
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "in-queue",
+                verdict: Verdict::Wait("In the merge queue at position 2, queued".into()),
+            }
+        );
+        assert_eq!(
+            w.gates().to_string(),
             "reviews=met checks=met branch=met merge=waiting"
         );
+    }
+
+    #[test]
+    fn dirty_checkout_blocks_before_comments_and_failed_ci() {
+        let mut w = World::new();
+        w.local.dirty.push(" M file".into());
         w.snap.threads.push(thread(vec![bot(1)]));
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Failure,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec![],
+        };
+        assert_eq!(w.decision().rule, "local-dirty");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=pending checks=pending branch=blocked merge=pending"
+        );
+    }
+
+    #[test]
+    fn unknown_mergeability_waits_before_ci() {
+        let mut w = World::new();
+        w.snap.mergeable = Mergeable::Unknown;
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec!["tests".into()],
+        };
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "mergeability-unknown",
+                verdict: Verdict::Wait("Waiting for GitHub to check mergeability".into()),
+            }
+        );
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=pending branch=waiting merge=pending"
+        );
+    }
+
+    #[test]
+    fn earlier_phase_regressions_grey_out_later_phases() {
+        let mut w = World::new();
+        assert_eq!(w.decision().rule, "merge");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=met branch=met merge=waiting"
+        );
         w.snap.ci = Ci::Rollup {
             state: RollupState::Pending,
             failing: vec![],
             cancelled: vec![],
             pending: vec![],
         };
-        w.snap.mergeable = Mergeable::Unknown;
-        let g = report(&w);
+        assert_eq!(w.decision().rule, "ci-pending");
         assert_eq!(
-            Gate::ALL.map(|gate| g.get(gate)),
-            [
-                GateState::Waiting,
-                GateState::Waiting,
-                GateState::Met,
-                GateState::Pending
-            ]
+            w.gates().to_string(),
+            "reviews=met checks=waiting branch=met merge=pending"
         );
-        w.snap.mergeable = Mergeable::Conflicting;
-        assert_eq!(report(&w).get(Gate::Branch), GateState::Waiting);
+        w.snap.merge_state = MergeState::Behind;
+        assert_eq!(w.decision().rule, "behind-base");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=pending branch=waiting merge=pending"
+        );
+        w.snap.threads.push(thread(vec![bot(1)]));
+        assert_eq!(w.decision().rule, "unhandled-items");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=waiting checks=pending branch=pending merge=pending"
+        );
+    }
+
+    #[test]
+    fn phase_stop_takes_precedence_over_a_wait_in_the_same_phase() {
+        let mut w = World::new();
+        w.snap.mergeable = Mergeable::Unknown;
+        w.snap.merge_state = MergeState::Dirty;
         w.snap.conflict_attempts = 3;
-        assert_eq!(report(&w).get(Gate::Branch), GateState::Blocked);
+        assert_eq!(w.decision().rule, "mergeability-unknown");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=pending branch=blocked merge=pending"
+        );
+    }
+
+    #[test]
+    fn checkout_waits_and_closed_prs_block_before_every_phase() {
+        let mut w = World::new();
+        for (relation, rule) in [
+            (Relation::Behind, "local-behind"),
+            (Relation::Pushed, "local-diverged"),
+            (Relation::Unpushed, "local-diverged"),
+        ] {
+            w.local.relation = relation;
+            assert_eq!(w.decision().rule, rule);
+            assert_eq!(
+                w.gates().to_string(),
+                "reviews=pending checks=pending branch=waiting merge=pending"
+            );
+        }
         w.snap.lifecycle = Lifecycle::Closed;
-        assert_eq!(report(&w).get(Gate::Merge), GateState::Blocked);
+        w.snap.draft = true;
+        assert_eq!(w.decision().rule, "closed");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=pending checks=pending branch=blocked merge=pending"
+        );
+    }
+
+    #[test]
+    fn review_approvals_and_answered_threads_wait_in_merge() {
+        let mut w = World::new();
+        w.snap
+            .threads
+            .push(thread(vec![bot(1), comment(2, Actor::Viewer, "answered")]));
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec![],
+        };
+        assert_eq!(w.decision().rule, "ci-pending");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=waiting branch=met merge=pending"
+        );
+        w.snap.ci = Ci::NoChecks;
+        assert_eq!(w.decision().rule, "unresolved-threads");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=met branch=met merge=waiting"
+        );
+        w.snap.threads.clear();
+        w.snap.review_decision = Some(ReviewDecision::ReviewRequired);
+        assert_eq!(w.decision().rule, "review-decision");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=met branch=met merge=waiting"
+        );
+    }
+
+    #[test]
+    fn queued_pr_runs_check_work_before_waiting_in_merge() {
+        let mut w = World::new();
+        w.snap.route = MergeRoute::Queue {
+            method: MergeMethod::Squash,
+        };
+        w.snap.queue = QueueStatus::Queued {
+            state: QueueEntryState::Queued,
+            position: 1,
+        };
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec!["tests".into()],
+        };
+        assert_eq!(w.decision().rule, "ci-pending");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=waiting branch=met merge=pending"
+        );
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Failure,
+            failing: vec![FailedCheck {
+                name: "tests".into(),
+                source: CheckSource::Actions { job_id: 1 },
+            }],
+            cancelled: vec![],
+            pending: vec![],
+        };
+        assert_eq!(w.decision().rule, "fix-ci");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=waiting branch=met merge=pending"
+        );
+    }
+
+    #[test]
+    fn comments_and_conflicts_precede_even_a_stopping_ci_failure() {
+        let mut w = World::new();
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Failure,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec![],
+        };
+        w.snap.mergeable = Mergeable::Conflicting;
+        w.snap.threads.push(thread(vec![bot(1)]));
+        assert_eq!(w.decision().rule, "unhandled-items");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=waiting checks=pending branch=pending merge=pending"
+        );
+        w.snap.threads.clear();
+        assert_eq!(w.decision().rule, "conflict");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=pending branch=waiting merge=pending"
+        );
+        w.snap.mergeable = Mergeable::Yes;
+        assert_eq!(w.decision().rule, "ci-failed");
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=blocked branch=met merge=pending"
+        );
+    }
+
+    #[test]
+    fn merged_pr_reports_completed_phases_even_with_other_blockers() {
+        let mut w = World::new();
         w.snap.lifecycle = Lifecycle::Merged;
-        assert_eq!(report(&w), Gates([GateState::Met; 4]));
+        w.local.dirty.push(" M file".into());
+        w.snap.threads.push(thread(vec![bot(1)]));
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=met branch=met merge=met"
+        );
+        w.snap.draft = true;
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=met branch=met merge=skipped"
+        );
     }
 }

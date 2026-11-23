@@ -60,7 +60,7 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 | `--merge-method` | `squash` | `squash`, `merge`, or `rebase` for direct merges. Merge queues use their configured method. |
 | `--timeout` | `2h` | Deadline for the whole run, including every `gh`, `git`, and `codex` call. |
 | `--interval` | `10s` | Time between snapshots while the run waits. |
-| `--gates` | off | Before every decision, print each merge gate's state: `[gates] reviews=met checks=waiting branch=met merge=pending`. Each rule in `RULES` belongs to one gate. A gate is `blocked` when one of its rules stops the run, `waiting` when one waits or acts, and `met` otherwise. Merge is `pending` until the other three are met, then `waiting` while the binary merges or the PR sits in a queue. Merge is `skipped` while the PR is a draft. |
+| `--gates` | off | Before every decision, print each phase's state: `[gates] reviews=met checks=waiting branch=met merge=pending`. `reviews` is the Comments phase. A phase is `met` when it is complete, `waiting` while one of its rules waits or acts, and `blocked` when one stops the run. Every phase after the first incomplete one is `pending`. Merge is `waiting` while the binary merges or the PR sits in a queue, and `skipped` while the PR is a draft. |
 
 | Exit code | Meaning |
 |---|---|
@@ -70,69 +70,46 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 
 ## Flow
 
-Each pass takes a fresh snapshot of the PR. For an open PR, it also observes the local checkout. The first rule that matches decides the pass. After any action, the next pass takes a new snapshot, so no step acts on stale data. If a snapshot request to GitHub fails, the pass waits and tries again, and the run stops only after three failures in a row. Error messages lead with the cause, followed by a short command label such as `gh api graphql`.
+Each pass takes a fresh snapshot of the PR. For an open PR, it also observes the local checkout. If a snapshot request to GitHub fails, the pass waits and tries again, and the run stops only after three failures in a row. Error messages lead with the cause, followed by a short command label such as `gh api graphql`.
+
+A PR moves through four phases in a fixed order: Comments, Branch, Checks, and Merge. A phase starts only when every earlier phase is complete. Every pass checks the phases again from the top, so the run always works on the earliest phase that needs work. When an earlier phase stops being complete, for example a new review comment while the PR waits in a merge queue, or a base branch that moves while CI runs, every later phase goes back to pending and the run returns to the earlier phase. The four icons in the app and the `[gates]` line show this: done phases are green, the current phase is amber or red, and later phases are grey.
 
 ```mermaid
 flowchart TD
-  START([Start]) --> SNAP["1 · Take a snapshot<br/>PR and open PR checkout"]
-  SNAP --> T{{"2 · Merged, closed,<br/>or failing CI with pending checks or at its limit?"}}
-  T -- merged --> DONE([Exit 0])
-  T -- "closed or fix limit" --> STOP([Stop, exit 1])
-  T -- "CI failing with checks pending" --> WAIT["Wait --interval"] --> NEXT
-  T -- no --> Q{{"3 · Queue status?"}}
-  Q -- queued --> WAIT
-  Q -- "removed at current head" --> STOP
-  Q -- otherwise --> L{{"4 · Local checkout in sync?"}}
-  L -- behind --> FF["Fast-forward"] --> NEXT
-  L -- "dirty, ahead, or diverged" --> STOP
-  L -- yes --> MC{{"5 · Conflicts with the base branch?"}}
-  MC -- yes --> MB["Merge the base<br/>list conflicted files"]
-  MB -- "conflict in CI configuration,<br/>or 3 resolve attempts" --> STOP
-  MB -- otherwise --> CR
-  subgraph CODEX ["Codex"]
-    CR["Resolve conflicts or return needs_human"]
-    HC["Edit code, draft replies<br/>fixed, declined, or needs_human"]
-    FC["Fix CI code or return needs_human"]
-  end
-  CR -- resolved --> MG{{"Only conflicted files edited,<br/>no markers left?"}}
-  MG -- yes --> MP["Commit the merge and push"] --> NEXT
-  MG -- no --> ABORT["Abort the merge"] --> STOP
-  CR -- "needs a person" --> ABORT
-  MC -- no --> RF{{"6 · Fixed threads still open?"}}
-  RF -- yes --> RES["Resolve them"] --> NEXT
-  RF -- no --> UH{{"7 · Unanswered review threads?"}}
-  UH -- yes --> HC
-  HC --> PUSH["Commit and push"] --> REPLY["Reply in threads with markers"] --> RR["Request re-review"] --> NEXT
-  UH -- no --> CF{{"8 · CI failed?"}}
-  CF -- "only cancelled Actions runs" --> RERUN["Rerun them<br/>stop after 3 attempts"] --> NEXT
-  CF -- "failed checks" --> LOG["Fetch failed Actions job logs"] --> FC
-  FC -- "fixed, or a partial fix" --> GUARD{{"CI configuration changed?"}}
-  GUARD -- no --> CP["Commit and push"] --> NEXT
-  GUARD -- yes --> STOP
-  FC -- "needs a person, no edits" --> STOP
-  CF -- no --> BE{{"9 · Direct merge behind base?"}}
-  BE -- yes --> UP["Update branch"] --> NEXT
-  BE -- no --> G{{"10 · Anything blocks the merge?"}}
-  G -- yes --> WAIT
-  G -- no --> MERGE["Merge or enqueue the snapshot's head SHA"] --> NEXT
+  START([Start]) --> SNAP["Take a snapshot<br/>PR and local checkout"]
+  SNAP --> PRE{{"Merged, closed,<br/>or local checkout out of sync?"}}
+  PRE -- merged --> DONE([Exit 0])
+  PRE -- "closed, dirty, ahead, or diverged" --> STOP([Stop, exit 1])
+  PRE -- "checkout behind" --> FF["Fast-forward"] --> NEXT
+  PRE -- no --> C{{"1 · Comments<br/>fixed threads open or threads unanswered?"}}
+  C -- yes --> CA["Resolve fixed threads, or have Codex<br/>edit code and reply, then push"] --> NEXT
+  C -- no --> B{{"2 · Branch<br/>mergeability unknown, conflicts, or behind base?"}}
+  B -- unknown --> WAIT["Wait --interval"] --> NEXT
+  B -- conflicts --> BC["Merge the base, have Codex resolve,<br/>commit and push"] --> NEXT
+  B -- "behind, direct merge" --> BU["Update branch"] --> NEXT
+  B -- no --> K{{"3 · Checks<br/>CI failed, cancelled, pending, or not started?"}}
+  K -- "cancelled only" --> KR["Rerun the runs"] --> NEXT
+  K -- failed --> KF["Have Codex fix the code<br/>without changing the PR's goal or CI files"] --> NEXT
+  K -- "pending or starting" --> WAIT
+  K -- "fix limit or needs a person" --> STOP
+  K -- no --> M{{"4 · Merge<br/>queued, draft, reviews, or merge state pending?"}}
+  M -- yes --> WAIT
+  M -- "removed from queue" --> STOP
+  M -- no --> MERGE["Merge or enqueue the snapshot's head SHA"] --> NEXT
   NEXT(("Next pass")) -.-> SNAP
 ```
 
-The rules live in one ordered table, `RULES` in `src/decide.rs`. The table order is the precedence. A direct merge or enqueue action runs only when no rule matches.
+The rules live in `RULES` in `src/decide.rs`, grouped as preconditions and then the four phases. Within the table, order is precedence: the first rule that matches decides the pass. A direct merge or enqueue action runs only when no rule matches.
 
-| Step | Rules | Result when a rule matches |
+| Stage | Rules | Result when a rule matches |
 |---|---|---|
-| 2 | `merged`, `closed`, `ci-failed` | Exit 0 for `merged`. Wait for pending checks when CI is failing. Stop for the others or after three failed CI fixes. |
-| 3 | `in-queue`, `dequeued` | Wait while queued. Stop if the current head was removed for a reason other than `merged`. |
-| 4 | `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Fast-forward when behind. Stop for the others. |
-| 5 | `conflict` | Merge the base into the PR branch, have Codex resolve the conflicted files, then commit and push. Stop after three resolve commits. |
-| 6 | `resolve-fixed` | Resolve threads whose newest marker says `fixed`. |
-| 7 | `unhandled-items` | Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
-| 8 | `rerun-cancelled`, `fix-ci` | Rerun Actions runs when every failure is a cancellation, and stop after a run's third attempt. Otherwise send failed Actions job logs and external check URLs to Codex, then commit and push a code fix. |
-| 9 | `behind-base` | Run `gh pr update-branch` for direct merges. Skip this rule for merge queues. |
-| 10 | `ci-pending`, `ci-starting`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision`, `draft` | Wait, then take a new snapshot. `ci-starting` waits when a head under three minutes old shows no checks yet, and a check suite that has not finished counts as pending CI. A draft PR runs earlier actions, then keeps waiting until it is marked ready. |
+| Preconditions | `merged`, `closed`, `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Exit 0 for `merged`. Fast-forward a checkout that is behind. Stop for the others. |
+| 1 · Comments | `resolve-fixed`, `unhandled-items` | Resolve threads whose newest marker says `fixed`. Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
+| 2 · Branch | `mergeability-unknown`, `conflict`, `behind-base` | Wait while GitHub computes mergeability. Merge the base and have Codex resolve conflicts, stopping after three resolve commits. Run `gh pr update-branch` for direct merges; a merge queue updates the branch itself. |
+| 3 · Checks | `ci-failed`, `rerun-cancelled`, `fix-ci`, `ci-pending`, `ci-starting` | Wait for pending checks before fixing. Rerun Actions runs when every failure is a cancellation, stopping after a run's third attempt. Otherwise send failed job logs and external check URLs to Codex, then commit and push a code fix. Stop after three failed CI fixes. `ci-starting` waits when a head under three minutes old shows no checks yet, and a check suite that has not finished counts as pending CI. |
+| 4 · Merge | `in-queue`, `dequeued`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision`, `draft` | Wait while queued, while reviews or the merge state block the merge, or while the PR is a draft. Stop if the current head was removed from the queue for a reason other than `merged`. |
 
-CI fix commits carry the `Baby-Sitter: fix-ci` trailer. The binary stops if CI still fails after three fix commits among the PR's last 20 commits. Codex must not edit CI configuration or weaken tests. It fixes every cause that is in the code. When a cause needs a person, it returns `needs_human`, and the binary pushes any code fix before stopping with that reason. The binary checks for protected CI configuration changes in the working tree before committing and in the commit before pushing. It leaves unsafe changes uncommitted or the unsafe commit local for inspection.
+CI fix commits carry the `Baby-Sitter: fix-ci` trailer. The binary stops if CI still fails after three fix commits among the PR's last 20 commits. Codex keeps the PR's purpose: it fixes what breaks the checks without reverting or reshaping the behavior the PR introduces, and returns `needs_human` when the only fix would contradict the PR's goal. It must not edit CI configuration or weaken tests. It fixes every cause that is in the code; when another cause needs a person, the binary pushes the code fix, waits for CI on it, and stops with the remaining reason once nothing code-side is left. The binary checks for protected CI configuration changes in the working tree before committing and in the commit before pushing. It leaves unsafe changes uncommitted or the unsafe commit local for inspection.
 
 ## Merge conflicts
 
