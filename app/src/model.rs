@@ -340,6 +340,7 @@ pub enum GateState {
     Met,
     Waiting,
     Blocked,
+    Skipped,
 }
 /// Keys of the CLI's `--gates` line, in the order it reports them.
 const GATE_KEYS: [&str; 4] = ["reviews", "checks", "branch", "merge"];
@@ -356,6 +357,7 @@ pub fn parse_gates(line: &str) -> Option<[GateState; 4]> {
             "met" => GateState::Met,
             "waiting" => GateState::Waiting,
             "blocked" => GateState::Blocked,
+            "skipped" => GateState::Skipped,
             _ => return None,
         });
     }
@@ -812,6 +814,15 @@ mod tests {
                 GateState::Waiting,
                 GateState::Blocked,
                 GateState::Pending
+            ])
+        );
+        assert_eq!(
+            parse_gates("[gates] reviews=met checks=met branch=met merge=skipped"),
+            Some([
+                GateState::Met,
+                GateState::Met,
+                GateState::Met,
+                GateState::Skipped
             ])
         );
         assert_eq!(

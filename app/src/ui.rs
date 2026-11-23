@@ -113,6 +113,7 @@ pub struct AppView {
     avatar_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
     ready_tasks: BTreeMap<PrRef, Task<()>>,
+    removal_tasks: BTreeMap<PrRef, Task<()>>,
     sweep_task: Option<Task<()>>,
     sweep_pending: bool,
 }
@@ -285,6 +286,7 @@ impl AppView {
             avatar_task: None,
             pr_task: None,
             ready_tasks: BTreeMap::new(),
+            removal_tasks: BTreeMap::new(),
             sweep_task: None,
             sweep_pending: false,
         };
@@ -712,7 +714,9 @@ impl AppView {
         self.handles.insert(pr, handle);
     }
     fn start(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
-        if self.states.get(&pr).is_some_and(SitState::is_active) {
+        if self.removal_tasks.contains_key(&pr)
+            || self.states.get(&pr).is_some_and(SitState::is_active)
+        {
             return;
         }
         let Some(settings) = self.config.repos.get(&pr.repo) else {
@@ -744,6 +748,9 @@ impl AppView {
         cx.notify();
     }
     fn dismiss(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
+        if self.removal_tasks.contains_key(&pr) {
+            return;
+        }
         let merged = match self.states.get(&pr) {
             Some(SitState::Finished(outcome)) => *outcome == Outcome::Merged,
             _ => return,
@@ -756,6 +763,29 @@ impl AppView {
             cx.notify();
             return;
         }
+        let env = self.env.clone();
+        let data = self.data.clone();
+        let locks = self.locks.clone();
+        let task_pr = pr.clone();
+        let task = cx.spawn_in(window, async move |view, cx| {
+            let removal_pr = task_pr.clone();
+            let result = cx
+                .background_spawn(async move {
+                    sitter::remove_worktree(&env, &data, &locks, &removal_pr)
+                })
+                .await;
+            let _ = view.update_in(cx, |this, _, cx| {
+                this.removal_tasks.remove(&task_pr);
+                if let Err(error) = result {
+                    this.error = Some(format!(
+                        "Could not remove the worktree for #{}: {error:#}",
+                        task_pr.number
+                    ));
+                }
+                cx.notify();
+            });
+        });
+        self.removal_tasks.insert(pr.clone(), task);
         if merged {
             if let Load::Ready(prs) = &mut self.prs {
                 prs.retain(|row| row.pr != pr);
@@ -1286,6 +1316,7 @@ impl AppView {
                     accent(),
                     cx,
                 )
+                .disabled(self.removal_tasks.contains_key(&row.pr))
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.start(pr.clone(), window, cx)),
                 ),
@@ -1950,8 +1981,11 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
         .flex()
         .items_center()
         .gap(px(6.))
-        .children(GATE_ICONS.iter().map(|&(index, icon, name)| {
+        .children(GATE_ICONS.iter().filter_map(|&(index, icon, name)| {
             let state = gates[index];
+            if state == GateState::Skipped {
+                return None;
+            }
             let (color, word) = state_style(state);
             let label = SharedString::from(format!("{name}: {word}"));
             let id = SharedString::from(format!("gate-{pr}-{name}"));
@@ -1968,7 +2002,7 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
             } else {
                 mark.into_any_element()
             };
-            div().id(id).child(mark).tooltip(move |window, cx| {
+            Some(div().id(id).child(mark).tooltip(move |window, cx| {
                 let label = label.clone();
                 Tooltip::element(move |_, _| {
                     div()
@@ -1979,7 +2013,7 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
                         .child(label.clone())
                 })
                 .build(window, cx)
-            })
+            }))
         }))
 }
 /// The color and word for a state, shared by gate icons, tooltips, and status badges.
@@ -1989,6 +2023,7 @@ fn state_style(state: GateState) -> (Hsla, &'static str) {
         GateState::Waiting => (warning(), "waiting"),
         GateState::Blocked => (danger(), "blocked"),
         GateState::Pending => (muted().opacity(0.45), "not started"),
+        GateState::Skipped => (muted().opacity(0.45), "skipped"),
     }
 }
 /// A filled circle with a check, dash, or cross; a hollow ring when not started.
@@ -2004,7 +2039,7 @@ fn status_badge(state: GateState) -> Div {
         GateState::Met => IconName::Check,
         GateState::Waiting => IconName::Minus,
         GateState::Blocked => IconName::X,
-        GateState::Pending => {
+        GateState::Pending | GateState::Skipped => {
             return badge.child(
                 div()
                     .size(px(12.))

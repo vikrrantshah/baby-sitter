@@ -92,12 +92,7 @@ fn git_output(
     command.output().context("start git")
 }
 
-pub fn remove_merged_worktree(
-    env: &ChildEnv,
-    data: &Path,
-    locks: &RepoLocks,
-    pr: &PrRef,
-) -> Result<()> {
+pub fn remove_worktree(env: &ChildEnv, data: &Path, locks: &RepoLocks, pr: &PrRef) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     let lock = repo_lock(locks, &pr.repo);
@@ -105,6 +100,9 @@ pub fn remove_merged_worktree(
         .lock()
         .map_err(|error| anyhow::anyhow!("repository lock: {error}"))?;
     let clone = clone_path(data, &pr.repo);
+    if !clone.exists() {
+        return Ok(());
+    }
     let worktree = worktree_path(data, pr);
     let remove = git_output(
         env,
@@ -214,7 +212,7 @@ pub fn sweep_merged(
                 };
                 if !keep.contains(&pr)
                     && gh::pr_state(env, &pr.url()).is_ok_and(|state| state == "MERGED")
-                    && remove_merged_worktree(env, data, locks, &pr).is_ok()
+                    && remove_worktree(env, data, locks, &pr).is_ok()
                 {
                     removed.push(pr);
                 }
@@ -658,7 +656,7 @@ pub fn spawn(
             return;
         }
         if outcome == Outcome::Merged {
-            let _ = remove_merged_worktree(&runner.env, &runner.data, &runner.locks, &runner.pr);
+            let _ = remove_worktree(&runner.env, &runner.data, &runner.locks, &runner.pr);
         }
         if QUITTING.load(Ordering::SeqCst) {
             return;
@@ -724,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_merged_worktree_with_untracked_files_and_branch() {
+    fn removes_worktree_with_untracked_files_and_branch() {
         let data = std::env::temp_dir().join(format!(
             "app-merged-worktree-{}-{}",
             std::process::id(),
@@ -780,7 +778,8 @@ mod tests {
         ]);
         fs::write(tree.join("untracked"), "scratch").unwrap();
         let locks = Arc::new(Mutex::new(BTreeMap::new()));
-        remove_merged_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
+        remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
+        remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
         assert!(!tree.exists());
         let status = Command::new("git")
             .args([
@@ -794,6 +793,8 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success());
+        fs::remove_dir_all(&clone).unwrap();
+        remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
         fs::remove_dir_all(data).unwrap();
     }
 
