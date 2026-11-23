@@ -2,6 +2,7 @@ use crate::domain::*;
 use std::{collections::BTreeSet, fmt, time::Duration};
 
 const MAX_CI_FIX_ATTEMPTS: u32 = 3;
+const MAX_CONFLICT_ATTEMPTS: u32 = 3;
 
 fn names<I>(mut items: I) -> String
 where
@@ -75,6 +76,10 @@ pub enum Action {
         checks: Vec<FailedCheck>,
         head: Head,
     },
+    ResolveConflicts {
+        head: Head,
+        base: String,
+    },
     UpdateBranch,
     Enqueue {
         head: Sha,
@@ -114,6 +119,9 @@ impl fmt::Display for Action {
                 write!(f, "Rerunning cancelled CI: {}", names(checks.iter()))
             }
             Self::FixCi { checks, .. } => write!(f, "Fixing CI: {}", check_names(checks)),
+            Self::ResolveConflicts { base, .. } => {
+                write!(f, "Resolving merge conflicts with {base}")
+            }
             Self::UpdateBranch => f.write_str("Updating the branch with its base"),
             Self::Enqueue { head } => {
                 write!(f, "Adding {} to the merge queue", &head.as_str()[..7])
@@ -178,11 +186,6 @@ const RULES: &[Rule] = &[
         eval: closed,
     },
     Rule {
-        name: "conflict",
-        gate: Gate::Branch,
-        eval: conflict,
-    },
-    Rule {
         name: "ci-failed",
         gate: Gate::Checks,
         eval: ci_failed,
@@ -216,6 +219,11 @@ const RULES: &[Rule] = &[
         name: "local-behind",
         gate: Gate::Branch,
         eval: local_behind,
+    },
+    Rule {
+        name: "conflict",
+        gate: Gate::Branch,
+        eval: conflict,
     },
     Rule {
         name: "resolve-fixed",
@@ -451,9 +459,23 @@ fn draft(f: &Facts<'_>) -> Option<Verdict> {
         )
     })
 }
+fn has_conflict(f: &Facts<'_>) -> bool {
+    f.snap.mergeable == Mergeable::Conflicting || f.snap.merge_state == MergeState::Dirty
+}
 fn conflict(f: &Facts<'_>) -> Option<Verdict> {
-    (f.snap.mergeable == Mergeable::Conflicting || f.snap.merge_state == MergeState::Dirty)
-        .then(|| Verdict::Stop("PR has merge conflicts with its base branch".into()))
+    has_conflict(f).then(|| {
+        if f.snap.conflict_attempts >= MAX_CONFLICT_ATTEMPTS {
+            Verdict::Stop(format!(
+                "PR still conflicts with {} after 3 resolution attempts",
+                f.snap.base
+            ))
+        } else {
+            Verdict::Act(Action::ResolveConflicts {
+                head: f.snap.head.clone(),
+                base: f.snap.base.clone(),
+            })
+        }
+    })
 }
 fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
     match &f.snap.ci {
@@ -494,6 +516,9 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn in_queue(f: &Facts<'_>) -> Option<Verdict> {
+    if has_conflict(f) {
+        return None;
+    }
     match &f.snap.queue {
         QueueStatus::Queued { state, position } => Some(Verdict::Wait(format!(
             "In the merge queue at position {position}, {state}"
@@ -502,6 +527,9 @@ fn in_queue(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn dequeued(f: &Facts<'_>) -> Option<Verdict> {
+    if has_conflict(f) {
+        return None;
+    }
     match &f.snap.queue {
         QueueStatus::Removed {
             reason,
@@ -808,6 +836,7 @@ mod tests {
                         branch: "feature".into(),
                         sha: sha.clone(),
                     },
+                    base: "main".into(),
                     head_age: None,
                     mergeable: Mergeable::Yes,
                     merge_state: MergeState::Clean,
@@ -816,6 +845,7 @@ mod tests {
                     review_requests: vec![],
                     ci: Ci::NoChecks,
                     ci_fix_attempts: 0,
+                    conflict_attempts: 0,
                     threads: vec![],
                     reviews: vec![],
                 },
@@ -980,6 +1010,76 @@ mod tests {
         );
     }
     #[test]
+    fn conflicting_branches_are_resolved_after_checkout_guards() {
+        for (route, mergeable, merge_state) in [
+            (
+                MergeRoute::Direct,
+                Mergeable::Conflicting,
+                MergeState::Clean,
+            ),
+            (
+                MergeRoute::Queue {
+                    method: MergeMethod::Squash,
+                },
+                Mergeable::Yes,
+                MergeState::Dirty,
+            ),
+        ] {
+            let mut w = World::new();
+            w.snap.route = route;
+            w.snap.mergeable = mergeable;
+            w.snap.merge_state = merge_state;
+            w.snap.base = "release/next".into();
+            assert_eq!(
+                w.decision(),
+                Decision {
+                    rule: "conflict",
+                    verdict: Verdict::Act(Action::ResolveConflicts {
+                        head: w.snap.head.clone(),
+                        base: "release/next".into(),
+                    }),
+                }
+            );
+            assert_eq!(
+                w.decision().verdict.to_string(),
+                "Resolving merge conflicts with release/next"
+            );
+            let facts = Facts {
+                snap: &w.snap,
+                local: Some(&w.local),
+                method: MergeMethod::Squash,
+            };
+            assert_eq!(gates(&facts).get(Gate::Branch), GateState::Waiting);
+            w.local.dirty.push(" M local-file".into());
+            assert_eq!(w.decision().rule, "local-dirty");
+            w.local.dirty.clear();
+            w.local.relation = Relation::Behind;
+            assert_eq!(w.decision().rule, "local-behind");
+            w.local.relation = Relation::Equal;
+            w.snap.conflict_attempts = 3;
+            assert_eq!(
+                w.decision().verdict,
+                Verdict::Stop(
+                    "PR still conflicts with release/next after 3 resolution attempts".into()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn queue_removal_for_a_conflict_does_not_prevent_resolution() {
+        let mut w = World::new();
+        w.snap.route = MergeRoute::Queue {
+            method: MergeMethod::Merge,
+        };
+        w.snap.mergeable = Mergeable::Conflicting;
+        w.snap.queue = QueueStatus::Removed {
+            reason: "conflicts".into(),
+            before_commit: w.snap.head.sha.clone(),
+        };
+        assert_eq!(w.decision().rule, "conflict");
+    }
+    #[test]
     fn queue_behind_base_enqueues_and_direct_route_merges() {
         let mut w = World::new();
         w.snap.route = MergeRoute::Queue {
@@ -1115,7 +1215,7 @@ mod tests {
             };
             assert_eq!(
                 gates(&facts).to_string(),
-                "reviews=waiting checks=waiting branch=blocked merge=skipped"
+                "reviews=waiting checks=waiting branch=waiting merge=skipped"
             );
         }
     }
@@ -1444,6 +1544,8 @@ mod tests {
             ]
         );
         w.snap.mergeable = Mergeable::Conflicting;
+        assert_eq!(report(&w).get(Gate::Branch), GateState::Waiting);
+        w.snap.conflict_attempts = 3;
         assert_eq!(report(&w).get(Gate::Branch), GateState::Blocked);
         w.snap.lifecycle = Lifecycle::Closed;
         assert_eq!(report(&w).get(Gate::Merge), GateState::Blocked);

@@ -218,12 +218,17 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         bail!("head commit changed during snapshot");
     }
     let mut ci_fix_attempts = 0;
+    let mut conflict_attempts = 0;
     for node in recent.iter().rev().take(20) {
-        if string(&node["commit"], "message")?
-            .lines()
-            .any(|line| line == "Baby-Sitter: fix-ci")
-        {
+        let message = string(&node["commit"], "message")?;
+        if message.lines().any(|line| line == "Baby-Sitter: fix-ci") {
             ci_fix_attempts += 1;
+        }
+        if message
+            .lines()
+            .any(|line| line == "Baby-Sitter: resolve-conflicts")
+        {
+            conflict_attempts += 1;
         }
     }
     let rollup = &commit["statusCheckRollup"];
@@ -369,6 +374,7 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         lifecycle,
         draft: boolean(p, "isDraft")?,
         head,
+        base: string(p, "baseRefName")?.into(),
         head_age: commit["committedDate"]
             .as_str()
             .and_then(|date| commit_age(date, now)),
@@ -380,6 +386,7 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         review_requests: requests,
         ci,
         ci_fix_attempts,
+        conflict_attempts,
         threads,
         reviews,
     })
@@ -997,6 +1004,35 @@ mod tests {
                 .ci_fix_attempts,
             2
         );
+    }
+    #[test]
+    fn parses_base_and_counts_only_recent_conflict_resolution_commits() {
+        let mut v = fixture();
+        let p = &mut v["data"]["repository"]["pullRequest"];
+        p["baseRefName"] = "release/next".into();
+        let head = p["headRefOid"].clone();
+        let mut commits = vec![serde_json::json!({
+            "commit":{"oid":head,"message":"old\n\nBaby-Sitter: resolve-conflicts"}
+        })];
+        commits.extend((0..17).map(|_| {
+            serde_json::json!({
+                "commit":{"oid":head,"message":"ordinary commit"}
+            })
+        }));
+        commits.push(serde_json::json!({
+            "commit":{"oid":head,"message":"Not-Baby-Sitter: resolve-conflicts"}
+        }));
+        commits.push(serde_json::json!({
+            "commit":{"oid":head,"message":"resolve\n\nBaby-Sitter: resolve-conflicts"}
+        }));
+        commits.push(serde_json::json!({
+            "commit":{"oid":head,"message":"fix\n\nBaby-Sitter: fix-ci\nBaby-Sitter: resolve-conflicts"}
+        }));
+        p["recent"]["nodes"] = commits.into();
+        let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(snapshot.base, "release/next");
+        assert_eq!(snapshot.conflict_attempts, 2);
+        assert_eq!(snapshot.ci_fix_attempts, 1);
     }
     #[test]
     fn separates_cancelled_actions_runs_from_other_failures() {

@@ -1,4 +1,11 @@
-use crate::{codex, decide::Action, domain::*, git::Git, github::Gh, proc};
+use crate::{
+    codex,
+    decide::Action,
+    domain::*,
+    git::{Git, MergeStart, is_ci_configuration},
+    github::Gh,
+    proc,
+};
 use anyhow::{Context, bail, ensure};
 use std::{
     fs::{self, File, OpenOptions},
@@ -53,7 +60,7 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 env.git.head()? == head.sha,
                 "local HEAD moved since snapshot"
             );
-            let protected = env.git.committed_ci_changes(&base)?;
+            let protected = env.git.protected_push_changes(&base)?;
             ensure!(
                 protected.is_empty(),
                 "local commits touch CI configuration: {}; not pushed",
@@ -110,6 +117,17 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Action::ResolveConflicts { head, base } => {
+            resolve_conflicts(&env.git, &head, &base, |files| {
+                codex::resolve_conflicts(
+                    &env.git.root,
+                    &env.git.state_dir(),
+                    &base,
+                    files,
+                    env.deadline,
+                )
+            })
+        }
         Action::FixCi { checks, head } => {
             ensure!(
                 env.git.head()? == head.sha,
@@ -162,6 +180,116 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
         }
     }
 }
+pub(crate) fn resolve_conflicts(
+    git: &Git,
+    head: &Head,
+    base: &str,
+    resolve: impl FnOnce(&[String]) -> anyhow::Result<codex::ConflictFix>,
+) -> anyhow::Result<()> {
+    ensure!(git.head()? == head.sha, "local HEAD moved since snapshot");
+    ensure!(
+        !git.merge_in_progress(),
+        "checkout already has a merge in progress"
+    );
+    ensure!(git.is_clean()?, "working tree became dirty since snapshot");
+    git.fetch("origin", base)?;
+
+    let result = (|| {
+        let summary = match git.merge_no_commit(base)? {
+            MergeStart::Clean => {
+                ensure!(
+                    git.merge_in_progress(),
+                    "GitHub reports a conflict with {base}, but the branch already contains origin/{base}"
+                );
+                format!("Merge {base} into the PR branch")
+            }
+            MergeStart::Conflicted(files) => {
+                let protected: Vec<_> = files
+                    .iter()
+                    .filter(|file| is_ci_configuration(file))
+                    .collect();
+                ensure!(
+                    protected.is_empty(),
+                    "Merge conflict in CI configuration: {}; resolve it by hand",
+                    protected
+                        .into_iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let index = git.index_state()?;
+                let fix = resolve(&files).with_context(|| {
+                    format!("Merge conflicts need a person: {}", files.join(", "))
+                })?;
+                ensure!(
+                    fix.outcome != codex::ConflictOutcome::NeedsHuman,
+                    "Merge conflicts need a person: {}: {}",
+                    files.join(", "),
+                    fix.summary.trim()
+                );
+                ensure!(
+                    git.head()? == head.sha,
+                    "codex changed HEAD; inspect the checkout"
+                );
+                ensure!(
+                    git.index_state()? == index,
+                    "codex changed the Git index; inspect the checkout"
+                );
+                let outside: Vec<_> = git
+                    .unstaged_paths()?
+                    .into_iter()
+                    .chain(git.untracked_paths()?)
+                    .filter(|path| !files.contains(path))
+                    .collect();
+                ensure!(
+                    outside.is_empty(),
+                    "codex edited files outside the conflicts: {}",
+                    outside.join(", ")
+                );
+                ensure!(
+                    !git.has_conflict_markers(&files)?,
+                    "conflict markers remain in: {}",
+                    files.join(", ")
+                );
+                fix.summary
+            }
+        };
+        git.commit_merge(&conflict_commit_message(&summary))?;
+        let protected = git.protected_push_changes(&head.sha)?;
+        ensure!(
+            protected.is_empty(),
+            "merge commit touches CI configuration beyond the automatic merge: {}; commit left local, not pushed",
+            protected.join(", ")
+        );
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return match git.merge_abort() {
+            Ok(()) => Err(error),
+            Err(abort_error) => {
+                Err(error.context(format!("could not abort the merge: {abort_error:#}")))
+            }
+        };
+    }
+    git.push(&head.branch)
+}
+
+fn conflict_commit_message(summary: &str) -> String {
+    let (subject, rest) = summary
+        .trim()
+        .split_once('\n')
+        .unwrap_or((summary.trim(), ""));
+    let rest = rest.trim();
+    if rest.is_empty() {
+        format!("{}\n\nBaby-Sitter: resolve-conflicts", subject.trim())
+    } else {
+        format!(
+            "{}\n\n{rest}\n\nBaby-Sitter: resolve-conflicts",
+            subject.trim()
+        )
+    }
+}
+
 fn ensure_ci_configuration_unchanged(git: &Git) -> anyhow::Result<()> {
     let protected = git.ci_configuration_changes()?;
     ensure!(

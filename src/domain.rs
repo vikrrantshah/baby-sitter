@@ -192,6 +192,7 @@ pub struct Snapshot {
     pub lifecycle: Lifecycle,
     pub draft: bool,
     pub head: Head,
+    pub base: String,
     pub head_age: Option<Duration>,
     pub mergeable: Mergeable,
     pub merge_state: MergeState,
@@ -200,6 +201,7 @@ pub struct Snapshot {
     pub review_requests: Vec<Reviewer>,
     pub ci: Ci,
     pub ci_fix_attempts: u32,
+    pub conflict_attempts: u32,
     pub threads: Vec<Thread>,
     pub reviews: Vec<Review>,
 }
