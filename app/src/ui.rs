@@ -2129,6 +2129,7 @@ impl AppView {
             && matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|item| item.pr == row.pr));
         let is_draft = row.state == PrState::Draft;
         let merged = reading.merged;
+        let shows_merged = merged || row.state == PrState::Merged;
         let menu_pr = row.pr.clone();
         let menu_url = row.url.clone();
         let view = cx.entity().downgrade();
@@ -2217,26 +2218,28 @@ impl AppView {
             .flex()
             .items_center()
             .gap(px(8.))
-            .child({
+            .when(!shows_merged, |title| {
                 let label = row.state.label();
-                div()
-                    .id(SharedString::from(format!("state-{}", row.pr)))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .text_color(pr_state_color(row.state))
-                    .child(
-                        Icon::empty()
-                            .path(match row.state {
-                                PrState::Draft => "icons/git-pull-request-draft.svg",
-                                PrState::Ready => "icons/git-pull-request.svg",
-                                PrState::Queued => "icons/git-merge-queue-16.svg",
-                                PrState::Merged => "icons/git-merge.svg",
-                                PrState::Closed => "icons/git-pull-request-closed.svg",
-                            })
-                            .size(px(16.)),
-                    )
-                    .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                title.child(
+                    div()
+                        .id(SharedString::from(format!("state-{}", row.pr)))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .text_color(pr_state_color(row.state))
+                        .child(
+                            Icon::empty()
+                                .path(match row.state {
+                                    PrState::Draft => "icons/git-pull-request-draft.svg",
+                                    PrState::Ready => "icons/git-pull-request.svg",
+                                    PrState::Queued => "icons/git-merge-queue-16.svg",
+                                    PrState::Merged => "icons/git-merge.svg",
+                                    PrState::Closed => "icons/git-pull-request-closed.svg",
+                                })
+                                .size(px(16.)),
+                        )
+                        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx)),
+                )
             })
             .child(
                 div()
@@ -2364,6 +2367,22 @@ impl AppView {
             .gap(px(20.))
             .child(match action {
                 Some(action) => action.into_any_element(),
+                None if shows_merged => {
+                    let color = pr_state_color(PrState::Merged);
+                    div()
+                        .id(SharedString::from(format!("merged-{}", row.pr)))
+                        .flex_shrink_0()
+                        .size(px(34.))
+                        .rounded_full()
+                        .bg(color.opacity(0.18))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(color)
+                        .child(Icon::empty().path("icons/git-merge.svg").size(px(16.)))
+                        .tooltip(|window, cx| Tooltip::new("Merged").build(window, cx))
+                        .into_any_element()
+                }
                 None => div().size(px(34.)).into_any_element(),
             })
             .child(content)
