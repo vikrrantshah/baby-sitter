@@ -96,7 +96,7 @@ impl RowAction {
         match self {
             Self::MarkReady if is_open && is_draft && !merged => Some("Ready for review"),
             Self::ConvertToDraft if is_open && !is_draft && !merged => Some("Convert to draft"),
-            Self::Close if is_open && !merged => Some("Close pull request…"),
+            Self::Close if is_open && !merged => Some("Close pull request"),
             Self::CopyLink => Some("Copy link"),
             _ => None,
         }
@@ -1716,18 +1716,25 @@ impl AppView {
         )
         .disabled(self.pr_action_tasks.contains_key(&row.pr))
         .dropdown_menu(move |mut menu, _, _| {
+            menu = menu.min_w(px(200.));
             for action in RowAction::ALL {
                 if let Some(label) = action.menu_item(is_open, is_draft, merged) {
                     let pr = menu_pr.clone();
                     let url = menu_url.clone();
                     let view = view.clone();
-                    let icon = match action {
+                    let (icon, color) = match action {
                         RowAction::MarkReady => {
                             Icon::empty().path("icons/git-pull-request-arrow.svg")
                         }
-                        RowAction::ConvertToDraft => Icon::new(IconName::GitPullRequestDraft),
-                        RowAction::Close => Icon::new(IconName::X),
-                        RowAction::CopyLink => Icon::empty().path("icons/link.svg"),
+                        RowAction::ConvertToDraft => (
+                            "icons/git-pull-request-draft.svg",
+                            pr_state_color(PrState::Draft),
+                        ),
+                        RowAction::Close => (
+                            "icons/git-pull-request-closed.svg",
+                            pr_state_color(PrState::Closed),
+                        ),
+                        RowAction::CopyLink => ("icons/link.svg", muted()),
                     };
                     menu = menu.item(PopupMenuItem::new(label).icon(icon).on_click(
                         move |_, window, cx| {
@@ -2760,11 +2767,11 @@ mod row_action_tests {
         };
         assert_eq!(
             labels(true, true, false),
-            ["Ready for review", "Close pull request…", "Copy link"]
+            ["Ready for review", "Close pull request", "Copy link"]
         );
         assert_eq!(
             labels(true, false, false),
-            ["Convert to draft", "Close pull request…", "Copy link"]
+            ["Convert to draft", "Close pull request", "Copy link"]
         );
         assert_eq!(labels(false, false, true), ["Copy link"]);
         assert_eq!(labels(false, false, false), ["Copy link"]);

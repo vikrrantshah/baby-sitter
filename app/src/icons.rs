@@ -36,7 +36,7 @@ filled! {
     "git-pull-request-draft" => "git-pull-request-draft-16.svg",
     "github" => "mark-github-24.svg",
     "inbox" => "tray-fill.svg",
-    "link" => "link-simple-fill.svg",
+    "link" => "link-16.svg",
     "list-checks" => "list-checks-fill.svg",
     "message-square" => "chat-centered-text-fill.svg",
     "minus" => "minus-circle-fill.svg",
