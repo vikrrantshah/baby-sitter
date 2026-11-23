@@ -71,8 +71,6 @@ pub(crate) fn command_label(cmd: &Command) -> String {
                     | "log"
             ),
             "codex" => first == "exec",
-            "npm" => first == "ci",
-            "pnpm" | "yarn" => first == "install",
             _ => false,
         };
         if known {

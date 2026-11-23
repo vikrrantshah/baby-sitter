@@ -91,28 +91,19 @@ The binary checks for CI configuration changes in the working tree before commit
 
 ## Each Codex prompt has a fixed frame
 
-Codex gets one of three prompts: `review` for unanswered threads, `ci` for failing checks, and `conflicts` for merge conflicts. Each prompt is built in four parts, in this order:
+Codex gets one of three prompts: `review` for unanswered threads, `ci` for failing checks, and `conflicts` for merge conflicts. Each prompt is built in three parts, in this order:
 
 1. The instructions. `baby-sitter --print-default-prompts` prints the defaults. `--prompts <file>` or **Settings > Prompts** in the app replaces them.
 2. The data: the `ITEM` blocks for review threads, the failing checks and their logs, or the base branch and the conflicted files.
 3. A fixed rule that Codex must not run `git` or `gh` and must not install packages. Custom instructions cannot remove it. It is an instruction to Codex, not a runtime block.
-4. The note about installed dependencies described below.
 
 The binary checks the `--prompts` file at startup and stops with the cause when the file is invalid. A missing file means the defaults. The binary reads the file again before each Codex call, so a running babysit picks up a change at its next call. The app always passes `<data dir>/prompts.json` and deletes the file when no custom prompt is saved and turned on.
 
 Custom instructions cannot loosen what the code enforces. Codex must still reply in the JSON shape the binary expects. The binary still refuses to commit or push CI configuration changes, and it still checks conflict resolutions before it commits them.
 
-## Codex can check its own edits
+## Codex checks its edits with the checkout's own tools
 
-Before every Codex call, the binary installs the checkout's JavaScript dependencies so Codex can typecheck and test what it changes. The lockfile at the checkout root picks the command:
-
-| Lockfile | Command |
-|---|---|
-| `pnpm-lock.yaml` | `pnpm install --frozen-lockfile --prefer-offline` |
-| `package-lock.json` | `npm ci` |
-| `yarn.lock` | `yarn install --frozen-lockfile` |
-
-The binary runs the install itself, outside Codex's sandbox. It skips the install when the lockfile has not changed since the last install in that checkout. Codex runs with `--sandbox workspace-write`, has no network access, and may not install packages. It is told to run the narrowest type checks, linters, and tests that cover the files it changed. When the install fails, Codex is told that checks are unavailable and must say so. Installs run the repository's install scripts with your permissions, as a local install does.
+The binary never installs packages. Codex runs with `--sandbox workspace-write` and no network access, and it may not install packages either. Its default instructions tell it to edit files and run checks, so it uses whatever tools the checkout already has. In the app, set a repository's **Setup command**, such as `pnpm install`, so each new worktree has its dependencies before the first Codex call. When you run the CLI yourself, install dependencies in your checkout first.
 
 ## The merge waits for every gate
 
@@ -145,7 +136,7 @@ A lock file at `$(git rev-parse --git-dir)/baby-sitter/pr-<n>.lock` stops a seco
 
 The app keeps its configuration, one clone per repository, and one worktree per PR in `~/Library/Application Support/baby-sitter`. It runs `baby-sitter --gates` in the PR's worktree and reads the phase icons and status from its output. Child processes get the `PATH` from your login shell, so version-managed tools such as `nvm` work when the app opens from Finder.
 
-When a babysit starts, the app runs the repository's **Setup command**, if one is set and has not finished in that PR's worktree yet, as `/bin/sh -c "<command>"` in the worktree with the same `PATH`. It runs after the app releases the repository lock, so a long install does not hold up other babysits in the same repository. A stop or the deadline ends it like any other babysit step. After it succeeds, the app records the command under `setup/` in its data folder, outside the worktree, so later starts skip it until the command changes or the worktree is removed. A setup cut short by a quit or crash runs again on the next start. If it fails, the babysit stops with the command's last error line and the app removes the new worktree, so the next start creates the worktree and runs the setup again. The binary still installs JavaScript dependencies before each Codex call, as described above, and skips that install when the lockfile has not changed since its last install in that checkout.
+When a babysit starts, the app runs the repository's **Setup command**, if one is set and has not finished in that PR's worktree yet, as `/bin/sh -c "<command>"` in the worktree with the same `PATH`. It runs after the app releases the repository lock, so a long install does not hold up other babysits in the same repository. A stop or the deadline ends it like any other babysit step. After it succeeds, the app records the command under `setup/` in its data folder, outside the worktree, so later starts skip it until the command changes or the worktree is removed. A setup cut short by a quit or crash runs again on the next start. If it fails, the babysit stops with the command's last error line and the app removes the new worktree, so the next start creates the worktree and runs the setup again. The setup command is the only package install: the binary does not install dependencies itself.
 
 Stopping a babysit sends `SIGTERM` to its process group and sends `SIGKILL` to whatever is still running 10 seconds later. Quitting the app stops every babysit, and the next launch restarts them with their original deadlines.
 
