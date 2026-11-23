@@ -234,15 +234,27 @@ pub fn list_my_prs(env: &ChildEnv) -> Result<Vec<PrRow>> {
         .collect())
 }
 
-pub fn mark_ready(env: &ChildEnv, pr: &PrRef) -> Result<()> {
+#[derive(Clone, Copy)]
+pub enum GhPrAction {
+    Ready,
+    Draft,
+    Close,
+}
+
+pub fn pr_action(env: &ChildEnv, pr: &PrRef, action: GhPrAction) -> Result<()> {
     let mut command = env.command("gh");
     command.args([
         "pr",
-        "ready",
-        &pr.number.to_string(),
-        "--repo",
-        &pr.repo.to_string(),
+        match action {
+            GhPrAction::Ready | GhPrAction::Draft => "ready",
+            GhPrAction::Close => "close",
+        },
     ]);
+    command.arg(pr.number.to_string());
+    if matches!(action, GhPrAction::Draft) {
+        command.arg("--undo");
+    }
+    command.args(["--repo", &pr.repo.to_string()]);
     output(command)?;
     Ok(())
 }

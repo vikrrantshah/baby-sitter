@@ -302,19 +302,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn codex_calls_receive_preparation_results_and_check_instructions() {
-        use std::{
-            os::unix::fs::PermissionsExt,
-            time::{SystemTime, UNIX_EPOCH},
-        };
+        use std::os::unix::fs::PermissionsExt;
 
-        let root = std::env::temp_dir().join(format!(
-            "baby-sitter-codex-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = crate::test_support::unique_test_dir("baby-sitter-codex");
         fs::create_dir(&root).unwrap();
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();

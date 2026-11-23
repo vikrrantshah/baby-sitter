@@ -112,8 +112,8 @@ fn prepare_inner(root: &Path, state_dir: &Path, deadline: Instant) -> anyhow::Re
             return Err(error);
         }
         let text = format!("{error:#}");
-        let prefix = format!("{command:?} failed: ");
-        let reason = text.strip_prefix(&prefix).unwrap_or(&text);
+        let suffix = format!(" ({})", proc::command_label(&command));
+        let reason = text.strip_suffix(&suffix).unwrap_or(&text);
         return Ok(Prepared::Failed(failure_reason(reason)));
     }
     fs::write(&marker, hash).context("writing dependency hash")?;
@@ -146,23 +146,13 @@ pub fn codex_note(prepared: &Prepared) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        path::PathBuf,
-        time::{Duration, SystemTime, UNIX_EPOCH},
-    };
+    use std::{path::PathBuf, time::Duration};
 
     struct TestDir(PathBuf);
 
     impl TestDir {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "baby-sitter-deps-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+            let path = crate::test_support::unique_test_dir("baby-sitter-deps");
             fs::create_dir(&path).unwrap();
             Self(path)
         }
@@ -347,7 +337,7 @@ mod tests {
         let Prepared::Failed(reason) = run().unwrap() else {
             panic!("expected a missing installer failure");
         };
-        assert!(reason.contains("spawning"));
+        assert!(reason.contains(&std::io::Error::from_raw_os_error(2).to_string()));
         assert!(!state.join("deps.lock-hash").exists());
     }
 }

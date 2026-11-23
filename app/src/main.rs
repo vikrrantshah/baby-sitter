@@ -1,6 +1,7 @@
 mod gh;
 mod icons;
 mod model;
+mod notifications;
 mod sitter;
 mod store;
 mod theme;
@@ -80,6 +81,7 @@ fn run() -> anyhow::Result<()> {
                 cx.new(|cx| ui::AppView::new(data, config, env, registry, locks, window, cx))
             })
             .expect("open baby-sitter window");
+            notifications::init();
             cx.activate(true);
         });
     Ok(())
@@ -104,3 +106,25 @@ fn set_dock_icon() {
 }
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    /// Temporary directory path no other test uses, even within the same nanosecond.
+    pub(crate) fn unique_test_dir(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+}

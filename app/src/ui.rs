@@ -14,6 +14,7 @@ use gpui_kit::{
         Disableable, Icon, Selectable, Sizable, Size, WindowExt,
         button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
         input::{Input, InputEvent, InputState},
+        menu::{DropdownMenu, PopupMenuItem},
         notification::Notification,
         select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
         switch::Switch,
@@ -48,6 +49,39 @@ enum Field {
     Timeout,
     DraftTimeout,
     Interval,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowAction {
+    MarkReady,
+    ConvertToDraft,
+    Close,
+    CopyLink,
+}
+
+impl RowAction {
+    const ALL: [Self; 4] = [
+        Self::MarkReady,
+        Self::ConvertToDraft,
+        Self::Close,
+        Self::CopyLink,
+    ];
+
+    fn menu_item(self, is_open: bool, is_draft: bool, merged: bool) -> Option<&'static str> {
+        match self {
+            Self::MarkReady if is_open && is_draft && !merged => Some("Ready for review"),
+            Self::ConvertToDraft if is_open && !is_draft && !merged => Some("Convert to draft"),
+            Self::Close if is_open && !merged => Some("Close pull request…"),
+            Self::CopyLink => Some("Copy link"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClosedPr {
+    AwaitingSearch,
+    Confirmed,
 }
 struct RepoInputs {
     timeout: Entity<InputState>,
@@ -88,6 +122,7 @@ pub struct AppView {
     prs: Load<Vec<PrRow>>,
     /// Merged PRs dismissed while a GitHub search may still return an older snapshot.
     dismissed_merged: BTreeSet<PrRef>,
+    closed_prs: BTreeMap<PrRef, ClosedPr>,
     org_select: Entity<SelectState<Vec<PickerChoice<String>>>>,
     org_filter: Option<String>,
     /// Owner login to its downloaded profile picture.
@@ -113,7 +148,7 @@ pub struct AppView {
     repo_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
-    ready_tasks: BTreeMap<PrRef, Task<()>>,
+    pr_action_tasks: BTreeMap<PrRef, Task<()>>,
     removal_tasks: BTreeMap<PrRef, Task<()>>,
     sweep_task: Option<Task<()>>,
     sweep_pending: bool,
@@ -265,6 +300,7 @@ impl AppView {
             repos: Load::Loading,
             prs: Load::Loading,
             dismissed_merged: BTreeSet::new(),
+            closed_prs: BTreeMap::new(),
             org_select,
             org_filter: None,
             avatars: BTreeMap::new(),
@@ -287,7 +323,7 @@ impl AppView {
             repo_task: None,
             avatar_task: None,
             pr_task: None,
-            ready_tasks: BTreeMap::new(),
+            pr_action_tasks: BTreeMap::new(),
             removal_tasks: BTreeMap::new(),
             sweep_task: None,
             sweep_pending: false,
@@ -578,7 +614,21 @@ impl AppView {
                 match result {
                     Ok(mut prs) => {
                         this.refresh_error = None;
-                        prs.retain(|row| !this.dismissed_merged.contains(&row.pr));
+                        this.closed_prs.retain(|pr, state| {
+                            let found = prs.iter().any(|row| &row.pr == pr);
+                            match (*state, found) {
+                                (ClosedPr::AwaitingSearch, false) => {
+                                    *state = ClosedPr::Confirmed;
+                                    true
+                                }
+                                (ClosedPr::Confirmed, true) => false,
+                                _ => true,
+                            }
+                        });
+                        prs.retain(|row| {
+                            !this.dismissed_merged.contains(&row.pr)
+                                && !this.closed_prs.contains_key(&row.pr)
+                        });
                         this.prs = Load::Ready(prs);
                         this.sweep_worktrees(window, cx);
                     }
@@ -593,8 +643,14 @@ impl AppView {
             });
         }));
     }
-    fn mark_ready(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ready_tasks.contains_key(&pr) {
+    fn run_pr_action(
+        &mut self,
+        pr: PrRef,
+        action: gh::GhPrAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pr_action_tasks.contains_key(&pr) {
             return;
         }
         let env = self.env.clone();
@@ -602,31 +658,71 @@ impl AppView {
         let task = cx.spawn_in(window, async move |view, cx| {
             let request_pr = task_pr.clone();
             let result = cx
-                .background_spawn(async move { gh::mark_ready(&env, &request_pr) })
+                .background_spawn(async move { gh::pr_action(&env, &request_pr, action) })
                 .await;
             let _ = view.update_in(cx, |this, window, cx| {
-                this.ready_tasks.remove(&task_pr);
+                this.pr_action_tasks.remove(&task_pr);
                 match result {
                     Ok(()) => {
-                        if let Load::Ready(rows) = &mut this.prs
-                            && let Some(row) = rows.iter_mut().find(|row| row.pr == task_pr)
-                        {
-                            row.is_draft = false;
+                        if let Load::Ready(rows) = &mut this.prs {
+                            match action {
+                                gh::GhPrAction::Ready | gh::GhPrAction::Draft => {
+                                    if let Some(row) = rows.iter_mut().find(|row| row.pr == task_pr)
+                                    {
+                                        row.is_draft = matches!(action, gh::GhPrAction::Draft);
+                                    }
+                                }
+                                gh::GhPrAction::Close => {
+                                    rows.retain(|row| row.pr != task_pr);
+                                    this.closed_prs
+                                        .insert(task_pr.clone(), ClosedPr::AwaitingSearch);
+                                }
+                            }
                         }
+                        let message = match action {
+                            gh::GhPrAction::Ready => {
+                                format!("Marked #{} ready for review", task_pr.number)
+                            }
+                            gh::GhPrAction::Draft => {
+                                format!("Converted #{} to draft", task_pr.number)
+                            }
+                            gh::GhPrAction::Close => format!("Closed #{}", task_pr.number),
+                        };
+                        window.push_notification(Notification::success(message), cx);
                         this.load_prs(window, cx);
                     }
                     Err(error) => {
-                        this.error = Some(format!(
-                            "Could not mark #{} ready for review: {error}",
-                            task_pr.number
-                        ));
+                        let verb = match action {
+                            gh::GhPrAction::Ready => "mark",
+                            gh::GhPrAction::Draft => "convert",
+                            gh::GhPrAction::Close => "close",
+                        };
+                        this.error = Some(format!("Could not {verb} #{}: {error}", task_pr.number));
                     }
                 }
                 cx.notify();
             });
         });
-        self.ready_tasks.insert(pr, task);
+        self.pr_action_tasks.insert(pr, task);
         cx.notify();
+    }
+
+    fn ask_close(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Close #{}? You can reopen it on GitHub.", pr.number),
+            None,
+            &["Close", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            if answer.await.ok() == Some(0) {
+                let _ = view.update_in(cx, |this, window, cx| {
+                    this.run_pr_action(pr, gh::GhPrAction::Close, window, cx);
+                });
+            }
+        })
+        .detach();
     }
     fn sweep_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sweep_task.is_some() {
@@ -1311,6 +1407,9 @@ impl AppView {
             PrFilter::All,
             self.selected_filter.as_ref(),
         )
+        .into_iter()
+        .filter(|row| !self.closed_prs.contains_key(&row.pr))
+        .collect()
     }
     fn pr_row(&self, row: &PrRow, cx: &mut Context<Self>) -> AnyElement {
         let state = self.states.get(&row.pr);
@@ -1371,22 +1470,53 @@ impl AppView {
             .then(|| self.config.active.get(&row.pr))
             .flatten()
             .map(|deadline| time_left(deadline.saturating_sub(model::unix_now())));
-        let ready = row.is_draft.then(|| {
-            let pr = row.pr.clone();
-            round_button_with(
-                SharedString::from(format!("ready-{pr}")),
-                Icon::empty()
-                    .path("icons/git-pull-request-arrow.svg")
-                    .size(px(14.)),
-                "Ready for review",
-                muted(),
-                ink(),
-                cx,
-            )
-            .disabled(self.ready_tasks.contains_key(&pr))
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.mark_ready(pr.clone(), window, cx)),
-            )
+        let is_open =
+            matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|item| item.pr == row.pr));
+        let is_draft = row.is_draft;
+        let merged = reading.merged;
+        let menu_pr = row.pr.clone();
+        let menu_url = row.url.clone();
+        let view = cx.entity().downgrade();
+        let menu = round_button_with(
+            SharedString::from(format!("actions-{}", row.pr)),
+            Icon::empty().path("icons/ellipsis.svg").size(px(14.)),
+            "More actions",
+            muted(),
+            ink(),
+            cx,
+        )
+        .disabled(self.pr_action_tasks.contains_key(&row.pr))
+        .dropdown_menu(move |mut menu, _, _| {
+            for action in RowAction::ALL {
+                if let Some(label) = action.menu_item(is_open, is_draft, merged) {
+                    let pr = menu_pr.clone();
+                    let url = menu_url.clone();
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        if action == RowAction::CopyLink {
+                            copy_pr_link(&pr, &url, window, cx);
+                        } else {
+                            let _ = view.update(cx, |this, cx| match action {
+                                RowAction::MarkReady => this.run_pr_action(
+                                    pr.clone(),
+                                    gh::GhPrAction::Ready,
+                                    window,
+                                    cx,
+                                ),
+                                RowAction::ConvertToDraft => this.run_pr_action(
+                                    pr.clone(),
+                                    gh::GhPrAction::Draft,
+                                    window,
+                                    cx,
+                                ),
+                                RowAction::Close => this.ask_close(pr.clone(), window, cx),
+                                RowAction::CopyLink => {}
+                            });
+                        }
+                    }));
+                }
+            }
+            menu
         });
         let url = row.url.clone();
         let open = round_button(
@@ -1428,7 +1558,7 @@ impl AppView {
             });
         let place = format!("{} #{}", row.pr.repo, row.pr.number);
         let copy_url = row.url.clone();
-        let copy_message = format!("Copied link to {place}");
+        let copy_pr = row.pr.clone();
         let gates = self.gates.get(&row.pr);
         let status = reading.verb.map(|verb| {
             div()
@@ -1514,10 +1644,7 @@ impl AppView {
                     .cursor_pointer()
                     .hover(|style| style.text_color(ink()).underline())
                     .tooltip(|window, cx| Tooltip::new("Copy link").build(window, cx))
-                    .on_click(move |_, window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
-                        window.push_notification(Notification::success(copy_message.clone()), cx);
-                    })
+                    .on_click(move |_, window, cx| copy_pr_link(&copy_pr, &copy_url, window, cx))
                     .child(place),
             )
             .when_some(meta, |d, meta| d.child(meta));
@@ -1530,13 +1657,27 @@ impl AppView {
             .flex()
             .items_start()
             .gap(px(20.))
+            .child(match action {
+                Some(action) => action.into_any_element(),
+                None => div().size(px(34.)).into_any_element(),
+            })
             .child(content)
             .child(
                 div()
                     .flex_shrink_0()
                     .flex()
-                    .items_center()
-                    .gap(px(12.))
+                    .flex_col()
+                    .items_end()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(open)
+                            .when_some(dismiss, |d, dismiss| d.child(dismiss))
+                            .child(menu),
+                    )
                     .when_some(time_left, |d, left| {
                         d.child(
                             div()
@@ -1548,21 +1689,6 @@ impl AppView {
                                 .child(Icon::empty().path("icons/timer.svg").size(px(13.)))
                                 .child(left),
                         )
-                    })
-                    .map(|d| match (action, dismiss) {
-                        // The rightmost slot holds the row's main action; a merged row's is Dismiss.
-                        (None, Some(dismiss)) => d
-                            .when_some(ready, |d, ready| d.child(ready))
-                            .child(open)
-                            .child(dismiss),
-                        (action, dismiss) => d
-                            .when_some(dismiss, |d, dismiss| d.child(dismiss))
-                            .when_some(ready, |d, ready| d.child(ready))
-                            .child(open)
-                            .child(match action {
-                                Some(action) => action.into_any_element(),
-                                None => div().size(px(34.)).into_any_element(),
-                            }),
                     }),
             )
             .into_any_element()
@@ -1828,6 +1954,14 @@ impl AppView {
                 ),
             )
     }
+}
+
+fn copy_pr_link(pr: &PrRef, url: &str, window: &mut Window, cx: &mut App) {
+    cx.write_to_clipboard(ClipboardItem::new_string(url.to_owned()));
+    window.push_notification(
+        Notification::success(format!("Copied link to {} #{}", pr.repo, pr.number)),
+        cx,
+    );
 }
 
 /// A round icon-only button: tinted with `tint` at rest, filled further with `hover` under the pointer.
@@ -2208,5 +2342,30 @@ impl Render for AppView {
                     )
                     .child(div().flex_1().min_h_0().child(body)),
             )
+    }
+}
+
+#[cfg(test)]
+mod row_action_tests {
+    use super::RowAction;
+
+    #[test]
+    fn menu_matches_pull_request_state() {
+        let labels = |open, draft, merged| {
+            RowAction::ALL
+                .into_iter()
+                .filter_map(|action| action.menu_item(open, draft, merged))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(true, true, false),
+            ["Ready for review", "Close pull request…", "Copy link"]
+        );
+        assert_eq!(
+            labels(true, false, false),
+            ["Convert to draft", "Close pull request…", "Copy link"]
+        );
+        assert_eq!(labels(false, false, true), ["Copy link"]);
+        assert_eq!(labels(false, false, false), ["Copy link"]);
     }
 }

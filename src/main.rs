@@ -61,6 +61,22 @@ impl Observation {
         }
     }
 }
+const MAX_OBSERVE_FAILURES: u32 = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+enum FailureStep {
+    Retry(u32),
+    GiveUp,
+}
+
+fn after_failure(consecutive_failures: u32) -> FailureStep {
+    if consecutive_failures >= MAX_OBSERVE_FAILURES {
+        FailureStep::GiveUp
+    } else {
+        FailureStep::Retry(consecutive_failures)
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let deadline = match Instant::now().checked_add(cli.timeout) {
@@ -84,11 +100,38 @@ fn main() -> ExitCode {
 }
 fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
     let env = act::Env::new(cli.pr.as_deref(), cli.dry_run, deadline)?;
+    let mut consecutive_failures = 0;
     loop {
         if Instant::now() >= deadline {
             return Err(proc::TimedOut.into());
         }
-        let observation = Observation::take(&env)?;
+        let observation = match Observation::take(&env) {
+            Ok(observation) => {
+                consecutive_failures = 0;
+                observation
+            }
+            Err(error) => {
+                if error.downcast_ref::<proc::TimedOut>().is_some() {
+                    return Err(error);
+                }
+                consecutive_failures += 1;
+                let cause = format!("{error:#}");
+                eprintln!(
+                    "[snapshot] wait: GitHub request failed ({} of {}): {}",
+                    consecutive_failures,
+                    MAX_OBSERVE_FAILURES,
+                    cause.lines().next().unwrap_or("")
+                );
+                match after_failure(consecutive_failures) {
+                    FailureStep::GiveUp => return Err(error),
+                    FailureStep::Retry(_) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        std::thread::sleep(cli.interval.min(remaining));
+                        continue;
+                    }
+                }
+            }
+        };
         let facts = observation.facts(cli.merge_method);
         let decision = decide::decide(&facts);
         if cli.dry_run {
@@ -143,4 +186,39 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     n.checked_mul(factor)
         .map(Duration::from_secs)
         .ok_or_else(|| "duration overflow".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observation_failures_retry_twice_then_stop() {
+        assert_eq!(after_failure(1), FailureStep::Retry(1));
+        assert_eq!(after_failure(2), FailureStep::Retry(2));
+        assert_eq!(after_failure(3), FailureStep::GiveUp);
+        assert_eq!(after_failure(4), FailureStep::GiveUp);
+    }
+}
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    /// Temporary directory path no other test uses, even within the same nanosecond.
+    pub(crate) fn unique_test_dir(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 }

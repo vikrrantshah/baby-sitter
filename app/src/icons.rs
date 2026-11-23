@@ -25,6 +25,7 @@ filled! {
     "chevron-left" => "caret-left-fill.svg",
     "chevron-right" => "caret-right-fill.svg",
     "close" => "x-circle-fill.svg",
+    "ellipsis" => "dots-three-bold.svg",
     "folder-git-2" => "folder-simple-fill.svg",
     "folder-open" => "folder-open-fill.svg",
     "git-branch" => "git-branch-fill.svg",

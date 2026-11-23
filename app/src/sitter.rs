@@ -688,13 +688,13 @@ pub fn spawn(
         if QUITTING.load(Ordering::SeqCst) {
             return;
         }
-        notify(&runner.env, &runner.pr, &outcome);
+        notify(&runner.pr, &outcome);
         emit(&runner.tx, &runner.pr, SitState::Finished(outcome));
     });
     SitHandle { control }
 }
 
-fn notify(env: &ChildEnv, pr: &PrRef, outcome: &Outcome) {
+fn notify(pr: &PrRef, outcome: &Outcome) {
     let (status, body) = match outcome {
         Outcome::Merged => ("Merged", "Pull request merged"),
         Outcome::TimedOut => ("Timed out", "Babysitting timed out"),
@@ -702,22 +702,7 @@ fn notify(env: &ChildEnv, pr: &PrRef, outcome: &Outcome) {
         Outcome::Failed(reason) => ("Needs you", reason.lines().next_back().unwrap_or("")),
         Outcome::Cancelled => return,
     };
-    let _ = env
-        .command("/usr/bin/osascript")
-        .args([
-            "-e",
-            "on run argv",
-            "-e",
-            "display notification (item 2 of argv) with title (item 1 of argv)",
-            "-e",
-            "end run",
-            &format!("{pr}: {status}"),
-            body,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    crate::notifications::post(&format!("{pr}: {status}"), body);
 }
 
 #[cfg(test)]
@@ -792,14 +777,7 @@ mod tests {
 
     #[test]
     fn removes_worktree_with_untracked_files_and_branch() {
-        let data = std::env::temp_dir().join(format!(
-            "app-merged-worktree-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let data = crate::test_support::unique_test_dir("app-merged-worktree");
         let source = data.join("source");
         fs::create_dir_all(&source).unwrap();
         let run = |args: &[&str]| {
@@ -868,14 +846,7 @@ mod tests {
     }
 
     fn fixture(mode: &str) -> (Child, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "app-cancel-{}-{}-{mode}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::test_support::unique_test_dir(&format!("app-cancel-{mode}"));
         fs::create_dir_all(&dir).unwrap();
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cancel.sh");
         let mut child = Command::new("/bin/sh")
@@ -900,14 +871,7 @@ mod tests {
     }
     #[test]
     fn cancel_waits_for_group_after_leader_exits() {
-        let dir = std::env::temp_dir().join(format!(
-            "app-cancel-runner-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::test_support::unique_test_dir("app-cancel-runner");
         fs::create_dir_all(&dir).unwrap();
         let pr = PrRef {
             repo: "owner/repo".parse().unwrap(),

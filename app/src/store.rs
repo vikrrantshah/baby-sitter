@@ -70,18 +70,10 @@ pub fn lock_instance(dir: &Path) -> Result<Option<File>> {
 mod tests {
     use super::*;
     use crate::model::{PrRef, RepoName, RepoSettings};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn configuration_persists_and_instance_lock_is_exclusive() {
-        let dir = std::env::temp_dir().join(format!(
-            "app-store-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::test_support::unique_test_dir("app-store");
         let first = lock_instance(&dir).unwrap().unwrap();
         assert!(lock_instance(&dir).unwrap().is_none());
         let repo: RepoName = "owner/repo".parse().unwrap();

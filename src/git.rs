@@ -370,14 +370,7 @@ mod tests {
 
     impl TestRepo {
         fn new(conflict: Option<&str>, base_ci: bool) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "baby-sitter-merge-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+            let root = crate::test_support::unique_test_dir("baby-sitter-merge");
             let work = root.join("work");
             fs::create_dir_all(&work).unwrap();
             let git = Git {
@@ -803,14 +796,7 @@ mod tests {
     fn committed_ci_changes_detects_files_added_by_a_commit_hook() {
         use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 
-        let root = std::env::temp_dir().join(format!(
-            "baby-sitter-ci-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = crate::test_support::unique_test_dir("baby-sitter-ci");
         fs::create_dir(&root).unwrap();
         let git = Git {
             git_dir: root.join(".git"),
@@ -862,14 +848,7 @@ mod tests {
     fn only_own_commits_since_accepts_baby_sitter_commits_and_rejects_yours() {
         use std::{fs, time::Duration};
 
-        let root = std::env::temp_dir().join(format!(
-            "baby-sitter-own-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = crate::test_support::unique_test_dir("baby-sitter-own");
         fs::create_dir(&root).unwrap();
         let git = Git {
             git_dir: root.join(".git"),

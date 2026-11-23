@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
 #[derive(Debug)]
@@ -25,25 +25,81 @@ fn run_with_limit(
     deadline: Instant,
     stdout_limit: Option<usize>,
 ) -> anyhow::Result<String> {
-    let (ok, stdout, stderr) = output(cmd, input, deadline, stdout_limit)?;
-    if !ok {
-        bail!("{cmd:?} failed: {stderr}");
+    let (status, stdout, stderr) = output(cmd, input, deadline, stdout_limit)?;
+    if !status.success() {
+        let cause = stderr.trim();
+        if cause.is_empty() {
+            bail!("{status} ({})", command_label(cmd));
+        }
+        bail!("{cause} ({})", command_label(cmd));
     }
     Ok(stdout)
 }
 pub fn succeeds(cmd: &mut Command, deadline: Instant) -> anyhow::Result<bool> {
-    let (ok, _, stderr) = output(cmd, None, deadline, None)?;
-    if !ok && !stderr.trim().is_empty() {
-        bail!("{cmd:?} failed: {stderr}");
+    let (status, _, stderr) = output(cmd, None, deadline, None)?;
+    if !status.success() && !stderr.trim().is_empty() {
+        bail!("{} ({})", stderr.trim(), command_label(cmd));
     }
-    Ok(ok)
+    Ok(status.success())
+}
+pub(crate) fn command_label(cmd: &Command) -> String {
+    let program = std::path::Path::new(cmd.get_program())
+        .file_name()
+        .unwrap_or(cmd.get_program())
+        .to_string_lossy();
+    let mut label = program.to_string();
+    let mut args = cmd.get_args().filter_map(|arg| arg.to_str());
+    if let Some(first) = args.next() {
+        let known = match program.as_ref() {
+            "gh" => matches!(first, "api" | "pr" | "run"),
+            "git" => matches!(
+                first,
+                "rev-parse"
+                    | "symbolic-ref"
+                    | "config"
+                    | "status"
+                    | "diff"
+                    | "rev-list"
+                    | "show"
+                    | "fetch"
+                    | "merge-base"
+                    | "merge"
+                    | "ls-files"
+                    | "add"
+                    | "commit"
+                    | "push"
+                    | "log"
+            ),
+            "codex" => first == "exec",
+            "npm" => first == "ci",
+            "pnpm" | "yarn" => first == "install",
+            _ => false,
+        };
+        if known {
+            label.push(' ');
+            label.push_str(first);
+            if program == "gh"
+                && let Some(second) = args.next()
+                && matches!(
+                    (first, second),
+                    ("api", "graphql")
+                        | ("pr", "view" | "update-branch" | "merge")
+                        | ("run", "rerun")
+                )
+            {
+                label.push(' ');
+                label.push_str(second);
+            }
+        }
+    }
+    label
 }
 fn output(
     cmd: &mut Command,
     input: Option<&str>,
     deadline: Instant,
     stdout_limit: Option<usize>,
-) -> anyhow::Result<(bool, String, String)> {
+) -> anyhow::Result<(ExitStatus, String, String)> {
     if Instant::now() >= deadline {
         return Err(TimedOut.into());
     }
@@ -53,7 +109,9 @@ fn output(
     } else {
         Stdio::null()
     });
-    let mut child = cmd.spawn().with_context(|| format!("spawning {cmd:?}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("{error} ({})", command_label(cmd)))?;
     let mut stdout = child.stdout.take().context("stdout pipe")?;
     let mut stderr = child.stderr.take().context("stderr pipe")?;
     let (out_tx, out_rx) = std::sync::mpsc::channel();
@@ -99,7 +157,7 @@ fn output(
     let stderr = err_rx
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| TimedOut)?;
-    Ok((status.success(), utf8_lossy(stdout), utf8_lossy(stderr)))
+    Ok((status, utf8_lossy(stdout), utf8_lossy(stderr)))
 }
 
 fn read_tail(reader: &mut impl Read, limit: usize) -> Vec<u8> {
@@ -125,6 +183,33 @@ fn utf8_lossy(bytes: Vec<u8>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failures_lead_with_cause_and_hide_command_values() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf 'network unavailable\\n' >&2; exit 1"]);
+        let error = run(&mut cmd, None, Instant::now() + Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "network unavailable (sh)");
+
+        let mut gh = Command::new("gh");
+        gh.args(["api", "graphql", "-f", "query=secret-long-query"]);
+        assert_eq!(command_label(&gh), "gh api graphql");
+        let mut git = Command::new("git");
+        git.args(["push", "secret-token"]);
+        assert_eq!(command_label(&git), "git push");
+    }
+
+    #[test]
+    fn failure_without_stderr_reports_exit_status() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 7"]);
+        let error = run(&mut cmd, None, Instant::now() + Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "exit status: 7 (sh)");
+    }
 
     #[test]
     fn captures_only_the_end_of_large_process_output() {
