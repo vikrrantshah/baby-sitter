@@ -271,14 +271,9 @@ const RULES: &[Rule] = &[
         eval: dequeued,
     },
     Rule {
-        name: "merge-state",
+        name: "review-decision",
         stage: Stage::Phase(Gate::Merge),
-        eval: merge_state,
-    },
-    Rule {
-        name: "unresolved-threads",
-        stage: Stage::Phase(Gate::Merge),
-        eval: unresolved_threads,
+        eval: review_decision,
     },
     Rule {
         name: "review-requests",
@@ -286,14 +281,19 @@ const RULES: &[Rule] = &[
         eval: review_requests,
     },
     Rule {
-        name: "review-decision",
+        name: "unresolved-threads",
         stage: Stage::Phase(Gate::Merge),
-        eval: review_decision,
+        eval: unresolved_threads,
     },
     Rule {
         name: "draft",
         stage: Stage::Phase(Gate::Merge),
         eval: draft,
+    },
+    Rule {
+        name: "merge-state",
+        stage: Stage::Phase(Gate::Merge),
+        eval: merge_state,
     },
 ];
 /// Phase identifiers in wire order, as reported by `--gates`.
@@ -698,7 +698,9 @@ fn merge_state(f: &Facts<'_>) -> Option<Verdict> {
         state => Some(Verdict::Wait(
             match state {
                 MergeState::Behind => "Branch is behind its base",
-                MergeState::Blocked => "Waiting for branch protection rules to allow the merge",
+                MergeState::Blocked => {
+                    "Waiting: GitHub blocks the merge without naming a missing review, check, or thread"
+                }
                 MergeState::Dirty => "PR has merge conflicts with its base branch",
                 MergeState::Unknown => "Waiting for GitHub to work out the merge state",
                 MergeState::Unstable => "Waiting: some checks are failing or still running",
@@ -729,15 +731,47 @@ fn review_requests(f: &Facts<'_>) -> Option<Verdict> {
         })
 }
 fn review_decision(f: &Facts<'_>) -> Option<Verdict> {
-    match f.snap.review_decision {
+    let mut message = match f.snap.review_decision {
         Some(ReviewDecision::ChangesRequested) => {
-            Some(Verdict::Wait("Waiting: changes were requested".into()))
+            let mut seen = BTreeSet::new();
+            let mut requested = Vec::new();
+            for review in f.snap.reviews.iter().rev() {
+                if let Actor::Human(login) = &review.actor
+                    && matches!(
+                        review.state,
+                        ReviewState::Approved
+                            | ReviewState::ChangesRequested
+                            | ReviewState::Dismissed
+                    )
+                    && seen.insert(login)
+                    && review.state == ReviewState::ChangesRequested
+                {
+                    requested.push(login.0.as_str());
+                }
+            }
+            requested.reverse();
+            if requested.is_empty() {
+                "Waiting: changes were requested".to_owned()
+            } else {
+                format!("Waiting: {} requested changes", names(requested.iter()))
+            }
         }
-        Some(ReviewDecision::ReviewRequired) => {
-            Some(Verdict::Wait("Waiting for an approving review".into()))
-        }
-        _ => None,
+        Some(ReviewDecision::ReviewRequired) => "Waiting for an approving review".to_owned(),
+        _ => return None,
+    };
+    if !f.snap.review_requests.is_empty() {
+        use std::borrow::Cow;
+        let reviewers = f
+            .snap
+            .review_requests
+            .iter()
+            .map(|reviewer| match reviewer {
+                Reviewer::User(login) | Reviewer::Bot(login) => Cow::Borrowed(login.0.as_str()),
+                _ => Cow::Owned(reviewer.to_string()),
+            });
+        message.push_str(&format!(". Review requested from {}", names(reviewers)));
     }
+    Some(Verdict::Wait(message))
 }
 fn unhandled(s: &Snapshot) -> Batch {
     let rereview = |a: &Actor| match a {
@@ -787,6 +821,97 @@ fn unhandled(s: &Snapshot) -> Batch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn human_review(name: &str, state: ReviewState) -> Review {
+        Review {
+            actor: Actor::Human(Login(name.into())),
+            state,
+        }
+    }
+
+    #[test]
+    fn latest_decisive_human_reviews_name_the_blocker() {
+        let mut w = World::new();
+        w.snap.merge_state = MergeState::Blocked;
+        w.snap.review_decision = Some(ReviewDecision::ChangesRequested);
+        w.snap.reviews = vec![
+            human_review("muslemomar", ReviewState::ChangesRequested),
+            human_review("windeko", ReviewState::ChangesRequested),
+            human_review("muslemomar", ReviewState::Approved),
+            human_review("windeko", ReviewState::Commented),
+            human_review("windeko", ReviewState::Pending),
+        ];
+        w.snap.review_requests = vec![
+            Reviewer::User(Login("mohsen89z".into())),
+            Reviewer::User(Login("windeko".into())),
+        ];
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "review-decision",
+                verdict: Verdict::Wait("Waiting: windeko requested changes. Review requested from mohsen89z and windeko".into()),
+            }
+        );
+        assert_eq!(w.gates().get(Gate::Merge), GateState::Waiting);
+    }
+
+    #[test]
+    fn changes_requested_names_follow_their_latest_decisive_reviews() {
+        let mut w = World::new();
+        w.snap.review_decision = Some(ReviewDecision::ChangesRequested);
+        w.snap.reviews = vec![
+            human_review("alice", ReviewState::ChangesRequested),
+            human_review("bob", ReviewState::ChangesRequested),
+            human_review("alice", ReviewState::ChangesRequested),
+            Review {
+                actor: Actor::Bot(Login("bot".into())),
+                state: ReviewState::ChangesRequested,
+            },
+        ];
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Wait("Waiting: bob and alice requested changes".into())
+        );
+    }
+
+    #[test]
+    fn unidentified_changes_and_approval_requests_are_explained() {
+        let mut w = World::new();
+        w.snap.review_decision = Some(ReviewDecision::ChangesRequested);
+        w.snap.reviews = vec![
+            human_review("alice", ReviewState::ChangesRequested),
+            human_review("alice", ReviewState::Dismissed),
+        ];
+        w.snap.review_requests = vec![Reviewer::User(Login("x".into()))];
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Wait("Waiting: changes were requested. Review requested from x".into())
+        );
+        w.snap.review_decision = Some(ReviewDecision::ReviewRequired);
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "review-decision",
+                verdict: Verdict::Wait(
+                    "Waiting for an approving review. Review requested from x".into()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn unexplained_github_block_is_the_fallback() {
+        let mut w = World::new();
+        w.snap.merge_state = MergeState::Blocked;
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "merge-state",
+                verdict: Verdict::Wait("Waiting: GitHub blocks the merge without naming a missing review, check, or thread".into()),
+            }
+        );
+        assert_eq!(w.gates().get(Gate::Merge), GateState::Waiting);
+    }
+
     #[test]
     fn name_lists_limit_the_displayed_names() {
         let all = ["a", "b", "c", "d", "e"];
