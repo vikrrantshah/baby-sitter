@@ -1,4 +1,4 @@
-use crate::model::{Config, Defaults};
+use crate::model::{Config, Defaults, Prompts};
 use anyhow::{Context, Result, bail};
 use std::{
     fs::{self, File, OpenOptions},
@@ -64,6 +64,29 @@ pub fn save(dir: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
+pub fn write_prompts(dir: &Path, prompts: &Prompts) -> Result<()> {
+    let path = dir.join("prompts.json");
+    if prompts.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).with_context(|| format!("remove {}", path.display())),
+        }
+    }
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let tmp = dir.join(format!(".prompts-{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(prompts.render_json()?.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&tmp, &path).with_context(|| format!("save {}", path.display()))?;
+    Ok(())
+}
+
 pub fn lock_instance(dir: &Path) -> Result<Option<File>> {
     use std::os::fd::AsRawFd;
     fs::create_dir_all(dir)?;
@@ -88,6 +111,32 @@ pub fn lock_instance(dir: &Path) -> Result<Option<File>> {
 mod tests {
     use super::*;
     use crate::model::{PrRef, RepoName, RepoSettings};
+
+    #[test]
+    fn prompt_file_tracks_overrides() {
+        let dir = crate::test_support::unique_test_dir("app-prompts");
+        let prompts = Prompts {
+            review: crate::model::CustomPrompt {
+                enabled: true,
+                text: Some("review this".into()),
+            },
+            ..Prompts::default()
+        };
+        write_prompts(&dir, &prompts).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("prompts.json")).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"review": "review this"}));
+        write_prompts(&dir, &Prompts::default()).unwrap();
+        assert!(!dir.join("prompts.json").exists());
+        write_prompts(&dir, &Prompts::default()).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn older_config_has_no_prompt_overrides() {
+        let config: Config = serde_json::from_str(r#"{"app": {}, "repos": {}}"#).unwrap();
+        assert_eq!(config.prompts, Prompts::default());
+    }
 
     #[test]
     fn legacy_defaults_become_inherited_and_custom_values_are_preserved() {

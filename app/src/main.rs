@@ -2,6 +2,7 @@ mod gh;
 mod icons;
 mod model;
 mod notifications;
+mod setup;
 mod sitter;
 mod store;
 mod theme;

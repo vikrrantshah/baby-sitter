@@ -665,6 +665,7 @@ impl Runner {
                     "--gates",
                 ])
                 .current_dir(worktree_path(&self.data, &self.pr));
+            command.arg("--prompts").arg(self.data.join("prompts.json"));
             let output = self.run(command, ProcessMode::Sit)?;
             if model::lock_held(output.status.code(), &output.stderr)
                 && output.interrupted.is_none()

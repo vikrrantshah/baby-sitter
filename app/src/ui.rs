@@ -4,6 +4,7 @@ use crate::{
         self, Config, Defaults, GateState, Outcome, PastSit, PrFilter, PrRef, PrRow, PrState,
         RepoListItem, RepoName, RepoScope, RepoSettings, SitState, VerdictKind,
     },
+    setup::{self, CheckSpec, CheckState},
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
     theme::{accent, danger, divider, ink, muted, panel, raised, success, surface, warning},
@@ -13,10 +14,11 @@ use gpui_kit::{
     component::{
         Disableable, Icon, Selectable, Sizable, Size, WindowExt,
         button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
-        input::{Input, InputEvent, InputState},
+        input::{Input, InputEvent, InputState, Textarea, TextareaState},
         menu::{DropdownMenu, PopupMenuItem},
         notification::Notification,
         select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
+        spinner::Spinner,
         switch::Switch,
         tooltip::Tooltip,
     },
@@ -43,6 +45,8 @@ enum Page {
 enum SettingsPage {
     Repositories,
     App,
+    Prompts,
+    Status,
     Repo(RepoName),
 }
 #[derive(Clone, Copy)]
@@ -118,6 +122,63 @@ enum ClosedPr {
     AwaitingSearch,
     Confirmed,
 }
+#[derive(serde::Deserialize)]
+struct PromptDefaults {
+    review: String,
+    ci: String,
+    conflicts: String,
+}
+
+#[derive(Clone, Copy)]
+enum PromptKind {
+    Review,
+    Ci,
+    Conflicts,
+}
+
+impl PromptKind {
+    const ALL: [Self; 3] = [Self::Review, Self::Ci, Self::Conflicts];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Review => 0,
+            Self::Ci => 1,
+            Self::Conflicts => 2,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Review => "Review threads",
+            Self::Ci => "Failing CI",
+            Self::Conflicts => "Merge conflicts",
+        }
+    }
+
+    fn switch_label(self) -> &'static str {
+        match self {
+            Self::Review => "Custom review prompt",
+            Self::Ci => "Custom CI fix prompt",
+            Self::Conflicts => "Custom conflict prompt",
+        }
+    }
+
+    fn value(self, prompts: &mut model::Prompts) -> &mut model::CustomPrompt {
+        match self {
+            Self::Review => &mut prompts.review,
+            Self::Ci => &mut prompts.ci,
+            Self::Conflicts => &mut prompts.conflicts,
+        }
+    }
+}
+
+struct PromptEditor {
+    input: Entity<TextareaState>,
+    default: String,
+    error: Option<String>,
+    _subscription: Subscription,
+}
+
 struct RepoInputs {
     timeout: Entity<InputState>,
     draft_timeout: Entity<InputState>,
@@ -173,6 +234,7 @@ pub struct AppView {
     page: Page,
     repos: Load<Vec<RepoName>>,
     prs: Load<Vec<PrRow>>,
+    setup: Load<Vec<(&'static CheckSpec, CheckState)>>,
     titles: BTreeMap<PrRef, String>,
     /// Merged PRs dismissed while a GitHub search may still return an older snapshot.
     dismissed_merged: BTreeSet<PrRef>,
@@ -187,6 +249,8 @@ pub struct AppView {
     dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
     selected_filter: Option<RepoName>,
     app_inputs: RepoInputs,
+    prompt_editors: Load<Vec<PromptEditor>>,
+    prompt_task: Option<Task<()>>,
     clear_merged_input: Entity<InputState>,
     clear_merged_error: Option<String>,
     inputs: BTreeMap<RepoName, RepoInputs>,
@@ -206,6 +270,7 @@ pub struct AppView {
     repo_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
+    setup_task: Option<Task<()>>,
     pr_action_tasks: BTreeMap<PrRef, Task<()>>,
     removal_tasks: BTreeMap<PrRef, Task<()>>,
     sweep_task: Option<Task<()>>,
@@ -239,6 +304,10 @@ impl AppView {
         } else {
             None
         };
+        let error = store::write_prompts(&data, &config.prompts)
+            .err()
+            .map(|e| format!("Could not write prompts: {e:#}"))
+            .or(error);
         let dashboard_filter = cx.new(|cx| {
             SelectState::new(
                 vec![PickerChoice::all("All repositories", IconName::BookMarked)],
@@ -404,6 +473,7 @@ impl AppView {
             page: Page::PullRequests,
             repos: Load::Loading,
             prs: Load::Loading,
+            setup: Load::Loading,
             titles,
             dismissed_merged: BTreeSet::new(),
             closed_prs: BTreeMap::new(),
@@ -416,6 +486,8 @@ impl AppView {
             dashboard_filter,
             selected_filter: None,
             app_inputs,
+            prompt_editors: Load::Loading,
+            prompt_task: None,
             clear_merged_input,
             clear_merged_error: None,
             inputs: BTreeMap::new(),
@@ -437,6 +509,7 @@ impl AppView {
             repo_task: None,
             avatar_task: None,
             pr_task: None,
+            setup_task: None,
             pr_action_tasks: BTreeMap::new(),
             removal_tasks: BTreeMap::new(),
             sweep_task: None,
@@ -449,16 +522,20 @@ impl AppView {
         for (repo, settings) in this.config.repos.clone() {
             this.add_inputs(repo, &settings, window, cx);
         }
+        this.load_prompt_defaults(window, cx);
         for (pr, deadline) in this.config.active.clone() {
             this.resume(pr, deadline);
         }
         this.dismiss_merged_history(window, cx);
         this.update_filter(window, cx);
         this.refresh(window, cx);
+        this.load_setup(window, cx);
         this
     }
     fn save(&mut self) -> bool {
-        match store::save(&self.data, &self.config) {
+        match store::write_prompts(&self.data, &self.config.prompts)
+            .and_then(|()| store::save(&self.data, &self.config))
+        {
             Ok(()) => {
                 self.error = None;
                 true
@@ -469,6 +546,146 @@ impl AppView {
             }
         }
     }
+    fn load_prompt_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let env = self.env.clone();
+        self.prompt_task = Some(cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let result = (|| -> anyhow::Result<PromptDefaults> {
+                        use anyhow::{Context as _, bail};
+                        let cli = std::env::current_exe()?
+                            .parent()
+                            .context("executable has no parent")?
+                            .join("baby-sitter");
+                        let output = env
+                            .command(cli)
+                            .arg("--print-default-prompts")
+                            .output()
+                            .context("start baby-sitter")?;
+                        if !output.status.success() {
+                            bail!(
+                                "baby-sitter exited {}: {}",
+                                output.status,
+                                String::from_utf8_lossy(&output.stderr).trim()
+                            );
+                        }
+                        serde_json::from_slice(&output.stdout).context("parse default prompts")
+                    })();
+                    result.map_err(|error| format!("{error:#}"))
+                })
+                .await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.prompt_editors = match result {
+                    Err(error) => Load::Error(error),
+                    Ok(defaults) => {
+                        let defaults = [defaults.review, defaults.ci, defaults.conflicts];
+                        let editors = PromptKind::ALL
+                            .into_iter()
+                            .zip(defaults)
+                            .map(|(kind, default)| {
+                                let value = kind
+                                    .value(&mut this.config.prompts)
+                                    .text
+                                    .clone()
+                                    .unwrap_or_else(|| default.clone());
+                                let input = cx
+                                    .new(|cx| TextareaState::new(window, cx).default_value(value));
+                                let subscription = cx.subscribe(
+                                    &input,
+                                    |this: &mut Self, _, event: &InputEvent, cx| {
+                                        if matches!(event, InputEvent::Change) {
+                                            let _ = this;
+                                            cx.notify();
+                                        }
+                                    },
+                                );
+                                PromptEditor {
+                                    input,
+                                    default,
+                                    error: None,
+                                    _subscription: subscription,
+                                }
+                            })
+                            .collect();
+                        Load::Ready(editors)
+                    }
+                };
+                cx.notify();
+            });
+        }));
+    }
+
+    fn save_prompt(
+        &mut self,
+        kind: PromptKind,
+        reset: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Load::Ready(editors) = &mut self.prompt_editors else {
+            return;
+        };
+        let editor = &mut editors[kind.index()];
+        let text = if reset {
+            editor.default.clone()
+        } else {
+            editor.input.read(cx).value().to_string()
+        };
+        if text.trim().is_empty() {
+            editor.error = Some("A prompt can't be empty. Use Reset to default.".into());
+            cx.notify();
+            return;
+        }
+        editor.error = None;
+        let value = (!reset).then_some(text.clone());
+        let previous = std::mem::replace(&mut kind.value(&mut self.config.prompts).text, value);
+        if self.save() {
+            if reset && let Load::Ready(editors) = &self.prompt_editors {
+                editors[kind.index()]
+                    .input
+                    .update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        } else {
+            kind.value(&mut self.config.prompts).text = previous;
+            if let Err(error) = store::write_prompts(&self.data, &self.config.prompts) {
+                self.error = Some(format!("Could not restore prompts: {error:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_prompt(
+        &mut self,
+        kind: PromptKind,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = kind.value(&mut self.config.prompts);
+        let previous = prompt.enabled;
+        prompt.enabled = enabled;
+        if !self.save() {
+            kind.value(&mut self.config.prompts).enabled = previous;
+            if let Err(error) = store::write_prompts(&self.data, &self.config.prompts) {
+                self.error = Some(format!("Could not restore prompts: {error:#}"));
+            }
+        } else if enabled {
+            let prompt = kind.value(&mut self.config.prompts);
+            if let Load::Ready(editors) = &mut self.prompt_editors {
+                let editor = &mut editors[kind.index()];
+                let text = prompt
+                    .text
+                    .clone()
+                    .unwrap_or_else(|| editor.default.clone());
+                editor.error = None;
+                editor
+                    .input
+                    .update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
     fn duration_inputs(
         target: DurationTarget,
         values: [Option<Duration>; 3],
@@ -1512,6 +1729,149 @@ impl AppView {
         );
         (header, body)
     }
+    fn render_prompts(&self, cx: &mut Context<Self>) -> (Div, Div) {
+        let header = self
+            .settings_header("Prompts", None, cx)
+            .border_b_1()
+            .border_color(divider());
+        let mut content = div().px(px(ROW_INSET)).py(px(28.)).w_full().max_w(px(800.))
+            .flex().flex_col().gap(px(24.))
+            .child(div().text_size(px(13.)).line_height(relative(1.4)).text_color(muted())
+                .child("Codex gets these instructions, followed by the review threads, failing checks, or conflicted files. The safety checks in Baby Sitter apply whatever the instructions say: it never commits CI configuration changes and checks conflict resolutions before pushing."))
+            .child(div().text_size(px(12.)).text_color(muted())
+                .child("Changes apply to running babysits at their next Codex call."));
+        match &self.prompt_editors {
+            Load::Loading => content = content.child("Loading prompts…"),
+            Load::Error(error) => {
+                content = content.child(
+                    div()
+                        .text_color(danger())
+                        .child(format!("Could not load default prompts: {error}")),
+                )
+            }
+            Load::Ready(editors) => {
+                for kind in PromptKind::ALL {
+                    let editor = &editors[kind.index()];
+                    let prompt = match kind {
+                        PromptKind::Review => &self.config.prompts.review,
+                        PromptKind::Ci => &self.config.prompts.ci,
+                        PromptKind::Conflicts => &self.config.prompts.conflicts,
+                    };
+                    let current = editor.input.read(cx).value();
+                    let saved_text = prompt.text.as_deref().unwrap_or(&editor.default);
+                    let dirty = current.as_ref() != saved_text;
+                    let id = kind.index();
+                    let switch = Switch::new(("custom-prompt", id))
+                        .accessibility_label(kind.switch_label())
+                        .checked(prompt.enabled)
+                        .on_click(cx.listener(move |this, checked, window, cx| {
+                            this.toggle_prompt(kind, *checked, window, cx);
+                        }));
+                    content = content.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .font_semibold()
+                                    .text_size(px(16.))
+                                    .text_color(ink())
+                                    .child(kind.title()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(16.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .font_semibold()
+                                            .text_size(px(14.))
+                                            .text_color(ink())
+                                            .child(kind.switch_label()),
+                                    )
+                                    .child(switch),
+                            )
+                            .when(!prompt.enabled, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(muted())
+                                        .child("Using the default prompt."),
+                                )
+                            })
+                            .when(prompt.enabled, |d| {
+                                d.when(prompt.text.is_none(), |d| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(muted())
+                                            .child("Save to use this prompt."),
+                                    )
+                                })
+                                .child(
+                                    Textarea::new(&editor.input)
+                                        .w_full()
+                                        .h(px(200.))
+                                        .aria_label(kind.title()),
+                                )
+                                .when_some(editor.error.clone(), |d, error| {
+                                    d.child(
+                                        div().text_size(px(12.)).text_color(danger()).child(error),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            Button::new(("save-prompt", id))
+                                                .label("Save")
+                                                .disabled(!dirty && prompt.text.is_some())
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.save_prompt(kind, false, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                        .when(dirty, |d| {
+                                            d.child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .text_color(muted())
+                                                    .child("Unsaved changes"),
+                                            )
+                                        })
+                                        .child(
+                                            Button::new(("reset-prompt", id))
+                                                .label("Reset to default")
+                                                .outline()
+                                                .disabled(prompt.text.is_none() && !dirty)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.save_prompt(kind, true, window, cx)
+                                                    },
+                                                )),
+                                        ),
+                                )
+                            }),
+                    );
+                }
+            }
+        }
+        let body = div().size_full().child(
+            div()
+                .id("prompts-settings-form")
+                .size_full()
+                .overflow_y_scroll()
+                .child(content),
+        );
+        (header, body)
+    }
+
     fn render_app_settings(&self, cx: &mut Context<Self>) -> (Div, Div) {
         let header = self
             .settings_header("App", None, cx)
@@ -2312,6 +2672,18 @@ impl AppView {
                                 IconName::BookMarked,
                                 SettingsPage::Repositories,
                             ),
+                            (
+                                "nav-prompts",
+                                "Prompts",
+                                IconName::MessageSquare,
+                                SettingsPage::Prompts,
+                            ),
+                            (
+                                "nav-status",
+                                "Status",
+                                IconName::Check,
+                                SettingsPage::Status,
+                            ),
                         ]
                         .into_iter()
                         .map(|(id, label, icon, page)| {
@@ -2324,6 +2696,12 @@ impl AppView {
                                 ),
                                 SettingsPage::App => {
                                     matches!(self.page, Page::Settings(SettingsPage::App))
+                                }
+                                SettingsPage::Prompts => {
+                                    matches!(self.page, Page::Settings(SettingsPage::Prompts))
+                                }
+                                SettingsPage::Status => {
+                                    matches!(self.page, Page::Settings(SettingsPage::Status))
                                 }
                                 SettingsPage::Repo(_) => false,
                             };
@@ -2362,6 +2740,211 @@ impl AppView {
                         }),
                     ),
             )
+    }
+}
+
+impl AppView {
+    fn load_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.setup, Load::Loading) && self.setup_task.is_some() {
+            return;
+        }
+        self.setup = Load::Loading;
+        let env = self.env.clone();
+        self.setup_task = Some(cx.spawn_in(window, async move |view, cx| {
+            let results = cx
+                .background_spawn(async move { setup::run_all(&env) })
+                .await;
+            let _ = view.update_in(cx, |this, _, cx| {
+                this.setup = Load::Ready(results);
+                this.setup_task = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn status_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let Load::Ready(results) = &self.setup else {
+            return None;
+        };
+        let mut failures = results
+            .iter()
+            .filter(|(spec, state)| spec.required && !matches!(state, CheckState::Ok(_)));
+        let (first, _) = failures.next()?;
+        let more = failures.count();
+        let text = if more == 0 {
+            format!("Baby Sitter isn't ready: {} needs attention.", first.label)
+        } else {
+            format!(
+                "Baby Sitter isn't ready: {} and {more} more need attention.",
+                first.label
+            )
+        };
+        Some(
+            div()
+                .px(px(ROW_INSET))
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .bg(warning().opacity(0.12))
+                .text_color(warning())
+                .text_size(px(13.))
+                .child(div().flex_1().min_w_0().text_ellipsis().child(text))
+                .child(
+                    Button::new("open-status")
+                        .label("Open Status")
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page = Page::Settings(SettingsPage::Status);
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+
+    fn render_status(&self, cx: &mut Context<Self>) -> (Div, Div) {
+        let header = self
+            .settings_header(
+                "Status",
+                Some("What Baby Sitter needs on this Mac. Checks use the same PATH as babysits."),
+                cx,
+            )
+            .child(
+                div()
+                    .px(px(ROW_INSET))
+                    .pb(px(12.))
+                    .flex()
+                    .justify_end()
+                    .child(
+                        Button::new("check-again")
+                            .label("Check again")
+                            .outline()
+                            .disabled(matches!(self.setup, Load::Loading))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.load_setup(window, cx)),
+                            ),
+                    ),
+            );
+        let mut body = div()
+            .id("status-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .px(px(ROW_INSET))
+            .pb(px(24.));
+        match &self.setup {
+            Load::Loading => {
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .py(px(20.))
+                        .text_color(muted())
+                        .child(Spinner::new().small())
+                        .child("Checking tools and sign-ins…"),
+                );
+            }
+            Load::Error(error) => {
+                body = body.child(div().text_color(danger()).child(error.clone()));
+            }
+            Load::Ready(results) => {
+                for (required, title) in [(true, "Required"), (false, "Optional")] {
+                    body = body.child(div().pt(px(20.)).pb(px(8.)).font_semibold().child(title));
+                    for (spec, state) in
+                        results.iter().filter(|(spec, _)| spec.required == required)
+                    {
+                        let (detail, fix, badge) = match state {
+                            CheckState::Ok(detail) => (detail.as_str(), None, GateState::Met),
+                            CheckState::Missing { detail, fix } => (
+                                detail.as_str(),
+                                Some(fix.as_str()),
+                                if required {
+                                    GateState::Blocked
+                                } else {
+                                    GateState::Pending
+                                },
+                            ),
+                            CheckState::Failed(detail) => {
+                                let fix = match spec.id {
+                                    "gh" if detail.starts_with("Version ") => "brew upgrade gh",
+                                    "gh-auth" if detail.contains("token lacks repo scope") => {
+                                        "gh auth refresh -s repo,read:org"
+                                    }
+                                    "codex-auth" if detail == "Install Codex first" => {
+                                        "brew install --cask codex"
+                                    }
+                                    _ => "Check again",
+                                };
+                                (detail.as_str(), Some(fix), GateState::Blocked)
+                            }
+                        };
+                        let mut row = div()
+                            .py(px(10.))
+                            .border_b_1()
+                            .border_color(divider())
+                            .flex()
+                            .items_start()
+                            .gap(px(10.))
+                            .child(status_badge(badge))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .child(div().font_semibold().child(spec.label))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(muted())
+                                            .child(detail.to_owned()),
+                                    ),
+                            );
+                        if let Some(fix) = fix {
+                            let value = fix.to_owned();
+                            row =
+                                row.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(
+                                            div()
+                                                .px(px(8.))
+                                                .py(px(4.))
+                                                .rounded(px(4.))
+                                                .bg(raised())
+                                                .text_size(px(12.))
+                                                .font_family("monospace")
+                                                .child(value.clone()),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "copy-{}",
+                                                spec.id
+                                            )))
+                                            .label("Copy")
+                                            .ghost()
+                                            .on_click(cx.listener(move |_, _, window, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    value.clone(),
+                                                ));
+                                                window.push_notification(
+                                                    Notification::success("Copied fix"),
+                                                    cx,
+                                                );
+                                            })),
+                                        ),
+                                );
+                        }
+                        body = body.child(row);
+                    }
+                }
+            }
+        }
+        (header, div().size_full().child(body))
     }
 }
 
@@ -2800,6 +3383,8 @@ impl Render for AppView {
             Page::PullRequests => self.render_dashboard(cx),
             Page::Settings(SettingsPage::Repositories) => self.render_repos(cx),
             Page::Settings(SettingsPage::App) => self.render_app_settings(cx),
+            Page::Settings(SettingsPage::Prompts) => self.render_prompts(cx),
+            Page::Settings(SettingsPage::Status) => self.render_status(cx),
             Page::Settings(SettingsPage::Repo(repo)) => self.render_repo_settings(repo, cx),
         };
         div()
@@ -2818,6 +3403,9 @@ impl Render for AppView {
                     .flex()
                     .flex_col()
                     .child(header)
+                    .when(matches!(self.page, Page::PullRequests), |d| {
+                        d.when_some(self.status_banner(cx), |d, banner| d.child(banner))
+                    })
                     .when_some(
                         self.error.clone().or(self.refresh_error.clone()),
                         |d, error| {

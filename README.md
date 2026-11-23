@@ -35,14 +35,17 @@ The bundle contains both binaries. For development, `cargo build --workspace && 
 
 ## Babysit pull requests with the app
 
-1. Open **Settings** with Cmd+, and select **Repositories**. Turn on the repositories you want to babysit.
-2. On **Pull requests**, press play on a PR. Its row shows the four phases and what the babysitter is doing now.
-3. Wait for the notification. A babysit ends when the PR merges, when its timeout passes, or when it needs you, and the row then shows the reason.
-4. Dismiss a finished row to delete its worktree.
+1. Open **Settings** with Cmd+, and select **Status**. Every required check should be green. A red check names the command that fixes it, such as `gh auth login` or `codex login`. While a required check fails, the Pull requests page shows a banner that links here.
+2. Select **Repositories** and turn on the repositories you want to babysit.
+3. On **Pull requests**, press play on a PR. Its row shows the four phases and what the babysitter is doing now.
+4. Wait for the notification. A babysit ends when the PR merges, when its timeout passes, or when it needs you, and the row then shows the reason.
+5. Dismiss a finished row to delete its worktree.
 
 Each row also has a **More actions** menu to mark a draft ready for review, convert a PR to draft, close it, or copy its link.
 
 **Settings > App** holds the defaults for every repository: a `2h` timeout, a `2h` timeout for drafts, and a `30s` interval between checks. To override a value for one repository, use the gear next to that repository. **Auto-dismiss merged PRs** clears merged rows and their worktrees after the **Clear after** delay.
+
+**Settings > Prompts** lets you replace the instructions Codex gets for review threads, failing CI, and merge conflicts. Turn on **Custom review prompt**, **Custom CI fix prompt**, or **Custom conflict prompt**, edit the text, and select **Save**. Until you save, the default prompt applies. Turning a toggle off goes back to the default and keeps your text for later. Running babysits use the change at their next Codex call. Your text replaces only the instructions: Baby Sitter still adds the threads, checks, or conflicted files, and its safety checks apply whatever the text says.
 
 Quitting the app stops every babysit. The next launch restarts them with their original deadlines.
 
@@ -64,6 +67,8 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 | `--timeout` | `2h` | Deadline for the whole run, including every `gh`, `git`, and `codex` call. |
 | `--interval` | `10s` | Time between checks while the run waits. |
 | `--gates` | off | Print each phase's state before every decision, for example `[gates] reviews=met checks=waiting branch=met merge=pending`. `reviews` is the Comments phase. |
+| `--prompts` | none | A JSON file that replaces the instructions for some prompts, for example `{"ci": "…"}`. Keys are `review`, `ci`, and `conflicts`. A missing file means the defaults. The binary reads the file again before each Codex call. |
+| `--print-default-prompts` | off | Print the default instructions as JSON, then exit. |
 
 | Exit code | Meaning |
 |---|---|

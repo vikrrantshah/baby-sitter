@@ -345,9 +345,60 @@ pub enum PrStatus {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct CustomPrompt {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl CustomPrompt {
+    pub fn in_effect(&self) -> Option<&str> {
+        self.text
+            .as_deref()
+            .filter(|text| self.enabled && !text.trim().is_empty())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Prompts {
+    pub review: CustomPrompt,
+    pub ci: CustomPrompt,
+    pub conflicts: CustomPrompt,
+}
+
+impl Prompts {
+    pub fn render_json(&self) -> serde_json::Result<String> {
+        #[derive(Serialize)]
+        struct Overrides<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            review: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ci: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            conflicts: Option<&'a str>,
+        }
+        serde_json::to_string_pretty(&Overrides {
+            review: self.review.in_effect(),
+            ci: self.ci.in_effect(),
+            conflicts: self.conflicts.in_effect(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.review.in_effect().is_none()
+            && self.ci.in_effect().is_none()
+            && self.conflicts.in_effect().is_none()
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     #[serde(default)]
     pub app: AppSettings,
+    #[serde(default)]
+    pub prompts: Prompts,
     pub repos: BTreeMap<RepoName, RepoSettings>,
     pub active: BTreeMap<PrRef, u64>,
     #[serde(default)]
@@ -636,6 +687,44 @@ pub fn classify(code: Option<i32>, stderr: &str, cancel_requested: bool) -> Outc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_json_contains_only_active_overrides() {
+        let prompts = super::Prompts {
+            review: super::CustomPrompt {
+                enabled: true,
+                text: Some("review".into()),
+            },
+            ci: super::CustomPrompt {
+                enabled: false,
+                text: Some("disabled".into()),
+            },
+            conflicts: super::CustomPrompt {
+                enabled: true,
+                text: Some("  ".into()),
+            },
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&prompts.render_json().unwrap()).unwrap();
+        assert_eq!(json, serde_json::json!({"review": "review"}));
+    }
+
+    #[test]
+    fn prompt_requires_enabled_and_nonblank_saved_text() {
+        for (enabled, text, expected) in [
+            (false, None, None),
+            (true, None, None),
+            (false, Some("saved"), None),
+            (true, Some("saved"), Some("saved")),
+            (true, Some(" \n"), None),
+        ] {
+            let prompt = super::CustomPrompt {
+                enabled,
+                text: text.map(str::to_owned),
+            };
+            assert_eq!(prompt.in_effect(), expected);
+        }
+    }
+
     #[test]
     fn merged_retention_respects_delay_and_outcome() {
         let recent: PrRef = "owner/repo#1".parse().unwrap();

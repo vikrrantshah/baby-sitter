@@ -89,6 +89,19 @@ Codex gets the failed Actions job logs and the URLs of failing external checks. 
 
 The binary checks for CI configuration changes in the working tree before committing and in the commit before pushing. It leaves an unsafe change uncommitted, or an unsafe commit local, for you to inspect. Fix commits carry the `Baby-Sitter: fix-ci` trailer, and the run stops if CI still fails after three fix commits among the PR's last 20 commits.
 
+## Each Codex prompt has a fixed frame
+
+Codex gets one of three prompts: `review` for unanswered threads, `ci` for failing checks, and `conflicts` for merge conflicts. Each prompt is built in four parts, in this order:
+
+1. The instructions. `baby-sitter --print-default-prompts` prints the defaults. `--prompts <file>` or **Settings > Prompts** in the app replaces them.
+2. The data: the `ITEM` blocks for review threads, the failing checks and their logs, or the base branch and the conflicted files.
+3. A fixed rule that Codex must not run `git` or `gh` and must not install packages. Custom instructions cannot remove it. It is an instruction to Codex, not a runtime block.
+4. The note about installed dependencies described below.
+
+The binary checks the `--prompts` file at startup and stops with the cause when the file is invalid. A missing file means the defaults. The binary reads the file again before each Codex call, so a running babysit picks up a change at its next call. The app always passes `<data dir>/prompts.json` and deletes the file when no custom prompt is saved and turned on.
+
+Custom instructions cannot loosen what the code enforces. Codex must still reply in the JSON shape the binary expects. The binary still refuses to commit or push CI configuration changes, and it still checks conflict resolutions before it commits them.
+
 ## Codex can check its own edits
 
 Before every Codex call, the binary installs the checkout's JavaScript dependencies so Codex can typecheck and test what it changes. The lockfile at the checkout root picks the command:
@@ -135,3 +148,14 @@ The app keeps its configuration, one clone per repository, and one worktree per 
 Stopping a babysit sends `SIGTERM` to its process group and sends `SIGKILL` to whatever is still running 10 seconds later. Quitting the app stops every babysit, and the next launch restarts them with their original deadlines.
 
 After a merge, the app removes the worktree. After any other outcome, it keeps the worktree until you dismiss the row. Dismiss moves the worktree into a trash folder at once and deletes it in the background, so a large `node_modules` never blocks a restart. The app clears leftover trash at launch.
+
+**Settings > Status** runs these checks at launch and when you select **Check again**, with the same `PATH` babysits use. Each command has a 10-second limit.
+
+| Check | Required | Passes when |
+|---|---|---|
+| GitHub CLI | yes | `gh --version` reports 2.97.0 or later |
+| GitHub sign-in | yes | `gh auth status --hostname github.com` names an account, and the token scopes, when listed, include `repo` |
+| Git | yes | `git --version` runs |
+| Codex CLI | yes | `codex --version` runs |
+| Codex sign-in | yes | `codex login status` exits 0 |
+| pnpm, npm, Yarn | no | The tool runs. Each one is needed only for repositories with its lockfile |
