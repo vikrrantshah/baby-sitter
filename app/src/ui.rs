@@ -1544,8 +1544,19 @@ impl AppView {
             .child(
                 div().px(px(ROW_INSET)).flex().items_start().child(
                     Button::new("back-home")
-                        .icon(IconName::ChevronLeft)
-                        .label("Home")
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .relative()
+                                        .top(px(-1.))
+                                        .child(Icon::new(IconName::ChevronLeft).size(px(14.))),
+                                )
+                                .child("Home"),
+                        )
                         .ghost()
                         .ml(px(-8.))
                         .on_click(cx.listener(|this, _, _, cx| {
