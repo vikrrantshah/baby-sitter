@@ -212,7 +212,7 @@ pub struct AppView {
 
 impl AppView {
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
-        self.page = Page::Settings(SettingsPage::Repositories);
+        self.page = Page::Settings(SettingsPage::App);
         cx.notify();
     }
 
@@ -1812,6 +1812,15 @@ impl AppView {
                     )
                     .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
             })
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(16.))
+                    .line_height(relative(1.3))
+                    .font_semibold()
+                    .text_color(ink())
+                    .child(row.title.clone()),
+            )
             .when_some(reading.verb, |title, verb| {
                 title.child(
                     div()
@@ -1822,16 +1831,7 @@ impl AppView {
                         .child(status_badge(reading.badge))
                         .tooltip(move |window, cx| Tooltip::new(verb).build(window, cx)),
                 )
-            })
-            .child(
-                div()
-                    .min_w_0()
-                    .text_size(px(16.))
-                    .line_height(relative(1.3))
-                    .font_semibold()
-                    .text_color(ink())
-                    .child(row.title.clone()),
-            );
+            });
         let place = format!("{} #{}", row.pr.repo, row.pr.number);
         let copy_url = row.url.clone();
         let copy_pr = row.pr.clone();
@@ -2110,10 +2110,7 @@ impl AppView {
                             ink(),
                             cx,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page = Page::Settings(SettingsPage::Repositories);
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
                     ),
             );
         let filter = ButtonGroup::new("pr-filter")
@@ -2238,13 +2235,13 @@ impl AppView {
                     .gap(px(4.))
                     .children(
                         [
+                            ("nav-app", "App", IconName::Settings, SettingsPage::App),
                             (
                                 "nav-repos",
                                 "Repositories",
                                 IconName::BookMarked,
                                 SettingsPage::Repositories,
                             ),
-                            ("nav-app", "App", IconName::Settings, SettingsPage::App),
                         ]
                         .into_iter()
                         .map(|(id, label, icon, page)| {
