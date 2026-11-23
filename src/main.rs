@@ -14,6 +14,7 @@ use crate::{
 };
 use clap::Parser;
 use std::{
+    path::PathBuf,
     process::ExitCode,
     time::{Duration, Instant},
 };
@@ -38,6 +39,12 @@ struct Cli {
     /// Print each merge gate's state before every decision.
     #[arg(long)]
     gates: bool,
+    /// Read instruction overrides from a JSON file.
+    #[arg(long, value_name = "FILE")]
+    prompts: Option<PathBuf>,
+    /// Print the default instruction texts as JSON and exit.
+    #[arg(long)]
+    print_default_prompts: bool,
 }
 struct Observation {
     snap: Snapshot,
@@ -78,7 +85,14 @@ fn after_failure(consecutive_failures: u32) -> FailureStep {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    run_cli(Cli::parse())
+}
+
+fn run_cli(cli: Cli) -> ExitCode {
+    if cli.print_default_prompts {
+        println!("{}", codex::default_prompts_json());
+        return ExitCode::SUCCESS;
+    }
     let deadline = match Instant::now().checked_add(cli.timeout) {
         Some(d) => d,
         None => {
@@ -99,7 +113,15 @@ fn main() -> ExitCode {
     }
 }
 fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
-    let env = act::Env::new(cli.pr.as_deref(), cli.dry_run, deadline)?;
+    if let Some(path) = cli.prompts.as_deref() {
+        codex::load(path)?;
+    }
+    let env = act::Env::new(
+        cli.pr.as_deref(),
+        cli.dry_run,
+        cli.prompts.clone(),
+        deadline,
+    )?;
     let mut consecutive_failures = 0;
     loop {
         if Instant::now() >= deadline {
@@ -191,6 +213,43 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_parses_prompt_options() {
+        let cli = Cli::try_parse_from(["baby-sitter", "--prompts", "prompts.json", "42"]).unwrap();
+        assert_eq!(
+            cli.prompts.as_deref(),
+            Some(std::path::Path::new("prompts.json"))
+        );
+        assert_eq!(cli.pr.as_deref(), Some("42"));
+        assert!(!cli.print_default_prompts);
+        assert!(Cli::try_parse_from(["baby-sitter", "--prompts"]).is_err());
+
+        let cli = Cli::try_parse_from(["baby-sitter", "--print-default-prompts"]).unwrap();
+        assert!(cli.print_default_prompts);
+        assert_eq!(run_cli(cli), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn invalid_prompt_file_fails_before_discovering_a_checkout() {
+        let root = test_support::unique_test_dir("baby-sitter-cli-prompts");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("prompts.json");
+        std::fs::write(&path, r#"{"ci":null}"#).unwrap();
+        let cli = Cli::try_parse_from([
+            std::ffi::OsString::from("baby-sitter"),
+            "--prompts".into(),
+            path.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        let error = run(&cli, Instant::now() + Duration::from_secs(10))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("invalid type: null"), "{error}");
+        assert!(error.contains(path.to_string_lossy().as_ref()));
+        assert_eq!(run_cli(cli), ExitCode::from(1));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn observation_failures_retry_twice_then_stop() {

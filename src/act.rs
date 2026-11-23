@@ -9,16 +9,23 @@ use crate::{
 use anyhow::{Context, bail, ensure};
 use std::{
     fs::{self, File, OpenOptions},
+    path::PathBuf,
     time::Instant,
 };
 pub struct Env {
     pub gh: Gh,
     pub git: Git,
+    pub prompts_path: Option<PathBuf>,
     pub deadline: Instant,
     pub _lock: Option<File>,
 }
 impl Env {
-    pub fn new(arg: Option<&str>, dry_run: bool, deadline: Instant) -> anyhow::Result<Self> {
+    pub fn new(
+        arg: Option<&str>,
+        dry_run: bool,
+        prompts_path: Option<PathBuf>,
+        deadline: Instant,
+    ) -> anyhow::Result<Self> {
         let gh = Gh::resolve(arg, deadline)?;
         let git = Git::discover(deadline)?;
         let lock = if dry_run {
@@ -38,6 +45,7 @@ impl Env {
         Ok(Self {
             gh,
             git,
+            prompts_path,
             deadline,
             _lock: lock,
         })
@@ -77,7 +85,13 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 env.git.is_clean()?,
                 "working tree became dirty since snapshot"
             );
-            let resolved = codex::run(&env.git.root, &env.git.state_dir(), &batch, env.deadline)?;
+            let resolved = codex::run(
+                &env.git.root,
+                &env.git.state_dir(),
+                &batch,
+                env.prompts_path.as_deref(),
+                env.deadline,
+            )?;
             ensure!(
                 env.git.head()? == head.sha,
                 "codex changed HEAD; inspect the checkout"
@@ -124,6 +138,7 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                     &env.git.state_dir(),
                     &base,
                     files,
+                    env.prompts_path.as_deref(),
                     env.deadline,
                 )
             })
@@ -153,6 +168,7 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 &env.git.root,
                 &env.git.state_dir(),
                 &checks_with_logs,
+                env.prompts_path.as_deref(),
                 env.deadline,
             );
             ensure!(
