@@ -45,6 +45,8 @@ Each row also has a **More actions** menu to mark a draft ready for review, conv
 
 **Settings > App** holds the defaults for every repository: a `2h` timeout, a `2h` timeout for drafts, and a `30s` interval between checks. To override a value for one repository, use the gear next to that repository. **Auto-dismiss merged PRs** clears merged rows and their worktrees after the **Clear after** delay.
 
+A repository's gear also sets its **Setup command**, such as `pnpm install`. Baby Sitter runs it in a PR's worktree before the babysit starts, once per worktree: a finished setup is not repeated unless you change the command. If the command fails, the babysit stops with its error and the worktree is removed, so the next start runs the setup again.
+
 **Settings > Prompts** lets you replace the instructions Codex gets for review threads, failing CI, and merge conflicts. Turn on **Custom review prompt**, **Custom CI fix prompt**, or **Custom conflict prompt**, edit the text, and select **Save**. Until you save, the default prompt applies. Turning a toggle off goes back to the default and keeps your text for later. Running babysits use the change at their next Codex call. Your text replaces only the instructions: Baby Sitter still adds the threads, checks, or conflicted files, and its safety checks apply whatever the text says.
 
 Quitting the app stops every babysit. The next launch restarts them with their original deadlines.

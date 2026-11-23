@@ -51,6 +51,14 @@ pub fn worktree_path(data: &Path, pr: &PrRef) -> PathBuf {
         .join(&pr.repo.name)
         .join(format!("pr-{}", pr.number))
 }
+/// Records the setup command that last finished in a PR's worktree. It lives outside the
+/// worktree so it never shows up as an untracked file.
+fn setup_marker(data: &Path, pr: &PrRef) -> PathBuf {
+    data.join("setup")
+        .join(&pr.repo.owner)
+        .join(&pr.repo.name)
+        .join(format!("pr-{}", pr.number))
+}
 fn clone_path(data: &Path, repo: &RepoName) -> PathBuf {
     data.join("repos").join(&repo.owner).join(&repo.name)
 }
@@ -219,6 +227,9 @@ pub fn remove_worktree(env: &ChildEnv, data: &Path, locks: &RepoLocks, pr: &PrRe
         }
         Ok(())
     })();
+    if result.is_ok() {
+        let _ = std::fs::remove_file(setup_marker(data, pr));
+    }
     if let Some(path) = trashed {
         thread::spawn(move || {
             let _ = std::fs::remove_dir_all(path);
@@ -357,8 +368,12 @@ enum ReadEvent {
 enum ProcessMode {
     Capture,
     Sit,
-    #[cfg(test)]
     Quiet,
+}
+
+enum Preparation {
+    Ready,
+    Finished(Outcome),
 }
 
 struct Runner {
@@ -548,19 +563,27 @@ impl Runner {
     fn repo_lock(&self) -> Arc<Mutex<()>> {
         repo_lock(&self.locks, &self.pr.repo)
     }
-    fn prepare(&self) -> Result<Option<Outcome>> {
+    fn prepare(&self) -> Result<Preparation> {
         let head: gh::PrHead =
             serde_json::from_slice(&self.checked(gh::pr_head_command(&self.env, &self.pr.url()))?)
                 .context("parse PR head")?;
         if head.state == "MERGED" {
-            return Ok(Some(Outcome::Merged));
+            return Ok(Preparation::Finished(Outcome::Merged));
         }
         if head.state == "CLOSED" {
-            return Ok(Some(Outcome::Stopped("PR closed without merging".into())));
+            return Ok(Preparation::Finished(Outcome::Stopped(
+                "PR closed without merging".into(),
+            )));
         }
         if head.is_cross_repository {
-            return Ok(Some(Outcome::Failed("fork PRs are not supported".into())));
+            return Ok(Preparation::Finished(Outcome::Failed(
+                "fork PRs are not supported".into(),
+            )));
         }
+        self.prepare_worktree(&head.head_ref_name)?;
+        Ok(Preparation::Ready)
+    }
+    fn prepare_worktree(&self, head_ref_name: &str) -> Result<()> {
         let lock = self.repo_lock();
         let _guard = loop {
             match lock.try_lock() {
@@ -604,10 +627,7 @@ impl Runner {
         fetch.arg("-C").arg(&clone).args([
             "fetch",
             "origin",
-            &format!(
-                "+refs/heads/{0}:refs/remotes/origin/{0}",
-                head.head_ref_name
-            ),
+            &format!("+refs/heads/{head_ref_name}:refs/remotes/origin/{head_ref_name}"),
         ]);
         self.checked(fetch)?;
         let mut prune = self.env.command("git");
@@ -626,16 +646,81 @@ impl Runner {
                     &format!("baby-sitter/pr-{}", self.pr.number),
                 ])
                 .arg(&worktree)
-                .arg(format!("origin/{}", head.head_ref_name));
+                .arg(format!("origin/{head_ref_name}"));
             self.checked(add)?;
         }
-        Ok(None)
+        Ok(())
+    }
+    /// Runs the repository's setup command unless this worktree already finished the same
+    /// command, so a setup cut short by a quit or crash runs again on the next start.
+    fn setup(&self) -> Option<Outcome> {
+        let setup = self.settings.setup_command.as_deref()?;
+        let marker = setup_marker(&self.data, &self.pr);
+        if std::fs::read_to_string(&marker).is_ok_and(|done| done == setup) {
+            return None;
+        }
+        emit(
+            &self.tx,
+            &self.pr,
+            SitState::Running {
+                last_line: Some(format!("Running setup: {setup}")),
+                since: Instant::now(),
+            },
+        );
+        let mut command = self.env.command("/bin/sh");
+        command
+            .args(["-c", setup])
+            .current_dir(worktree_path(&self.data, &self.pr));
+        let mut outcome = match self.run(command, ProcessMode::Quiet) {
+            Ok(output) => {
+                if let Some(reason) = output.interrupted {
+                    reason.outcome()
+                } else if output.status.success() {
+                    let recorded = marker
+                        .parent()
+                        .map_or(Ok(()), std::fs::create_dir_all)
+                        .and_then(|()| std::fs::write(&marker, setup));
+                    if let Err(error) = recorded {
+                        eprintln!("Could not record the finished setup command: {error}");
+                    }
+                    return None;
+                } else {
+                    let cause = output
+                        .stderr
+                        .lines()
+                        .rev()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| match output.status.code() {
+                            Some(code) => format!("exit status {code}"),
+                            None => output.status.to_string(),
+                        });
+                    Outcome::Stopped(format!("Setup command failed: {cause}"))
+                }
+            }
+            Err(error) => match self.interrupted() {
+                Some(reason) => reason.outcome(),
+                None => Outcome::Stopped(format!("Setup command failed: {error:#}")),
+            },
+        };
+        if let Err(error) = remove_worktree(&self.env, &self.data, &self.locks, &self.pr) {
+            if let Outcome::Stopped(message) = &mut outcome {
+                message.push_str(&format!("; could not remove worktree: {error:#}"));
+            } else {
+                eprintln!("Could not remove worktree after interrupted setup: {error:#}");
+            }
+        }
+        Some(outcome)
     }
     fn execute(&self) -> Result<Outcome> {
         if let Some(reason) = self.interrupted() {
             return Ok(reason.outcome());
         }
-        if let Some(outcome) = self.prepare()? {
+        if let Preparation::Finished(outcome) = self.prepare()? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = self.setup() {
             return Ok(outcome);
         }
         let cli = std::env::current_exe()?
@@ -816,22 +901,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn removes_worktree_with_untracked_files_and_branch() {
-        let data = crate::test_support::unique_test_dir("app-merged-worktree");
+    fn run_git(args: &[&str]) {
+        let output = Command::new("git").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn worktree_fixture(name: &str) -> (PathBuf, PrRef) {
+        let data = crate::test_support::unique_test_dir(name);
         let source = data.join("source");
         fs::create_dir_all(&source).unwrap();
-        let run = |args: &[&str]| {
-            let output = Command::new("git").args(args).output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
         let source_str = source.to_str().unwrap();
-        run(&["init", source_str]);
-        run(&[
+        run_git(&["init", source_str]);
+        run_git(&[
             "-C",
             source_str,
             "-c",
@@ -843,10 +928,11 @@ mod tests {
             "-m",
             "initial",
         ]);
+        run_git(&["-C", source_str, "branch", "-M", "setup-test"]);
         let pr: PrRef = "owner/repo#42".parse().unwrap();
         let clone = clone_path(&data, &pr.repo);
         fs::create_dir_all(clone.parent().unwrap()).unwrap();
-        run(&[
+        run_git(&[
             "clone",
             "--no-checkout",
             source_str,
@@ -854,7 +940,7 @@ mod tests {
         ]);
         let tree = worktree_path(&data, &pr);
         fs::create_dir_all(tree.parent().unwrap()).unwrap();
-        run(&[
+        run_git(&[
             "-C",
             clone.to_str().unwrap(),
             "worktree",
@@ -864,6 +950,14 @@ mod tests {
             tree.to_str().unwrap(),
             "HEAD",
         ]);
+        (data, pr)
+    }
+
+    #[test]
+    fn removes_worktree_with_untracked_files_and_branch() {
+        let (data, pr) = worktree_fixture("app-merged-worktree");
+        let clone = clone_path(&data, &pr.repo);
+        let tree = worktree_path(&data, &pr);
         fs::write(tree.join("untracked"), "scratch").unwrap();
         let locks = Arc::new(Mutex::new(BTreeMap::new()));
         remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
@@ -894,7 +988,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success());
-        run(&[
+        run_git(&[
             "-C",
             clone.to_str().unwrap(),
             "worktree",
@@ -921,6 +1015,189 @@ mod tests {
         assert!(!status.success());
         fs::remove_dir_all(&clone).unwrap();
         remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    fn setup_runner(
+        data: PathBuf,
+        pr: PrRef,
+        setup: &str,
+    ) -> (Runner, async_channel::Receiver<SitEvent>) {
+        let (tx, rx) = async_channel::unbounded();
+        let settings = model::RepoSettings {
+            setup_command: Some(setup.to_owned()),
+            ..Default::default()
+        }
+        .resolve(&model::Defaults::default());
+        (
+            Runner {
+                pr,
+                data,
+                env: ChildEnv::new(),
+                deadline: unix_now() + 60,
+                settings,
+                registry: Arc::new(Mutex::new(BTreeMap::new())),
+                locks: Arc::new(Mutex::new(BTreeMap::new())),
+                control: Arc::new(Control {
+                    cancelled: AtomicBool::new(false),
+                    wake: Condvar::new(),
+                    mutex: Mutex::new(()),
+                }),
+                tx,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn setup_runs_until_it_finishes_once_per_command() {
+        let (data, pr) = worktree_fixture("app-setup-success");
+        let tree = worktree_path(&data, &pr);
+        let command = "sh -c 'touch ran; echo \"[ci] wait: pending\" >&2'";
+        let (mut runner, rx) = setup_runner(data.clone(), pr.clone(), command);
+
+        runner.settings.setup_command = None;
+        assert_eq!(runner.setup(), None);
+        assert!(!tree.join("ran").exists(), "no command runs no setup");
+        assert!(rx.try_recv().is_err());
+
+        runner.settings.setup_command = Some(command.into());
+        let lock = runner.repo_lock();
+        assert!(lock.try_lock().is_ok());
+        assert_eq!(runner.setup(), None);
+        assert!(
+            tree.join("ran").exists(),
+            "a worktree without a finished setup runs it"
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap().state,
+            SitState::Running { last_line: Some(line), .. }
+                if line == format!("Running setup: {command}")
+        ));
+
+        fs::remove_file(tree.join("ran")).unwrap();
+        assert_eq!(runner.setup(), None);
+        assert!(
+            !tree.join("ran").exists(),
+            "a finished setup does not run again"
+        );
+
+        runner.settings.setup_command = Some("sh -c 'touch changed'".into());
+        assert_eq!(runner.setup(), None);
+        assert!(tree.join("changed").exists(), "a changed command runs");
+
+        remove_worktree(&runner.env, &data, &runner.locks, &pr).unwrap();
+        runner.prepare_worktree("setup-test").unwrap();
+        assert_eq!(runner.setup(), None);
+        assert!(
+            tree.join("changed").exists(),
+            "a recreated worktree runs the setup again"
+        );
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn failed_setup_reports_last_stderr_and_allows_retry() {
+        let (data, pr) = worktree_fixture("app-setup-failure");
+        let tree = worktree_path(&data, &pr);
+        let (mut runner, _) = setup_runner(
+            data.clone(),
+            pr,
+            "sh -c 'echo earlier >&2; echo boom >&2; echo >&2; exit 3'",
+        );
+
+        assert_eq!(
+            runner.setup(),
+            Some(Outcome::Stopped("Setup command failed: boom".into()))
+        );
+        assert!(!tree.exists());
+        runner.prepare_worktree("setup-test").unwrap();
+        runner.settings.setup_command = Some("sh -c 'touch ran'".into());
+        assert_eq!(runner.setup(), None);
+        assert!(tree.join("ran").exists());
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn failed_setup_without_stderr_reports_exit_status() {
+        let (data, pr) = worktree_fixture("app-setup-exit-status");
+        let tree = worktree_path(&data, &pr);
+        let (runner, _) = setup_runner(data.clone(), pr, "sh -c 'exit 3'");
+        assert_eq!(
+            runner.setup(),
+            Some(Outcome::Stopped(
+                "Setup command failed: exit status 3".into()
+            ))
+        );
+        assert!(!tree.exists());
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn setup_spawn_error_removes_worktree_registration() {
+        let (data, pr) = worktree_fixture("app-setup-spawn-error");
+        let tree = worktree_path(&data, &pr);
+        let (runner, _) = setup_runner(data.clone(), pr, "touch ran");
+        fs::remove_dir_all(&tree).unwrap();
+        assert!(matches!(
+            runner.setup(),
+            Some(Outcome::Stopped(message))
+                if message.starts_with("Setup command failed: start /bin/sh")
+        ));
+        runner.prepare_worktree("setup-test").unwrap();
+        assert!(tree.exists());
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn setup_deadline_removes_worktree_and_returns_timeout() {
+        let (data, pr) = worktree_fixture("app-setup-deadline");
+        let tree = worktree_path(&data, &pr);
+        let (mut runner, _) = setup_runner(data.clone(), pr, "touch ran");
+        runner.deadline = unix_now();
+        assert_eq!(runner.setup(), Some(Outcome::TimedOut));
+        assert!(!tree.exists());
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn setup_deadline_interrupts_a_running_process() {
+        let (data, pr) = worktree_fixture("app-setup-running-deadline");
+        let tree = worktree_path(&data, &pr);
+        let (mut runner, _) = setup_runner(data.clone(), pr, "touch started; sleep 30");
+        runner.deadline = unix_now() + 3;
+        let worker = thread::spawn(move || runner.setup());
+        let until = Instant::now() + Duration::from_secs(2);
+        while !tree.join("started").exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let started = tree.join("started").exists();
+        let outcome = worker.join().unwrap();
+        assert!(started, "setup did not start");
+        assert_eq!(outcome, Some(Outcome::TimedOut));
+        assert!(!tree.exists());
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn cancelling_setup_removes_worktree_and_returns_cancelled() {
+        let (data, pr) = worktree_fixture("app-setup-cancel");
+        let tree = worktree_path(&data, &pr);
+        let (runner, _) = setup_runner(data.clone(), pr, "touch started; sleep 30");
+        let handle = SitHandle {
+            control: runner.control.clone(),
+        };
+        let worker = thread::spawn(move || runner.setup());
+        let until = Instant::now() + Duration::from_secs(5);
+        while !tree.join("started").exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let started = tree.join("started").exists();
+        handle.cancel();
+        let outcome = worker.join().unwrap();
+        assert!(started, "setup did not start");
+        assert_eq!(outcome, Some(Outcome::Cancelled));
+        assert!(!tree.exists());
         fs::remove_dir_all(data).unwrap();
     }
 

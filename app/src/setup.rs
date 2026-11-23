@@ -12,7 +12,6 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Required,
-    Optional,
     Permissions,
 }
 
@@ -67,24 +66,6 @@ pub const CHECKS: &[CheckSpec] = &[
         label: "Codex sign-in",
         section: Section::Required,
         run: check_codex_auth,
-    },
-    CheckSpec {
-        id: "pnpm",
-        label: "pnpm",
-        section: Section::Optional,
-        run: check_pnpm,
-    },
-    CheckSpec {
-        id: "npm",
-        label: "npm",
-        section: Section::Optional,
-        run: check_npm,
-    },
-    CheckSpec {
-        id: "yarn",
-        label: "Yarn",
-        section: Section::Optional,
-        run: check_yarn,
     },
     CheckSpec {
         id: "notifications",
@@ -259,36 +240,6 @@ fn check_codex_auth(env: &ChildEnv) -> CheckState {
         Err(error) => CheckState::Failed(error),
     }
 }
-fn optional(env: &ChildEnv, program: &str, detail: &str, fix: &str) -> CheckState {
-    match version_output(env, program, fix, detail) {
-        Ok(version) => CheckState::Ok(format!("Version {version}")),
-        Err(state) => state,
-    }
-}
-fn check_pnpm(env: &ChildEnv) -> CheckState {
-    optional(
-        env,
-        "pnpm",
-        "Needed for repositories with pnpm-lock.yaml",
-        "npm install -g pnpm or corepack enable",
-    )
-}
-fn check_npm(env: &ChildEnv) -> CheckState {
-    optional(
-        env,
-        "npm",
-        "Needed for repositories with package-lock.json",
-        "Install Node.js",
-    )
-}
-fn check_yarn(env: &ChildEnv) -> CheckState {
-    optional(
-        env,
-        "yarn",
-        "Needed for repositories with yarn.lock",
-        "corepack enable",
-    )
-}
 
 const NOTIFICATION_SETTINGS_URL: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.github.vikrrantshah.baby-sitter";
 
@@ -428,12 +379,11 @@ mod tests {
     }
 
     #[test]
-    fn banner_failures_exclude_optional_and_permission_checks() {
+    fn banner_failures_exclude_permission_checks() {
         let results = vec![
             (&CHECKS[0], CheckState::Ok("ready".into())),
             (&CHECKS[1], CheckState::Failed("required".into())),
-            (&CHECKS[5], CheckState::Failed("optional".into())),
-            (&CHECKS[8], CheckState::Failed("permission".into())),
+            (&CHECKS[5], CheckState::Failed("permission".into())),
         ];
         let labels: Vec<_> = required_failures(&results)
             .map(|(spec, _)| spec.label)

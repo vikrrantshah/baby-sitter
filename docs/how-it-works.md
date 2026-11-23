@@ -145,6 +145,8 @@ A lock file at `$(git rev-parse --git-dir)/baby-sitter/pr-<n>.lock` stops a seco
 
 The app keeps its configuration, one clone per repository, and one worktree per PR in `~/Library/Application Support/baby-sitter`. It runs `baby-sitter --gates` in the PR's worktree and reads the phase icons and status from its output. Child processes get the `PATH` from your login shell, so version-managed tools such as `nvm` work when the app opens from Finder.
 
+When a babysit starts, the app runs the repository's **Setup command**, if one is set and has not finished in that PR's worktree yet, as `/bin/sh -c "<command>"` in the worktree with the same `PATH`. It runs after the app releases the repository lock, so a long install does not hold up other babysits in the same repository. A stop or the deadline ends it like any other babysit step. After it succeeds, the app records the command under `setup/` in its data folder, outside the worktree, so later starts skip it until the command changes or the worktree is removed. A setup cut short by a quit or crash runs again on the next start. If it fails, the babysit stops with the command's last error line and the app removes the new worktree, so the next start creates the worktree and runs the setup again. The binary still installs JavaScript dependencies before each Codex call, as described above, and skips that install when the lockfile has not changed since its last install in that checkout.
+
 Stopping a babysit sends `SIGTERM` to its process group and sends `SIGKILL` to whatever is still running 10 seconds later. Quitting the app stops every babysit, and the next launch restarts them with their original deadlines.
 
 After a merge, the app removes the worktree. After any other outcome, it keeps the worktree until you dismiss the row. Dismiss moves the worktree into a trash folder at once and deletes it in the background, so a large `node_modules` never blocks a restart. The app clears leftover trash at launch.
@@ -158,7 +160,6 @@ After a merge, the app removes the worktree. After any other outcome, it keeps t
 | Git | yes | `git --version` runs |
 | Codex CLI | yes | `codex --version` runs |
 | Codex sign-in | yes | `codex login status` exits 0 |
-| pnpm, npm, Yarn | no | The tool runs. Each one is needed only for repositories with its lockfile |
 
 The **Permissions** section reads Baby Sitter's notification settings from macOS. It is green when notifications are allowed with banners and Notification Center on. When macOS has not asked yet, **Allow notifications** shows the prompt. When notifications are off, or allowed but hidden from banners or Notification Center, **Open System Settings** opens Baby Sitter's notification settings. A permission problem does not raise the banner on the Pull requests page, because babysits run without notifications.
 

@@ -186,13 +186,16 @@ pub struct RepoSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub interval: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_command: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resolved {
     pub timeout: Duration,
     pub draft_timeout: Duration,
     pub interval: Duration,
+    pub setup_command: Option<String>,
 }
 
 impl RepoSettings {
@@ -201,8 +204,14 @@ impl RepoSettings {
             timeout: self.timeout.unwrap_or(defaults.timeout),
             draft_timeout: self.draft_timeout.unwrap_or(defaults.draft_timeout),
             interval: self.interval.unwrap_or(defaults.interval),
+            setup_command: self.setup_command.clone(),
         }
     }
+}
+
+pub fn normalize_setup_command(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -825,6 +834,7 @@ mod tests {
             timeout: Some(Duration::from_secs(1800)),
             draft_timeout: None,
             interval: Some(Duration::from_secs(10)),
+            setup_command: Some("pnpm install".into()),
         };
         assert_eq!(
             settings.resolve(&defaults),
@@ -832,6 +842,7 @@ mod tests {
                 timeout: Duration::from_secs(1800),
                 draft_timeout: Duration::from_secs(7200),
                 interval: Duration::from_secs(10),
+                setup_command: Some("pnpm install".into()),
             }
         );
         assert_eq!(
@@ -844,6 +855,7 @@ mod tests {
                 timeout: Duration::from_secs(3600),
                 draft_timeout: Duration::from_secs(14400),
                 interval: Duration::from_secs(45),
+                setup_command: None,
             }
         );
         assert_eq!(
@@ -852,6 +864,7 @@ mod tests {
                 timeout: Duration::from_secs(3600),
                 draft_timeout: Duration::from_secs(7200),
                 interval: Duration::from_secs(45),
+                setup_command: None,
             }
         );
     }
@@ -862,6 +875,7 @@ mod tests {
             timeout: None,
             draft_timeout: Some(Duration::from_secs(5400)),
             interval: None,
+            setup_command: None,
         };
         let json = serde_json::to_value(&settings).unwrap();
         assert_eq!(json, serde_json::json!({ "draft_timeout": "90m" }));
@@ -877,6 +891,26 @@ mod tests {
             serde_json::from_str::<RepoSettings>("{}").unwrap(),
             RepoSettings::default()
         );
+    }
+
+    #[test]
+    fn setup_command_loads_old_configs_and_omits_blank_input() {
+        let mut settings: RepoSettings =
+            serde_json::from_str(r#"{"timeout":"1h","interval":"30s"}"#).unwrap();
+        assert_eq!(settings.setup_command, None);
+        assert_eq!(settings.resolve(&Defaults::default()).setup_command, None);
+
+        settings.setup_command = normalize_setup_command("  pnpm install  ").map(str::to_owned);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["setup_command"], "pnpm install");
+        assert_eq!(
+            serde_json::from_value::<RepoSettings>(json).unwrap(),
+            settings
+        );
+
+        settings.setup_command = normalize_setup_command(" \t ").map(str::to_owned);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert!(json.get("setup_command").is_none());
     }
 
     #[test]

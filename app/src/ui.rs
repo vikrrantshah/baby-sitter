@@ -184,6 +184,7 @@ struct RepoInputs {
     timeout: Entity<InputState>,
     draft_timeout: Entity<InputState>,
     interval: Entity<InputState>,
+    setup_command: Option<Entity<InputState>>,
     timeout_error: Option<String>,
     draft_timeout_error: Option<String>,
     interval_error: Option<String>,
@@ -798,6 +799,7 @@ impl AppView {
             timeout,
             draft_timeout,
             interval,
+            setup_command: None,
             timeout_error: None,
             draft_timeout_error: None,
             interval_error: None,
@@ -812,14 +814,46 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let inputs = Self::duration_inputs(
+        let mut inputs = Self::duration_inputs(
             DurationTarget::Repo(repo.clone()),
             [settings.timeout, settings.draft_timeout, settings.interval],
             Some(self.config.app.defaults),
             window,
             cx,
         );
+        let setup_command = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.setup_command.clone().unwrap_or_default())
+                .placeholder("pnpm install")
+        });
+        let target = repo.clone();
+        inputs._subscriptions.push(cx.subscribe_in(
+            &setup_command,
+            window,
+            move |this: &mut Self, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    let value = input.read(cx).value().to_string();
+                    this.update_setup_command(&target, &value);
+                    cx.notify();
+                }
+            },
+        ));
+        inputs.setup_command = Some(setup_command);
         self.inputs.insert(repo, inputs);
+    }
+
+    fn update_setup_command(&mut self, repo: &RepoName, text: &str) {
+        let value = model::normalize_setup_command(text);
+        let previous = self.config.repos.get_mut(repo).and_then(|settings| {
+            (settings.setup_command.as_deref() != value)
+                .then(|| std::mem::replace(&mut settings.setup_command, value.map(str::to_owned)))
+        });
+        if let Some(previous) = previous
+            && !self.save()
+            && let Some(settings) = self.config.repos.get_mut(repo)
+        {
+            settings.setup_command = previous;
+        }
     }
 
     fn update_duration(
@@ -2041,7 +2075,7 @@ impl AppView {
         let inputs = self
             .inputs
             .get(repo)
-            .expect("watched repositories have duration inputs");
+            .expect("watched repositories have settings inputs");
         let header = div()
             .flex_shrink_0()
             .px(px(ROW_INSET))
@@ -2098,7 +2132,17 @@ impl AppView {
                         .max_w(px(SETTINGS_LABEL_WIDTH
                             + SETTINGS_COLUMN_GAP
                             + SETTINGS_INPUT_WIDTH))
-                        .child(duration_fields(inputs)),
+                        .child(duration_fields(inputs).child(duration_field(
+                            Icon::empty().path("icons/square-terminal.svg"),
+                            "Setup command",
+                            "Runs in a new worktree right after it is created, before the babysit starts. Leave empty to skip.",
+                            inputs
+                                .setup_command
+                                .as_ref()
+                                .expect("watched repositories have setup inputs"),
+                            &None,
+                            false,
+                        ))),
                 ),
         );
         (header, body)
@@ -2953,7 +2997,6 @@ impl AppView {
             Load::Ready(results) => {
                 for (section, title) in [
                     (Section::Required, "Required"),
-                    (Section::Optional, "Optional"),
                     (Section::Permissions, "Permissions"),
                 ] {
                     body = body.child(div().pt(px(20.)).pb(px(8.)).font_semibold().child(title));
