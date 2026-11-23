@@ -1222,7 +1222,7 @@ impl AppView {
                                 .text_color(if selected { accent() } else { muted() })
                                 .when(selected, |d| d.font_semibold())
                                 .child(label)
-                                .when(count > 0, |d| d.child(count_pill(count, selected))),
+                                .when(count > 0, |d| d.child(count_pill(count))),
                         )
                     }),
             )
@@ -1918,7 +1918,7 @@ impl AppView {
                                 .text_color(if selected { accent() } else { muted() })
                                 .when(selected, |d| d.font_semibold())
                                 .child(label)
-                                .when(count > 0, |d| d.child(count_pill(count, selected))),
+                                .when(count > 0, |d| d.child(count_pill(count))),
                         )
                     }),
             )
@@ -2042,7 +2042,7 @@ impl AppView {
     }
 }
 
-fn count_pill(count: usize, selected: bool) -> Div {
+fn count_pill(count: usize) -> Div {
     div()
         .h(px(16.))
         .px(px(6.))
@@ -2050,13 +2050,10 @@ fn count_pill(count: usize, selected: bool) -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .bg(if selected {
-            accent().opacity(0.15)
-        } else {
-            raised()
-        })
+        .bg(accent())
         .text_size(px(11.))
-        .text_color(if selected { accent() } else { muted() })
+        .font_semibold()
+        .text_color(surface())
         .child(count.to_string())
 }
 
