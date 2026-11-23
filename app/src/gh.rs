@@ -2,13 +2,102 @@ use crate::model::{PrRef, PrRow, RepoName};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
-    ffi::OsString,
-    os::unix::fs::PermissionsExt,
+    collections::{BTreeMap, HashSet},
+    ffi::{OsStr, OsString},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::Duration,
 };
+
+fn merge_paths(login: Option<&OsStr>, current: &OsStr, home: Option<&OsStr>) -> OsString {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    let fallbacks = [
+        Some(PathBuf::from("/opt/homebrew/bin")),
+        Some(PathBuf::from("/usr/local/bin")),
+        home.map(|home| PathBuf::from(home).join(".cargo/bin")),
+    ];
+    for path in login
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .chain(std::env::split_paths(current))
+        .chain(fallbacks.into_iter().flatten())
+    {
+        if seen.insert(path.as_os_str().to_owned()) {
+            paths.push(path);
+        }
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| current.to_owned())
+}
+
+fn login_shell_path(shell: &OsStr) -> Option<OsString> {
+    let child = Command::new(shell)
+        .args(["-lic", "printf '__BS_PATH__%s__BS_END__' \"$PATH\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let pid = child.id();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+    let output = match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(output)) if output.status.success() => output,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            return None;
+        }
+        _ => return None,
+    };
+    let stdout = std::str::from_utf8(&output.stdout).ok()?;
+    let (_, rest) = stdout.split_once("__BS_PATH__")?;
+    let (path, _) = rest.split_once("__BS_END__")?;
+    (!path.is_empty()).then(|| OsString::from(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_paths_precede_current_paths_and_duplicates_are_removed() {
+        assert_eq!(
+            merge_paths(
+                Some(OsStr::new("/node/bin:/shared:/node/bin:/opt/homebrew/bin")),
+                OsStr::new("/shared:/usr/bin:/usr/local/bin:/usr/bin"),
+                Some(OsStr::new("/home/user")),
+            ),
+            OsString::from(
+                "/node/bin:/shared:/opt/homebrew/bin:/usr/bin:/usr/local/bin:/home/user/.cargo/bin"
+            )
+        );
+    }
+
+    #[test]
+    fn missing_login_keeps_current_paths_and_adds_missing_fallbacks() {
+        assert_eq!(
+            merge_paths(
+                None,
+                OsStr::new("/usr/bin:/home/user/.cargo/bin:/usr/bin"),
+                Some(OsStr::new("/home/user")),
+            ),
+            OsString::from("/usr/bin:/home/user/.cargo/bin:/opt/homebrew/bin:/usr/local/bin")
+        );
+    }
+
+    #[test]
+    fn missing_home_omits_cargo_fallback() {
+        assert_eq!(
+            merge_paths(None, OsStr::new("/usr/bin"), None),
+            OsString::from("/usr/bin:/opt/homebrew/bin:/usr/local/bin")
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct ChildEnv(BTreeMap<OsString, OsString>);
@@ -22,23 +111,17 @@ impl ChildEnv {
             .get(&OsString::from("PATH"))
             .cloned()
             .unwrap_or_default();
-        if !std::env::split_paths(&path).any(|dir| {
-            dir.join("gh")
-                .metadata()
-                .is_ok_and(|entry| entry.is_file() && entry.permissions().mode() & 0o111 != 0)
-        }) {
-            let mut paths = vec![
-                PathBuf::from("/opt/homebrew/bin"),
-                PathBuf::from("/usr/local/bin"),
-            ];
-            if let Some(home) = vars.get(&OsString::from("HOME")) {
-                paths.push(PathBuf::from(home).join(".cargo/bin"));
-            }
-            paths.extend(std::env::split_paths(&path));
-            if let Ok(path) = std::env::join_paths(paths) {
-                vars.insert("PATH".into(), path);
-            }
-        }
+        let shell = vars
+            .get(OsStr::new("SHELL"))
+            .map(OsString::as_os_str)
+            .unwrap_or(OsStr::new("/bin/zsh"));
+        let login = login_shell_path(shell);
+        let merged = merge_paths(
+            login.as_deref(),
+            &path,
+            vars.get(OsStr::new("HOME")).map(OsString::as_os_str),
+        );
+        vars.insert("PATH".into(), merged);
         Self(vars)
     }
     pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
