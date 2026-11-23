@@ -92,95 +92,139 @@ fn git_output(
     command.output().context("start git")
 }
 
+pub fn sweep_trash(data: &Path) {
+    let trash = data.join("trash");
+    thread::spawn(move || {
+        if let Ok(entries) = std::fs::read_dir(trash) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(path);
+                } else {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    });
+}
+
 pub fn remove_worktree(env: &ChildEnv, data: &Path, locks: &RepoLocks, pr: &PrRef) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
-    let lock = repo_lock(locks, &pr.repo);
-    let _guard = lock
-        .lock()
-        .map_err(|error| anyhow::anyhow!("repository lock: {error}"))?;
-    let clone = clone_path(data, &pr.repo);
-    if !clone.exists() {
-        return Ok(());
-    }
-    let worktree = worktree_path(data, pr);
-    let remove = git_output(
-        env,
-        &clone,
-        &[
-            "worktree".as_ref(),
-            "remove".as_ref(),
-            "--force".as_ref(),
-            worktree.as_os_str(),
-        ],
-    )?;
-    let branch = format!("baby-sitter/pr-{}", pr.number);
-    let reference = format!("refs/heads/{branch}");
-    let exists = git_output(
-        env,
-        &clone,
-        &[
-            "show-ref".as_ref(),
-            "--verify".as_ref(),
-            "--quiet".as_ref(),
-            reference.as_ref(),
-        ],
-    )?;
-    if exists.status.success() {
-        let deleted = git_output(
-            env,
-            &clone,
-            &["branch".as_ref(), "-D".as_ref(), branch.as_ref()],
-        )?;
-        if !deleted.status.success() {
+    let mut trashed = None;
+    let result = (|| {
+        let lock = repo_lock(locks, &pr.repo);
+        let _guard = lock
+            .lock()
+            .map_err(|error| anyhow::anyhow!("repository lock: {error}"))?;
+        let clone = clone_path(data, &pr.repo);
+        if !clone.exists() {
+            return Ok(());
+        }
+        let worktree = worktree_path(data, pr);
+        let remove = if worktree.exists() {
+            let trash = data.join("trash");
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let destination = trash.join(format!(
+                "{}-{}-pr-{}-{nanos}",
+                pr.repo.owner, pr.repo.name, pr.number
+            ));
+            if std::fs::create_dir_all(&trash)
+                .and_then(|()| std::fs::rename(&worktree, &destination))
+                .is_ok()
+            {
+                trashed = Some(destination);
+                None
+            } else {
+                Some(git_output(
+                    env,
+                    &clone,
+                    &[
+                        "worktree".as_ref(),
+                        "remove".as_ref(),
+                        "--force".as_ref(),
+                        worktree.as_os_str(),
+                    ],
+                )?)
+            }
+        } else {
+            None
+        };
+        let prune = git_output(env, &clone, &["worktree".as_ref(), "prune".as_ref()])?;
+        if !prune.status.success() {
             bail!(
-                "delete branch: {}",
-                String::from_utf8_lossy(&deleted.stderr).trim()
+                "prune worktrees: {}",
+                String::from_utf8_lossy(&prune.stderr).trim()
             );
         }
-    } else if exists.status.code() != Some(1) {
-        bail!(
-            "check branch: {}",
-            String::from_utf8_lossy(&exists.stderr).trim()
-        );
-    }
-    let prune = git_output(env, &clone, &["worktree".as_ref(), "prune".as_ref()])?;
-    if !prune.status.success() {
-        bail!(
-            "prune worktrees: {}",
-            String::from_utf8_lossy(&prune.stderr).trim()
-        );
-    }
-    if !remove.status.success() && worktree.exists() {
-        let list = git_output(
+        let branch = format!("baby-sitter/pr-{}", pr.number);
+        let reference = format!("refs/heads/{branch}");
+        let exists = git_output(
             env,
             &clone,
             &[
-                "worktree".as_ref(),
-                "list".as_ref(),
-                "--porcelain".as_ref(),
-                "-z".as_ref(),
+                "show-ref".as_ref(),
+                "--verify".as_ref(),
+                "--quiet".as_ref(),
+                reference.as_ref(),
             ],
         )?;
-        if !list.status.success() {
+        if exists.status.success() {
+            let deleted = git_output(
+                env,
+                &clone,
+                &["branch".as_ref(), "-D".as_ref(), branch.as_ref()],
+            )?;
+            if !deleted.status.success() {
+                bail!(
+                    "delete branch: {}",
+                    String::from_utf8_lossy(&deleted.stderr).trim()
+                );
+            }
+        } else if exists.status.code() != Some(1) {
             bail!(
-                "list worktrees: {}",
-                String::from_utf8_lossy(&list.stderr).trim()
+                "check branch: {}",
+                String::from_utf8_lossy(&exists.stderr).trim()
             );
         }
-        if list
-            .stdout
-            .split(|byte| *byte == 0)
-            .any(|entry| entry.strip_prefix(b"worktree ") == Some(worktree.as_os_str().as_bytes()))
+        if let Some(remove) = remove
+            && !remove.status.success()
+            && worktree.exists()
         {
-            bail!(
-                "remove worktree: {}",
-                String::from_utf8_lossy(&remove.stderr).trim()
-            );
+            let list = git_output(
+                env,
+                &clone,
+                &[
+                    "worktree".as_ref(),
+                    "list".as_ref(),
+                    "--porcelain".as_ref(),
+                    "-z".as_ref(),
+                ],
+            )?;
+            if !list.status.success() {
+                bail!(
+                    "list worktrees: {}",
+                    String::from_utf8_lossy(&list.stderr).trim()
+                );
+            }
+            if list.stdout.split(|byte| *byte == 0).any(|entry| {
+                entry.strip_prefix(b"worktree ") == Some(worktree.as_os_str().as_bytes())
+            }) {
+                bail!(
+                    "remove worktree: {}",
+                    String::from_utf8_lossy(&remove.stderr).trim()
+                );
+            }
+            std::fs::remove_dir_all(&worktree).context("remove unregistered worktree")?;
         }
-        std::fs::remove_dir_all(&worktree).context("remove unregistered worktree")?;
+        Ok(())
+    })();
+    if let Some(path) = trashed {
+        thread::spawn(move || {
+            let _ = std::fs::remove_dir_all(path);
+        });
     }
-    Ok(())
+    result
 }
 
 pub fn sweep_merged(
@@ -682,14 +726,15 @@ pub fn spawn(
         if QUITTING.load(Ordering::SeqCst) {
             return;
         }
-        if outcome == Outcome::Merged {
-            let _ = remove_worktree(&runner.env, &runner.data, &runner.locks, &runner.pr);
-        }
+        let merged = outcome == Outcome::Merged;
+        notify(&runner.pr, &outcome);
         if QUITTING.load(Ordering::SeqCst) {
             return;
         }
-        notify(&runner.pr, &outcome);
         emit(&runner.tx, &runner.pr, SitState::Finished(outcome));
+        if merged && !QUITTING.load(Ordering::SeqCst) {
+            let _ = remove_worktree(&runner.env, &runner.data, &runner.locks, &runner.pr);
+        }
     });
     SitHandle { control }
 }
@@ -826,8 +871,46 @@ mod tests {
         fs::write(tree.join("untracked"), "scratch").unwrap();
         let locks = Arc::new(Mutex::new(BTreeMap::new()));
         remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
+        assert!(!tree.exists());
+        let list = Command::new("git")
+            .args([
+                "-C",
+                clone.to_str().unwrap(),
+                "worktree",
+                "list",
+                "--porcelain",
+            ])
+            .output()
+            .unwrap();
+        assert!(list.status.success());
+        assert!(!String::from_utf8_lossy(&list.stdout).contains(tree.to_str().unwrap()));
         remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
         assert!(!tree.exists());
+        let status = Command::new("git")
+            .args([
+                "-C",
+                clone.to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/baby-sitter/pr-42",
+            ])
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        run(&[
+            "-C",
+            clone.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "baby-sitter/pr-42",
+            tree.to_str().unwrap(),
+            "HEAD",
+        ]);
+        fs::remove_dir_all(&tree).unwrap();
+        remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
+        remove_worktree(&ChildEnv::new(), &data, &locks, &pr).unwrap();
         let status = Command::new("git")
             .args([
                 "-C",

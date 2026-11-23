@@ -130,6 +130,7 @@ pub struct AppView {
     page: Page,
     repos: Load<Vec<RepoName>>,
     prs: Load<Vec<PrRow>>,
+    titles: BTreeMap<PrRef, String>,
     /// Merged PRs dismissed while a GitHub search may still return an older snapshot.
     dismissed_merged: BTreeSet<PrRef>,
     closed_prs: BTreeMap<PrRef, ClosedPr>,
@@ -175,6 +176,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        sitter::sweep_trash(&data);
         let before = config.active.len();
         config
             .active
@@ -242,20 +244,10 @@ impl AppView {
                         }
                         let finished = matches!(event.state, SitState::Finished(_));
                         if let SitState::Finished(outcome) = &event.state {
-                            let title = match &this.prs {
-                                Load::Ready(prs) => prs
-                                    .iter()
-                                    .find(|row| row.pr == event.pr)
-                                    .map(|row| row.title.clone()),
-                                _ => None,
-                            }
-                            .or_else(|| {
-                                this.config
-                                    .history
-                                    .get(&event.pr)
-                                    .map(|past| past.title.clone())
-                            })
-                            .unwrap_or_else(|| format!("Pull request #{}", event.pr.number));
+                            let title =
+                                this.titles.get(&event.pr).cloned().unwrap_or_else(|| {
+                                    format!("Pull request #{}", event.pr.number)
+                                });
                             this.handles.remove(&event.pr);
                             this.config.active.remove(&event.pr);
                             this.config.history.insert(
@@ -301,6 +293,12 @@ impl AppView {
                 }
             }
         });
+        let titles = config
+            .history
+            .iter()
+            .filter(|(_, past)| !past.title.starts_with("Pull request #"))
+            .map(|(pr, past)| (pr.clone(), past.title.clone()))
+            .collect();
         let mut this = Self {
             data,
             config,
@@ -310,6 +308,7 @@ impl AppView {
             page: Page::PullRequests,
             repos: Load::Loading,
             prs: Load::Loading,
+            titles,
             dismissed_merged: BTreeSet::new(),
             closed_prs: BTreeMap::new(),
             org_select,
@@ -626,6 +625,8 @@ impl AppView {
                 match result {
                     Ok(mut prs) => {
                         this.refresh_error = None;
+                        this.titles
+                            .extend(prs.iter().map(|row| (row.pr.clone(), row.title.clone())));
                         this.closed_prs.retain(|pr, state| {
                             let found = prs.iter().any(|row| &row.pr == pr);
                             match (*state, found) {
@@ -1432,6 +1433,14 @@ impl AppView {
             self.selected_filter.as_ref(),
         )
         .into_iter()
+        .map(|mut row| {
+            if let Cow::Owned(row) = &mut row
+                && let Some(title) = self.titles.get(&row.pr)
+            {
+                row.title.clone_from(title);
+            }
+            row
+        })
         .filter(|row| !self.closed_prs.contains_key(&row.pr))
         .collect()
     }
