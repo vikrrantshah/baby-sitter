@@ -1580,19 +1580,14 @@ impl AppView {
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(
+            .child({
+                let label = row.state.label();
                 div()
+                    .id(SharedString::from(format!("state-{}", row.pr)))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(px(4.))
-                    .rounded_full()
-                    .px(px(8.))
-                    .py(px(2.))
-                    .bg(pr_state_color(row.state).opacity(0.12))
                     .text_color(pr_state_color(row.state))
-                    .text_size(px(12.))
-                    .font_semibold()
                     .child(
                         Icon::empty()
                             .path(match row.state {
@@ -1604,8 +1599,8 @@ impl AppView {
                             })
                             .size(px(16.)),
                     )
-                    .child(row.state.label()),
-            )
+                    .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+            })
             .child(
                 div()
                     .min_w_0()
