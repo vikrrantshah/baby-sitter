@@ -34,7 +34,7 @@ Drag the app to `/Applications` to keep it. The script needs Xcode's command lin
 For development, `cargo build --workspace && target/debug/baby-sitter-app` runs the window without a bundle. Both binaries must sit in the same directory. Outside the bundle the Dock shows the name `baby-sitter-app`, and system notification responses are disabled.
 
 - **Repositories** groups accessible repositories by organization and leaves out archived ones. Filter by organization or watched status. Use the toggle to watch a repository and the gear to set its timeout, draft timeout, and interval. A babysit started on a draft uses the draft timeout, and keeps that deadline if the PR is marked ready while it runs. The default interval is `30s`, not the CLI's `10s`. Each pass makes two GraphQL calls, so six PRs at `10s` use most of the hourly limit of 5,000 points.
-- **Pull requests** lists your open PRs and completed babysits. Filter by repository or select All, Watched, Unwatched, or Merged. Watched shows PRs with an active babysit. Unwatched shows PRs that are neither being babysat nor merged, including stopped, timed-out, cancelled, and failed babysits. Completed babysits keep their outcome across restarts until you dismiss them. Press the play button to start a babysit or the stop button to cancel it. The GitHub button opens the PR. Each row shows what the latest pass is doing, and after a stop it shows the reason. Before that text, four icons show what the merge still needs: reviews, an up-to-date branch, checks, and the merge itself. Green is done, amber is waiting, red is blocked, and grey is not started; hover over an icon for its name. A badge in the same colors ends the line: a check for merged, a dash while the babysit runs or after a timeout, a cross after a stop or failure, and an empty ring after a cancel. Hover over the badge for the state's name, such as Stopped or Timed out. The app runs the binary with `--gates` to get the icons. After a stop, the row names the PR's worktree folder; the folder button reveals it in Finder.
+- **Pull requests** lists your open PRs and completed babysits. Filter by repository or select All, Watched, Unwatched, or Merged. Watched shows PRs with an active babysit. Unwatched shows PRs that are neither being babysat nor merged, including stopped, timed-out, cancelled, and failed babysits. Completed babysits keep their outcome across restarts until you dismiss them. Dismiss also deletes the PR's worktree and its local `baby-sitter/pr-<n>` branch, whatever the outcome. Press the play button to start a babysit or the stop button to cancel it. The GitHub button opens the PR. Each row shows what the latest pass is doing, and after a stop it shows the reason. Before that text, four icons show what the merge still needs: reviews, an up-to-date branch, checks, and the merge itself. A draft shows only the first three. Green is done, amber is waiting, red is blocked, and grey is not started; hover over an icon for its name. A badge in the same colors ends the line: a check for merged, a dash while the babysit runs or after a timeout, a cross after a stop or failure, and an empty ring after a cancel. Hover over the badge for the state's name, such as Stopped or Timed out. The app runs the binary with `--gates` to get the icons. After a stop, the row names the PR's worktree folder; the folder button reveals it in Finder.
 - A notification appears when a babysit merges, times out, or stops. A cancel does not notify.
 
 The app keeps its configuration, one clone per repository, and one worktree per PR in `~/Library/Application Support/baby-sitter`. It removes a worktree after a merge and deletes leftover worktrees for merged PRs when the PR list loads. After any other outcome it keeps the worktree and shows its path with a Reveal button.
@@ -60,7 +60,7 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 | `--merge-method` | `squash` | `squash`, `merge`, or `rebase` for direct merges. Merge queues use their configured method. |
 | `--timeout` | `2h` | Deadline for the whole run, including every `gh`, `git`, and `codex` call. |
 | `--interval` | `10s` | Time between snapshots while the run waits. |
-| `--gates` | off | Before every decision, print each merge gate's state: `[gates] reviews=met checks=waiting branch=met merge=pending`. Each rule in `RULES` belongs to one gate. A gate is `blocked` when one of its rules stops the run, `waiting` when one waits or acts, and `met` otherwise. Merge is `pending` until the other three are met, then `waiting` while the binary merges or the PR sits in a queue. |
+| `--gates` | off | Before every decision, print each merge gate's state: `[gates] reviews=met checks=waiting branch=met merge=pending`. Each rule in `RULES` belongs to one gate. A gate is `blocked` when one of its rules stops the run, `waiting` when one waits or acts, and `met` otherwise. Merge is `pending` until the other three are met, then `waiting` while the binary merges or the PR sits in a queue. Merge is `skipped` while the PR is a draft. |
 
 | Exit code | Meaning |
 |---|---|
@@ -95,11 +95,12 @@ flowchart TD
   end
   HC --> PUSH["Commit and push"] --> REPLY["Reply in threads with markers"] --> RR["Request re-review"] --> NEXT
   UH -- no --> CF{{"7 · CI failed?"}}
-  CF -- yes --> LOG["Fetch failed Actions job logs"] --> FC
-  FC -- fixed --> GUARD{{"CI configuration changed?"}}
-  GUARD -- no --> CP["Commit and push"] --> NEXT
+  CF -- "only cancelled Actions runs" --> RERUN["Rerun them<br/>stop after 3 attempts"] --> NEXT
+  CF -- "failed checks" --> LOG["Fetch failed Actions job logs"] --> FC
+  FC -- "fixed, or a partial fix that needs a person" --> GUARD{{"CI configuration changed?"}}
+  GUARD -- no --> CP["Commit and push<br/>stop if a person is still needed"] --> NEXT
   GUARD -- yes --> STOP
-  FC -- "needs human" --> STOP
+  FC -- "needs a person, no edits" --> STOP
   CF -- no --> BE{{"8 · Direct merge behind base?"}}
   BE -- yes --> UP["Update branch"] --> NEXT
   BE -- no --> G{{"9 · Anything blocks the merge?"}}
@@ -117,11 +118,11 @@ The rules live in one ordered table, `RULES` in `src/decide.rs`. The table order
 | 4 | `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Fast-forward when behind. Stop for the others. |
 | 5 | `resolve-fixed` | Resolve threads whose newest marker says `fixed`. |
 | 6 | `unhandled-items` | Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
-| 7 | `fix-ci` | Send failed Actions job logs and external check URLs to Codex, then commit and push a code fix. |
+| 7 | `rerun-cancelled`, `fix-ci` | Rerun Actions runs when every failure is a cancellation, and stop after a run's third attempt. Otherwise send failed Actions job logs and external check URLs to Codex, then commit and push a code fix. |
 | 8 | `behind-base` | Run `gh pr update-branch` for direct merges. Skip this rule for merge queues. |
-| 9 | `ci-pending`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision`, `draft` | Wait, then take a new snapshot. A draft PR runs earlier actions and waits for review readiness before merging or enqueueing. |
+| 9 | `ci-pending`, `ci-starting`, `merge-state`, `unresolved-threads`, `review-requests`, `review-decision`, `draft` | Wait, then take a new snapshot. `ci-starting` waits when a head under three minutes old shows no checks yet, and a check suite that has not finished counts as pending CI. A draft PR runs earlier actions, then keeps waiting until it is marked ready. |
 
-CI fix commits carry the `Baby-Sitter: fix-ci` trailer. The binary stops if CI still fails after three fix commits among the PR's last 20 commits. Codex must not edit CI configuration or weaken tests, and must return `needs_human` for non-code causes. The binary checks for protected CI configuration changes in the working tree before committing and in the commit before pushing. It leaves unsafe changes uncommitted or the unsafe commit local for inspection.
+CI fix commits carry the `Baby-Sitter: fix-ci` trailer. The binary stops if CI still fails after three fix commits among the PR's last 20 commits. Codex must not edit CI configuration or weaken tests. It fixes every cause that is in the code. When a cause needs a person, it returns `needs_human`, and the binary pushes any code fix before stopping with that reason. The binary checks for protected CI configuration changes in the working tree before committing and in the commit before pushing. It leaves unsafe changes uncommitted or the unsafe commit local for inspection.
 
 ## Review threads and replies
 
