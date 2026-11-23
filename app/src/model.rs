@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -327,7 +327,10 @@ pub enum Outcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SitState {
     Preparing,
-    Running { last_line: Option<String> },
+    Running {
+        last_line: Option<String>,
+        since: Instant,
+    },
     Cancelling,
     Finished(Outcome),
 }
@@ -672,7 +675,10 @@ mod tests {
         let sits = BTreeMap::from([
             (
                 "owner/one#3".parse().unwrap(),
-                SitState::Running { last_line: None },
+                SitState::Running {
+                    last_line: None,
+                    since: Instant::now(),
+                },
             ),
             (
                 "owner/one#7".parse().unwrap(),
@@ -729,7 +735,10 @@ mod tests {
         assert_eq!(pr_status(None), PrStatus::Unwatched);
         for state in [
             SitState::Preparing,
-            SitState::Running { last_line: None },
+            SitState::Running {
+                last_line: None,
+                since: Instant::now(),
+            },
             SitState::Cancelling,
         ] {
             assert_eq!(pr_status(Some(&state)), PrStatus::Watched);

@@ -223,6 +223,7 @@ impl AppView {
                         }
                         if let SitState::Running {
                             last_line: Some(line),
+                            ..
                         } = &event.state
                             && let Some(gates) = model::parse_gates(line)
                         {
@@ -242,7 +243,7 @@ impl AppView {
                 }
             }
         });
-        // Keeps each babysit's time left current between its own output lines.
+        // Keeps countdowns and step durations current between output lines.
         let clock = cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor()
@@ -816,7 +817,7 @@ impl AppView {
     fn ask_cancel(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
         let acting = matches!(
             self.states.get(&pr),
-            Some(SitState::Running { last_line: Some(line) })
+            Some(SitState::Running { last_line: Some(line), .. })
                 if model::parse_pass(line).is_some_and(|pass| pass.kind == VerdictKind::Act)
         );
         if !acting {
@@ -862,16 +863,29 @@ impl AppView {
             Some(SitState::Preparing) => {
                 reading(Waiting, "Preparing", Some("Setting up the worktree"))
             }
-            Some(SitState::Running { last_line: None }) => {
-                reading(Waiting, "Starting", Some("Taking the first snapshot"))
-            }
+            Some(SitState::Running {
+                last_line: None, ..
+            }) => reading(Waiting, "Starting", Some("Taking the first snapshot")),
             Some(SitState::Running {
                 last_line: Some(line),
+                since,
             }) => match model::parse_pass(line) {
                 Some(pass) => match pass.kind {
                     VerdictKind::Done => merged,
-                    VerdictKind::Wait => reading(Waiting, "Waiting", Some(pass.detail)),
-                    VerdictKind::Act => reading(Waiting, "Working", Some(pass.detail)),
+                    VerdictKind::Wait | VerdictKind::Act => {
+                        let verb = if pass.kind == VerdictKind::Wait {
+                            "Waiting"
+                        } else {
+                            "Working"
+                        };
+                        let mut result = reading(Waiting, verb, Some(pass.detail));
+                        let seconds = since.elapsed().as_secs();
+                        if seconds >= 60 {
+                            result.detail =
+                                Some(format!("{} · {}", pass.detail, format_minutes(seconds)));
+                        }
+                        result
+                    }
                     VerdictKind::Stop => reading(Blocked, "Stopping", Some(pass.detail)),
                 },
                 None => reading(
@@ -1910,13 +1924,19 @@ where
 fn drag_area() -> Div {
     div().on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
 }
-fn time_left(seconds: u64) -> String {
+fn format_minutes(seconds: u64) -> String {
     let minutes = seconds / 60;
     match (minutes / 60, minutes % 60) {
-        (0, 0) => "Under a minute left".to_owned(),
-        (0, m) => format!("{m}m left"),
-        (h, 0) => format!("{h}h left"),
-        (h, m) => format!("{h}h {m}m left"),
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+fn time_left(seconds: u64) -> String {
+    if seconds < 60 {
+        "Under a minute left".to_owned()
+    } else {
+        format!("{} left", format_minutes(seconds))
     }
 }
 /// One choice in a header picker: an organization or repository with its owner's

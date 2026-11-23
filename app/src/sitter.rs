@@ -401,6 +401,10 @@ impl Runner {
         let mut stderr_done = false;
         let mut status = None;
         let mut interrupted = None;
+        let mut last_running = SitState::Running {
+            last_line: None,
+            since: Instant::now(),
+        };
         let mut drain_until = None;
         loop {
             while let Ok(event) = read_rx.try_recv() {
@@ -410,13 +414,29 @@ impl Runner {
                         stderr.push_str(&line);
                         stderr.push('\n');
                         if matches!(mode, ProcessMode::Sit) && interrupted.is_none() {
-                            emit(
-                                &self.tx,
-                                &self.pr,
-                                SitState::Running {
+                            if model::parse_gates(&line).is_some() {
+                                emit(
+                                    &self.tx,
+                                    &self.pr,
+                                    SitState::Running {
+                                        last_line: Some(line),
+                                        since: Instant::now(),
+                                    },
+                                );
+                            } else {
+                                let since = match &last_running {
+                                    SitState::Running {
+                                        last_line: Some(previous),
+                                        since,
+                                    } if previous == &line => *since,
+                                    _ => Instant::now(),
+                                };
+                                last_running = SitState::Running {
                                     last_line: Some(line),
-                                },
-                            );
+                                    since,
+                                };
+                                emit(&self.tx, &self.pr, last_running.clone());
+                            }
                         }
                     }
                     ReadEvent::StderrDone => stderr_done = true,
@@ -582,7 +602,14 @@ impl Runner {
             if let Some(reason) = self.interrupted() {
                 return Ok(reason.outcome());
             }
-            emit(&self.tx, &self.pr, SitState::Running { last_line: None });
+            emit(
+                &self.tx,
+                &self.pr,
+                SitState::Running {
+                    last_line: None,
+                    since: Instant::now(),
+                },
+            );
             let mut command = self.env.command(&cli);
             command
                 .arg(self.pr.url())
@@ -697,6 +724,48 @@ fn notify(env: &ChildEnv, pr: &PrRef, outcome: &Outcome) {
 mod tests {
     use super::*;
     use std::{fs, os::unix::process::CommandExt};
+    #[test]
+    fn repeated_status_keeps_elapsed_time_until_status_changes() {
+        let (tx, rx) = async_channel::unbounded();
+        let runner = Runner {
+            pr: "owner/repo#1".parse().unwrap(),
+            data: PathBuf::new(),
+            env: ChildEnv::new(),
+            deadline: unix_now() + 60,
+            settings: RepoSettings::default(),
+            registry: Arc::new(Mutex::new(BTreeMap::new())),
+            locks: Arc::new(Mutex::new(BTreeMap::new())),
+            control: Arc::new(Control {
+                cancelled: AtomicBool::new(false),
+                wake: Condvar::new(),
+                mutex: Mutex::new(()),
+            }),
+            tx,
+        };
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "echo '[ci] wait: pending' >&2; sleep 0.2; echo '[gates] reviews=met checks=waiting branch=met merge=pending' >&2; echo '[ci] wait: pending' >&2; sleep 0.2; echo '[fix] Fixing CI' >&2",
+        ]);
+        runner.run(command, ProcessMode::Sit).unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| event.state)
+            .collect();
+        let [
+            SitState::Running { since: first, .. },
+            SitState::Running { .. },
+            SitState::Running {
+                since: repeated, ..
+            },
+            SitState::Running { since: changed, .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected four running events, got {events:?}");
+        };
+        assert_eq!(first, repeated);
+        assert!(changed > repeated);
+    }
+
     #[test]
     fn parses_only_worktree_paths() {
         let root = Path::new("/data/worktrees");
