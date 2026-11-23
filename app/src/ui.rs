@@ -28,7 +28,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 enum Load<T> {
@@ -267,6 +267,7 @@ pub struct AppView {
     _subscriptions: Vec<Subscription>,
     _events: Task<()>,
     _clock: Task<()>,
+    pulse_epoch: Instant,
     repo_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
@@ -278,6 +279,12 @@ pub struct AppView {
 }
 
 impl AppView {
+    /// One opacity for every pulsing icon this frame, from a single start time.
+    fn pulse(&self) -> f32 {
+        const PERIOD_MS: u128 = 2400;
+        let phase = (self.pulse_epoch.elapsed().as_millis() % PERIOD_MS) as f32 / PERIOD_MS as f32;
+        pulsating_between(0.35, 1.0)(phase)
+    }
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Settings(SettingsPage::App);
         cx.notify();
@@ -506,6 +513,7 @@ impl AppView {
             },
             _events: events,
             _clock: clock,
+            pulse_epoch: Instant::now(),
             repo_task: None,
             avatar_task: None,
             pr_task: None,
@@ -2353,7 +2361,7 @@ impl AppView {
                             }
                             gates
                         },
-                        active,
+                        active.then(|| self.pulse()),
                     ))
                     .when_some(worktree, |line, worktree| line.child(worktree)),
             )
@@ -3280,8 +3288,9 @@ const GATE_ICONS: [(usize, IconName, &str); 4] = [
     (3, IconName::GitMerge, "Merge"),
 ];
 /// One icon per merge requirement, colored by its state and named in its tooltip.
-/// A waiting requirement pulses while the babysit runs.
-fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
+/// A waiting requirement pulses while the babysit runs, at `pulse` opacity, so every
+/// pulsing icon shares one phase.
+fn gate_icons(pr: &PrRef, gates: &[GateState; 4], pulse: Option<f32>) -> Div {
     div()
         .flex_shrink_0()
         .h(px(19.))
@@ -3297,19 +3306,11 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
                     let (color, word) = state_style(state);
                     let label = SharedString::from(format!("{name}: {word}"));
                     let id = SharedString::from(format!("gate-{pr}-{name}"));
-                    let mark = Icon::new(icon).size(px(15.)).text_color(color);
-                    let mark = if live && state == GateState::Waiting {
-                        mark.with_animation(
-                            id.clone(),
-                            Animation::new(Duration::from_millis(2400))
-                                .repeat()
-                                .with_easing(pulsating_between(0.35, 1.0)),
-                            move |mark, delta| mark.text_color(color.opacity(delta)),
-                        )
-                        .into_any_element()
-                    } else {
-                        mark.into_any_element()
+                    let color = match pulse {
+                        Some(opacity) if state == GateState::Waiting => color.opacity(opacity),
+                        _ => color,
                     };
+                    let mark = Icon::new(icon).size(px(15.)).text_color(color);
                     div().id(id).child(mark).tooltip(move |window, cx| {
                         let label = label.clone();
                         Tooltip::element(move |_, _| {
@@ -3409,7 +3410,18 @@ fn message(title: &'static str, detail: Option<String>) -> Div {
         .when_some(detail, |d, text| d.child(text))
 }
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.page == Page::PullRequests
+            && self.states.iter().any(|(pr, state)| {
+                state.is_active()
+                    && self
+                        .gates
+                        .get(pr)
+                        .is_some_and(|gates| gates.contains(&GateState::Waiting))
+            })
+        {
+            window.request_animation_frame();
+        }
         if matches!(
             &self.page,
             Page::Settings(SettingsPage::Repo(repo)) if !self.config.repos.contains_key(repo)
