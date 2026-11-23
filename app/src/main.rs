@@ -14,6 +14,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+actions!(
+    baby_sitter,
+    [
+        Quit,
+        OpenSettings,
+        Hide,
+        HideOthers,
+        ShowAll,
+        Refresh,
+        Minimize,
+        Zoom
+    ]
+);
+
 fn alert(message: &str) {
     let _ = std::process::Command::new("/usr/bin/osascript")
         .args([
@@ -66,6 +80,59 @@ fn run() -> anyhow::Result<()> {
             })
             .detach();
             cx.on_window_closed(|cx, _| cx.quit()).detach();
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &Hide, cx| cx.hide());
+            cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+            cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+            cx.bind_keys([
+                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("cmd-h", Hide, None),
+                KeyBinding::new("alt-cmd-h", HideOthers, None),
+                KeyBinding::new("cmd-r", Refresh, None),
+                KeyBinding::new("cmd-m", Minimize, None),
+            ]);
+            cx.set_menus([
+                Menu {
+                    name: "Baby Sitter".into(),
+                    items: vec![
+                        MenuItem::action("Settings…", OpenSettings),
+                        MenuItem::separator(),
+                        MenuItem::action("Hide Baby Sitter", Hide),
+                        MenuItem::action("Hide Others", HideOthers),
+                        MenuItem::action("Show All", ShowAll),
+                        MenuItem::separator(),
+                        MenuItem::action("Quit Baby Sitter", Quit),
+                    ],
+                    disabled: false,
+                },
+                Menu {
+                    name: "Edit".into(),
+                    items: vec![
+                        MenuItem::action("Undo", component::input::Undo),
+                        MenuItem::action("Redo", component::input::Redo),
+                        MenuItem::separator(),
+                        MenuItem::action("Cut", component::input::Cut),
+                        MenuItem::action("Copy", component::input::Copy),
+                        MenuItem::action("Paste", component::input::Paste),
+                        MenuItem::action("Select All", component::input::SelectAll),
+                    ],
+                    disabled: false,
+                },
+                Menu {
+                    name: "View".into(),
+                    items: vec![MenuItem::action("Refresh", Refresh)],
+                    disabled: false,
+                },
+                Menu {
+                    name: "Window".into(),
+                    items: vec![
+                        MenuItem::action("Minimize", Minimize),
+                        MenuItem::action("Zoom", Zoom),
+                    ],
+                    disabled: false,
+                },
+            ]);
             let bounds = Bounds::centered(None, size(px(1080.0), px(760.0)), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -77,10 +144,30 @@ fn run() -> anyhow::Result<()> {
                 }),
                 ..Default::default()
             };
-            open_window(options, cx, move |window, cx| {
+            let (window, view) = open_window(options, cx, move |window, cx| {
                 cx.new(|cx| ui::AppView::new(data, config, env, registry, locks, window, cx))
             })
             .expect("open baby-sitter window");
+            let view = view.downgrade();
+            let settings_view = view.clone();
+            cx.on_action(move |_: &OpenSettings, cx| {
+                let _ = settings_view.update(cx, |view, cx| view.open_settings(cx));
+            });
+            cx.on_action(move |_: &Refresh, cx| {
+                let view = view.clone();
+                let _ = window.update(cx, |_, window, cx| {
+                    let _ = view.update(cx, |view, cx| {
+                        view.refresh(window, cx);
+                        cx.notify();
+                    });
+                });
+            });
+            cx.on_action(move |_: &Minimize, cx| {
+                let _ = window.update(cx, |_, window, _| window.minimize_window());
+            });
+            cx.on_action(move |_: &Zoom, cx| {
+                let _ = window.update(cx, |_, window, _| window.zoom_window());
+            });
             notifications::init();
             cx.activate(true);
         });

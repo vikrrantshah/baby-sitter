@@ -1,8 +1,8 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, Config, GateState, Outcome, PastSit, PrFilter, PrRef, PrRow, PrState, RepoListItem,
-        RepoName, RepoScope, RepoSettings, SitState, VerdictKind,
+        self, Config, Defaults, GateState, Outcome, PastSit, PrFilter, PrRef, PrRow, PrState,
+        RepoListItem, RepoName, RepoScope, RepoSettings, SitState, VerdictKind,
     },
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
@@ -42,6 +42,7 @@ enum Page {
 #[derive(Clone, Eq, PartialEq)]
 enum SettingsPage {
     Repositories,
+    App,
     Repo(RepoName),
 }
 #[derive(Clone, Copy)]
@@ -49,6 +50,30 @@ enum Field {
     Timeout,
     DraftTimeout,
     Interval,
+}
+
+impl Field {
+    fn default_value(self, defaults: &mut Defaults) -> &mut Duration {
+        match self {
+            Self::Timeout => &mut defaults.timeout,
+            Self::DraftTimeout => &mut defaults.draft_timeout,
+            Self::Interval => &mut defaults.interval,
+        }
+    }
+
+    fn repo_value(self, settings: &mut RepoSettings) -> &mut Option<Duration> {
+        match self {
+            Self::Timeout => &mut settings.timeout,
+            Self::DraftTimeout => &mut settings.draft_timeout,
+            Self::Interval => &mut settings.interval,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum DurationTarget {
+    App,
+    Repo(RepoName),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +128,24 @@ struct RepoInputs {
     _subscriptions: Vec<Subscription>,
 }
 
+impl RepoInputs {
+    fn input(&self, field: Field) -> &Entity<InputState> {
+        match field {
+            Field::Timeout => &self.timeout,
+            Field::DraftTimeout => &self.draft_timeout,
+            Field::Interval => &self.interval,
+        }
+    }
+
+    fn error_mut(&mut self, field: Field) -> &mut Option<String> {
+        match field {
+            Field::Timeout => &mut self.timeout_error,
+            Field::DraftTimeout => &mut self.draft_timeout_error,
+            Field::Interval => &mut self.interval_error,
+        }
+    }
+}
+
 /// How a pull request row's status line reads.
 struct Reading {
     /// The state's name, shown in the badge tooltip. `None` for a pull request
@@ -143,6 +186,7 @@ pub struct AppView {
     drafts_only: bool,
     dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
     selected_filter: Option<RepoName>,
+    app_inputs: RepoInputs,
     inputs: BTreeMap<RepoName, RepoInputs>,
     states: BTreeMap<PrRef, SitState>,
     /// Each babysit's latest gate report; kept after it finishes to show what held it.
@@ -167,6 +211,11 @@ pub struct AppView {
 }
 
 impl AppView {
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.page = Page::Settings(SettingsPage::Repositories);
+        cx.notify();
+    }
+
     pub fn new(
         data: PathBuf,
         mut config: Config,
@@ -258,6 +307,14 @@ impl AppView {
                                     finished_at: model::unix_now(),
                                 },
                             );
+                            if *outcome == Outcome::Merged {
+                                this.remove_worktree(event.pr.clone(), window, cx);
+                            }
+                            if *outcome == Outcome::Merged && this.config.app.auto_dismiss_merged {
+                                this.states.insert(event.pr.clone(), event.state);
+                                this.dismiss(event.pr, window, cx);
+                                return;
+                            }
                             this.save();
                         }
                         if let SitState::Running {
@@ -299,6 +356,18 @@ impl AppView {
             .filter(|(_, past)| !past.title.starts_with("Pull request #"))
             .map(|(pr, past)| (pr.clone(), past.title.clone()))
             .collect();
+        let defaults = config.app.defaults;
+        let app_inputs = Self::duration_inputs(
+            DurationTarget::App,
+            [
+                Some(defaults.timeout),
+                Some(defaults.draft_timeout),
+                Some(defaults.interval),
+            ],
+            None,
+            window,
+            cx,
+        );
         let mut this = Self {
             data,
             config,
@@ -319,6 +388,7 @@ impl AppView {
             drafts_only: false,
             dashboard_filter,
             selected_filter: None,
+            app_inputs,
             inputs: BTreeMap::new(),
             states: BTreeMap::new(),
             gates: BTreeMap::new(),
@@ -349,6 +419,9 @@ impl AppView {
         for (pr, deadline) in this.config.active.clone() {
             this.resume(pr, deadline);
         }
+        if this.config.app.auto_dismiss_merged {
+            this.dismiss_merged_history(window, cx);
+        }
         this.update_filter(window, cx);
         this.refresh(window, cx);
         this
@@ -365,6 +438,72 @@ impl AppView {
             }
         }
     }
+    fn duration_inputs(
+        target: DurationTarget,
+        values: [Option<Duration>; 3],
+        defaults: Option<Defaults>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> RepoInputs {
+        fn make_input(
+            value: Option<Duration>,
+            default: Option<Duration>,
+            window: &mut Window,
+            cx: &mut Context<AppView>,
+        ) -> Entity<InputState> {
+            let value = value.map(model::format_duration).unwrap_or_default();
+            let placeholder = default
+                .map(|duration| format!("{} (app default)", model::format_duration(duration)))
+                .unwrap_or_default();
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(value)
+                    .placeholder(placeholder)
+            })
+        }
+
+        let defaults = defaults
+            .map(|defaults| {
+                [
+                    Some(defaults.timeout),
+                    Some(defaults.draft_timeout),
+                    Some(defaults.interval),
+                ]
+            })
+            .unwrap_or([None; 3]);
+        let timeout = make_input(values[0], defaults[0], window, cx);
+        let draft_timeout = make_input(values[1], defaults[1], window, cx);
+        let interval = make_input(values[2], defaults[2], window, cx);
+        let mut subscriptions = Vec::new();
+        for (input, field) in [
+            (&timeout, Field::Timeout),
+            (&draft_timeout, Field::DraftTimeout),
+            (&interval, Field::Interval),
+        ] {
+            let target = target.clone();
+            subscriptions.push(cx.subscribe_in(
+                input,
+                window,
+                move |this: &mut Self, input, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        let value = input.read(cx).value().to_string();
+                        this.update_duration(&target, field, &value, window, cx);
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+        RepoInputs {
+            timeout,
+            draft_timeout,
+            interval,
+            timeout_error: None,
+            draft_timeout_error: None,
+            interval_error: None,
+            _subscriptions: subscriptions,
+        }
+    }
+
     fn add_inputs(
         &mut self,
         repo: RepoName,
@@ -372,97 +511,80 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let timeout = cx.new(|cx| {
-            InputState::new(window, cx).default_value(model::format_duration(settings.timeout))
-        });
-        let draft_timeout = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(model::format_duration(settings.draft_timeout))
-        });
-        let interval = cx.new(|cx| {
-            InputState::new(window, cx).default_value(model::format_duration(settings.interval))
-        });
-        let mut subscriptions = Vec::new();
-        for (input, field) in [
-            (&timeout, Field::Timeout),
-            (&draft_timeout, Field::DraftTimeout),
-            (&interval, Field::Interval),
-        ] {
-            let repo = repo.clone();
-            subscriptions.push(cx.subscribe_in(
-                input,
-                window,
-                move |this: &mut Self, input, event: &InputEvent, _window, cx| {
-                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                        let value = input.read(cx).value().to_string();
-                        this.update_duration(&repo, field, &value);
-                        cx.notify();
-                    }
-                },
-            ));
-        }
-        self.inputs.insert(
-            repo,
-            RepoInputs {
-                timeout,
-                draft_timeout,
-                interval,
-                timeout_error: None,
-                draft_timeout_error: None,
-                interval_error: None,
-                _subscriptions: subscriptions,
-            },
+        let inputs = Self::duration_inputs(
+            DurationTarget::Repo(repo.clone()),
+            [settings.timeout, settings.draft_timeout, settings.interval],
+            Some(self.config.app.defaults),
+            window,
+            cx,
         );
+        self.inputs.insert(repo, inputs);
     }
-    fn update_duration(&mut self, repo: &RepoName, field: Field, text: &str) {
-        let parsed = model::parse_duration(text).and_then(|duration| {
-            if matches!(field, Field::Interval) && duration.is_zero() {
-                Err("Interval must be greater than 0".into())
-            } else {
-                Ok(duration)
-            }
-        });
-        match parsed {
-            Ok(duration) => {
-                let previous = self.config.repos.get_mut(repo).and_then(|settings| {
-                    let value = match field {
-                        Field::Timeout => &mut settings.timeout,
-                        Field::DraftTimeout => &mut settings.draft_timeout,
-                        Field::Interval => &mut settings.interval,
-                    };
-                    if *value == duration {
-                        None
-                    } else {
-                        Some(std::mem::replace(value, duration))
+
+    fn update_duration(
+        &mut self,
+        target: &DurationTarget,
+        field: Field,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.trim();
+        let parsed = if text.is_empty() && matches!(target, DurationTarget::Repo(_)) {
+            Ok(None)
+        } else {
+            model::parse_duration(text).and_then(|duration| {
+                if matches!(field, Field::Interval) && duration.is_zero() {
+                    Err("Interval must be greater than 0".into())
+                } else {
+                    Ok(Some(duration))
+                }
+            })
+        };
+        let error = match parsed {
+            Ok(value) => {
+                match target {
+                    DurationTarget::App => {
+                        let duration = value.expect("app defaults cannot be empty");
+                        let current = field.default_value(&mut self.config.app.defaults);
+                        let previous = std::mem::replace(current, duration);
+                        if previous != duration {
+                            if self.save() {
+                                let placeholder =
+                                    format!("{} (app default)", model::format_duration(duration));
+                                for inputs in self.inputs.values() {
+                                    inputs.input(field).update(cx, |input, cx| {
+                                        input.set_placeholder(placeholder.clone(), window, cx);
+                                    });
+                                }
+                            } else {
+                                *field.default_value(&mut self.config.app.defaults) = previous;
+                            }
+                        }
                     }
-                });
-                if let Some(previous) = previous
-                    && !self.save()
-                    && let Some(settings) = self.config.repos.get_mut(repo)
-                {
-                    match field {
-                        Field::Timeout => settings.timeout = previous,
-                        Field::DraftTimeout => settings.draft_timeout = previous,
-                        Field::Interval => settings.interval = previous,
+                    DurationTarget::Repo(repo) => {
+                        let previous = self.config.repos.get_mut(repo).and_then(|settings| {
+                            let current = field.repo_value(settings);
+                            (*current != value).then(|| std::mem::replace(current, value))
+                        });
+                        if let Some(previous) = previous
+                            && !self.save()
+                            && let Some(settings) = self.config.repos.get_mut(repo)
+                        {
+                            *field.repo_value(settings) = previous;
+                        }
                     }
                 }
-                if let Some(inputs) = self.inputs.get_mut(repo) {
-                    match field {
-                        Field::Timeout => inputs.timeout_error = None,
-                        Field::DraftTimeout => inputs.draft_timeout_error = None,
-                        Field::Interval => inputs.interval_error = None,
-                    }
-                }
+                None
             }
-            Err(error) => {
-                if let Some(inputs) = self.inputs.get_mut(repo) {
-                    match field {
-                        Field::Timeout => inputs.timeout_error = Some(error),
-                        Field::DraftTimeout => inputs.draft_timeout_error = Some(error),
-                        Field::Interval => inputs.interval_error = Some(error),
-                    }
-                }
-            }
+            Err(error) => Some(error),
+        };
+        let inputs = match target {
+            DurationTarget::App => Some(&mut self.app_inputs),
+            DurationTarget::Repo(repo) => self.inputs.get_mut(repo),
+        };
+        if let Some(inputs) = inputs {
+            *inputs.error_mut(field) = error;
         }
     }
     fn toggle_repo(
@@ -507,7 +629,7 @@ impl AppView {
             .filter(|(pr, state)| &pr.repo == repo && state.is_active())
             .count()
     }
-    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.loading_repos || self.loading_prs {
             return;
         }
@@ -811,9 +933,10 @@ impl AppView {
         if self.handles.contains_key(&pr) {
             return;
         }
-        let Some(settings) = self.config.repos.get(&pr.repo).cloned() else {
+        let Some(settings) = self.config.repos.get(&pr.repo) else {
             return;
         };
+        let settings = settings.resolve(&self.config.app.defaults);
         self.states.insert(pr.clone(), SitState::Preparing);
         self.gates.remove(&pr);
         let handle = sitter::spawn(
@@ -837,6 +960,7 @@ impl AppView {
         let Some(settings) = self.config.repos.get(&pr.repo) else {
             return;
         };
+        let settings = settings.resolve(&self.config.app.defaults);
         let timeout = if matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|row| row.pr == pr && row.state == PrState::Draft))
         {
             settings.draft_timeout
@@ -862,20 +986,8 @@ impl AppView {
         self.update_filter(window, cx);
         cx.notify();
     }
-    fn dismiss(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
+    fn remove_worktree(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
         if self.removal_tasks.contains_key(&pr) {
-            return;
-        }
-        let merged = match self.states.get(&pr) {
-            Some(SitState::Finished(outcome)) => *outcome == Outcome::Merged,
-            _ => return,
-        };
-        let previous = self.config.history.remove(&pr);
-        if !self.save() {
-            if let Some(past) = previous {
-                self.config.history.insert(pr, past);
-            }
-            cx.notify();
             return;
         }
         let env = self.env.clone();
@@ -900,7 +1012,23 @@ impl AppView {
                 cx.notify();
             });
         });
-        self.removal_tasks.insert(pr.clone(), task);
+        self.removal_tasks.insert(pr, task);
+    }
+
+    fn dismiss(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let merged = match self.states.get(&pr) {
+            Some(SitState::Finished(outcome)) => *outcome == Outcome::Merged,
+            _ => return true,
+        };
+        let previous = self.config.history.remove(&pr);
+        if !self.save() {
+            if let Some(past) = previous {
+                self.config.history.insert(pr, past);
+            }
+            cx.notify();
+            return false;
+        }
+        self.remove_worktree(pr.clone(), window, cx);
         if merged {
             if let Load::Ready(prs) = &mut self.prs {
                 prs.retain(|row| row.pr != pr);
@@ -910,6 +1038,43 @@ impl AppView {
         self.states.remove(&pr);
         self.gates.remove(&pr);
         self.update_filter(window, cx);
+        cx.notify();
+        true
+    }
+    fn dismiss_merged_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let merged: Vec<_> = self
+            .config
+            .history
+            .iter()
+            .filter(|(_, past)| past.outcome == Outcome::Merged)
+            .map(|(pr, _)| pr.clone())
+            .collect();
+        for pr in merged {
+            if !self.dismiss(pr, window, cx) {
+                break;
+            }
+        }
+    }
+
+    fn set_auto_dismiss_merged(
+        &mut self,
+        checked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.config.app.auto_dismiss_merged;
+        if previous == checked {
+            return;
+        }
+        self.config.app.auto_dismiss_merged = checked;
+        if !self.save() {
+            self.config.app.auto_dismiss_merged = previous;
+        } else if checked {
+            if self.pr_filter == PrFilter::Merged {
+                self.pr_filter = PrFilter::All;
+            }
+            self.dismiss_merged_history(window, cx);
+        }
         cx.notify();
     }
     fn cancel(&mut self, pr: PrRef, cx: &mut Context<Self>) {
@@ -1092,6 +1257,31 @@ impl AppView {
             .child(settings)
             .into_any_element()
     }
+    fn settings_header(
+        &self,
+        title: &'static str,
+        detail: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        div()
+            .flex_shrink_0()
+            .pt(px(20.))
+            .child(
+                div().px(px(ROW_INSET)).flex().items_start().child(
+                    Button::new("back-to-pull-requests")
+                        .icon(IconName::ChevronLeft)
+                        .label("Pull requests")
+                        .ghost()
+                        .ml(px(-8.))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page = Page::PullRequests;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(header(title, detail).pt(px(16.)))
+    }
+
     fn render_repos(&self, cx: &mut Context<Self>) -> (Div, Div) {
         let repo_counts = model::repo_counts(
             match &self.repos {
@@ -1257,84 +1447,111 @@ impl AppView {
             .flex_col()
             .child(filters)
             .child(div().flex_1().min_h_0().child(list));
-        let header = div()
-            .flex_shrink_0()
-            .pt(px(20.))
-            .child(
-                div().px(px(ROW_INSET)).flex().items_start().child(
-                    Button::new("back-to-pull-requests")
-                        .icon(IconName::ChevronLeft)
-                        .label("Pull requests")
-                        .ghost()
-                        .ml(px(-8.))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page = Page::PullRequests;
-                            cx.notify();
-                        })),
-                ),
-            )
-            .child(
-                header(
-                    "Repositories",
-                    Some("Babysits run only in the repositories you watch."),
-                )
-                .pt(px(10.)),
-            );
+        let header = self.settings_header(
+            "Repositories",
+            Some("Babysits run only in the repositories you watch."),
+            cx,
+        );
         (header, body)
     }
+    fn render_app_settings(&self, cx: &mut Context<Self>) -> (Div, Div) {
+        let header = self
+            .settings_header("App", None, cx)
+            .border_b_1()
+            .border_color(divider());
+        let switch = Switch::new("auto-dismiss-merged")
+            .accessibility_label("Auto-dismiss merged PRs")
+            .checked(self.config.app.auto_dismiss_merged)
+            .on_click(cx.listener(|this, checked, window, cx| {
+                this.set_auto_dismiss_merged(*checked, window, cx);
+            }));
+        let body = div().size_full().child(
+            div()
+                .id("app-settings-form")
+                .size_full()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .px(px(ROW_INSET))
+                        .py(px(28.))
+                        .w_full()
+                        .max_w(px(SETTINGS_LABEL_WIDTH
+                            + SETTINGS_COLUMN_GAP
+                            + SETTINGS_INPUT_WIDTH))
+                        .flex()
+                        .flex_col()
+                        .gap(px(28.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(20.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .font_semibold()
+                                                .text_size(px(16.))
+                                                .text_color(ink())
+                                                .child("Defaults"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .text_color(muted())
+                                                .child("Used by repositories that do not set their own value."),
+                                        ),
+                                )
+                                .child(duration_fields(&self.app_inputs)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.))
+                                .child(
+                                    div()
+                                        .font_semibold()
+                                        .text_size(px(16.))
+                                        .text_color(ink())
+                                        .child("Merged PRs"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(16.))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .font_semibold()
+                                                .text_size(px(14.))
+                                                .text_color(ink())
+                                                .child("Auto-dismiss merged PRs"),
+                                        )
+                                        .child(switch),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .line_height(relative(1.4))
+                                        .text_color(muted())
+                                        .child("Remove a merged PR's row and worktree as soon as it merges. Hides the Merged filter."),
+                                ),
+                        ),
+                ),
+        );
+        (header, body)
+    }
+
     fn render_repo_settings(&self, repo: &RepoName, cx: &mut Context<Self>) -> (Div, Div) {
         let inputs = self
             .inputs
             .get(repo)
             .expect("watched repositories have duration inputs");
-        let field = |icon: Icon,
-                     label: &'static str,
-                     hint: &'static str,
-                     input: &Entity<InputState>,
-                     error: &Option<String>| {
-            let note = match error {
-                Some(error) => div().text_color(danger()).child(error.clone()),
-                None => div().text_color(muted()).child(hint),
-            };
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap(px(SETTINGS_COLUMN_GAP))
-                        .child(
-                            div()
-                                .w(px(SETTINGS_LABEL_WIDTH))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .text_size(px(14.))
-                                .font_semibold()
-                                .text_color(ink())
-                                .child(icon.size(px(14.)).text_color(muted()))
-                                .child(label),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .max_w(px(SETTINGS_INPUT_WIDTH))
-                                .child(Input::new(input)),
-                        ),
-                )
-                .child(
-                    note.ml(px(SETTINGS_LABEL_WIDTH + SETTINGS_COLUMN_GAP))
-                        .max_w(px(SETTINGS_INPUT_WIDTH))
-                        .text_size(px(12.))
-                        .line_height(relative(1.4)),
-                )
-        };
         let header = div()
             .flex_shrink_0()
             .px(px(ROW_INSET))
@@ -1391,30 +1608,7 @@ impl AppView {
                         .max_w(px(SETTINGS_LABEL_WIDTH
                             + SETTINGS_COLUMN_GAP
                             + SETTINGS_INPUT_WIDTH))
-                        .flex()
-                        .flex_col()
-                        .gap(px(20.))
-                        .child(field(
-                            Icon::empty().path("icons/timer.svg"),
-                            "Timeout",
-                            "How long to wait for the merge, for example 2h.",
-                            &inputs.timeout,
-                            &inputs.timeout_error,
-                        ))
-                        .child(field(
-                            Icon::new(IconName::GitPullRequestDraft),
-                            "Draft timeout",
-                            "How long to babysit a draft pull request.",
-                            &inputs.draft_timeout,
-                            &inputs.draft_timeout_error,
-                        ))
-                        .child(field(
-                            Icon::new(IconName::RefreshCw),
-                            "Interval",
-                            "How long to wait between checks, for example 30s.",
-                            &inputs.interval,
-                            &inputs.interval_error,
-                        )),
+                        .child(duration_fields(inputs)),
                 ),
         );
         (header, body)
@@ -1497,7 +1691,9 @@ impl AppView {
                 ink(),
                 cx,
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.dismiss(pr.clone(), window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.dismiss(pr.clone(), window, cx);
+            }))
         });
         let time_left = active
             .then(|| self.config.active.get(&row.pr))
@@ -1601,6 +1797,17 @@ impl AppView {
                     )
                     .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
             })
+            .when_some(reading.verb, |title, verb| {
+                title.child(
+                    div()
+                        .id(SharedString::from(format!("status-{}", row.pr)))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .child(status_badge(reading.badge))
+                        .tooltip(move |window, cx| Tooltip::new(verb).build(window, cx)),
+                )
+            })
             .child(
                 div()
                     .min_w_0()
@@ -1613,34 +1820,8 @@ impl AppView {
         let place = format!("{} #{}", row.pr.repo, row.pr.number);
         let copy_url = row.url.clone();
         let copy_pr = row.pr.clone();
-        let gates = self.gates.get(&row.pr);
-        let status = reading.verb.map(|verb| {
-            div()
-                .min_w_0()
-                .flex()
-                .items_start()
-                .gap(px(8.))
-                .text_size(px(13.))
-                .line_height(relative(1.45))
-                .when_some(gates, |line, gates| {
-                    line.child(gate_icons(&row.pr, gates, active))
-                })
-                .when_some(reading.detail.clone(), |line, detail| {
-                    line.child(div().min_w_0().text_color(ink()).child(detail))
-                })
-                .child(
-                    div()
-                        .id(SharedString::from(format!("status-{}", row.pr)))
-                        .flex_shrink_0()
-                        .h(px(19.))
-                        .flex()
-                        .items_center()
-                        .child(status_badge(reading.badge))
-                        .tooltip(move |window, cx| Tooltip::new(verb).build(window, cx)),
-                )
-        });
         let path = sitter::worktree_path(&self.data, &row.pr);
-        let worktree = (!active && path.exists()).then(|| {
+        let worktree = path.exists().then(|| {
             let folder = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -1673,15 +1854,6 @@ impl AppView {
                     }),
                 )
         });
-        let meta = (status.is_some() || worktree.is_some()).then(|| {
-            div()
-                .pt(px(6.))
-                .flex()
-                .items_start()
-                .gap(px(16.))
-                .when_some(status, |d, status| d.child(status))
-                .when_some(worktree, |d, worktree| d.child(worktree))
-        });
         let content = div()
             .flex_1()
             .min_w_0()
@@ -1691,17 +1863,51 @@ impl AppView {
             .child(title)
             .child(
                 div()
-                    .id(SharedString::from(format!("copy-link-{}", row.pr)))
-                    .self_start()
-                    .text_size(px(13.))
-                    .text_color(muted())
-                    .cursor_pointer()
-                    .hover(|style| style.text_color(ink()).underline())
-                    .tooltip(|window, cx| Tooltip::new("Copy link").build(window, cx))
-                    .on_click(move |_, window, cx| copy_pr_link(&copy_pr, &copy_url, window, cx))
-                    .child(place),
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("copy-link-{}", row.pr)))
+                            .text_size(px(13.))
+                            .text_color(muted())
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(ink()).underline())
+                            .tooltip(|window, cx| Tooltip::new("Copy link").build(window, cx))
+                            .on_click(move |_, window, cx| {
+                                copy_pr_link(&copy_pr, &copy_url, window, cx)
+                            })
+                            .child(place),
+                    )
+                    .child(gate_icons(
+                        &row.pr,
+                        self.gates.get(&row.pr).unwrap_or(
+                            if row.state == PrState::Merged
+                                || matches!(
+                                    self.states.get(&row.pr),
+                                    Some(SitState::Finished(Outcome::Merged))
+                                )
+                            {
+                                &[GateState::Met; 4]
+                            } else {
+                                &[GateState::Pending; 4]
+                            },
+                        ),
+                        active,
+                    ))
+                    .when_some(worktree, |line, worktree| line.child(worktree)),
             )
-            .when_some(meta, |d, meta| d.child(meta));
+            .when_some(reading.detail.clone(), |content, detail| {
+                content.child(
+                    div()
+                        .min_w_0()
+                        .text_size(px(13.))
+                        .line_height(relative(1.45))
+                        .text_color(ink())
+                        .child(detail),
+                )
+            });
         div()
             .px(px(ROW_INSET))
             .flex_shrink_0()
@@ -1899,8 +2105,9 @@ impl AppView {
             .with_size(Size::Medium)
             .outline()
             .children(
-                PrFilter::ALL
-                    .into_iter()
+                PrFilter::visible(self.config.app.auto_dismiss_merged)
+                    .iter()
+                    .copied()
                     .zip(counts)
                     .map(|(filter, (_, count))| {
                         let (id, label) = match filter {
@@ -1923,7 +2130,9 @@ impl AppView {
                     }),
             )
             .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
-                if let Some(filter) = selected.first().and_then(|index| PrFilter::ALL.get(*index)) {
+                if let Some(filter) = selected.first().and_then(|index| {
+                    PrFilter::visible(this.config.app.auto_dismiss_merged).get(*index)
+                }) {
                     this.pr_filter = *filter;
                     cx.notify();
                 }
@@ -2006,40 +2215,148 @@ impl AppView {
                     ),
             )
             .child(
-                div().px(px(12.)).pt(px(28.)).child(
-                    Button::new("nav-repos")
-                        .custom(
-                            ButtonCustomVariant::new(cx)
-                                .foreground(ink())
-                                .hover(raised())
-                                .active(divider()),
-                        )
-                        .w_full()
-                        .h(px(34.))
-                        .accessibility_label("Repositories")
-                        .child(
+                div()
+                    .px(px(12.))
+                    .pt(px(28.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .children(
+                        [
+                            (
+                                "nav-repos",
+                                "Repositories",
+                                IconName::BookMarked,
+                                SettingsPage::Repositories,
+                            ),
+                            ("nav-app", "App", IconName::Settings, SettingsPage::App),
+                        ]
+                        .into_iter()
+                        .map(|(id, label, icon, page)| {
+                            let selected = match &page {
+                                SettingsPage::Repositories => matches!(
+                                    self.page,
+                                    Page::Settings(
+                                        SettingsPage::Repositories | SettingsPage::Repo(_)
+                                    )
+                                ),
+                                SettingsPage::App => {
+                                    matches!(self.page, Page::Settings(SettingsPage::App))
+                                }
+                                SettingsPage::Repo(_) => false,
+                            };
+                            let color = if selected { accent() } else { muted() };
                             div()
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .gap(px(12.))
-                                .px(px(4.))
-                                .text_size(px(14.))
-                                .font_semibold()
+                                .rounded(px(6.))
+                                .when(selected, |d| d.bg(accent().opacity(0.12)))
                                 .child(
-                                    Icon::new(IconName::BookMarked)
-                                        .size_4()
-                                        .text_color(accent()),
+                                    Button::new(id)
+                                        .custom(
+                                            ButtonCustomVariant::new(cx)
+                                                .foreground(color)
+                                                .hover(raised())
+                                                .active(divider()),
+                                        )
+                                        .w_full()
+                                        .h(px(34.))
+                                        .accessibility_label(label)
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(12.))
+                                                .px(px(4.))
+                                                .text_size(px(14.))
+                                                .when(selected, |d| d.font_semibold())
+                                                .child(Icon::new(icon).size_4().text_color(color))
+                                                .child(label),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.page = Page::Settings(page.clone());
+                                            cx.notify();
+                                        })),
                                 )
-                                .child("Repositories"),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page = Page::Settings(SettingsPage::Repositories);
-                            cx.notify();
-                        })),
-                ),
+                        }),
+                    ),
             )
     }
+}
+
+fn duration_fields(inputs: &RepoInputs) -> Div {
+    let field = |icon: Icon,
+                 label: &'static str,
+                 hint: &'static str,
+                 input: &Entity<InputState>,
+                 error: &Option<String>| {
+        let note = match error {
+            Some(error) => div().text_color(danger()).child(error.clone()),
+            None => div().text_color(muted()).child(hint),
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(SETTINGS_COLUMN_GAP))
+                    .child(
+                        div()
+                            .w(px(SETTINGS_LABEL_WIDTH))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(14.))
+                            .font_semibold()
+                            .text_color(ink())
+                            .child(icon.size(px(14.)).text_color(muted()))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .max_w(px(SETTINGS_INPUT_WIDTH))
+                            .child(Input::new(input)),
+                    ),
+            )
+            .child(
+                note.ml(px(SETTINGS_LABEL_WIDTH + SETTINGS_COLUMN_GAP))
+                    .max_w(px(SETTINGS_INPUT_WIDTH))
+                    .text_size(px(12.))
+                    .line_height(relative(1.4)),
+            )
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(20.))
+        .child(field(
+            Icon::empty().path("icons/timer.svg"),
+            "Timeout",
+            "How long to wait for the merge, for example 2h.",
+            &inputs.timeout,
+            &inputs.timeout_error,
+        ))
+        .child(field(
+            Icon::new(IconName::GitPullRequestDraft),
+            "Draft timeout",
+            "How long to babysit a draft pull request.",
+            &inputs.draft_timeout,
+            &inputs.draft_timeout_error,
+        ))
+        .child(field(
+            Icon::new(IconName::RefreshCw),
+            "Interval",
+            "How long to wait between checks, for example 30s.",
+            &inputs.interval,
+            &inputs.interval_error,
+        ))
 }
 
 fn copy_pr_link(pr: &PrRef, url: &str, window: &mut Window, cx: &mut App) {
@@ -2262,11 +2579,8 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
         .flex()
         .items_center()
         .gap(px(6.))
-        .children(GATE_ICONS.iter().filter_map(|&(index, icon, name)| {
+        .children(GATE_ICONS.iter().map(|&(index, icon, name)| {
             let state = gates[index];
-            if state == GateState::Skipped {
-                return None;
-            }
             let (color, word) = state_style(state);
             let label = SharedString::from(format!("{name}: {word}"));
             let id = SharedString::from(format!("gate-{pr}-{name}"));
@@ -2283,7 +2597,7 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
             } else {
                 mark.into_any_element()
             };
-            Some(div().id(id).child(mark).tooltip(move |window, cx| {
+            div().id(id).child(mark).tooltip(move |window, cx| {
                 let label = label.clone();
                 Tooltip::element(move |_, _| {
                     div()
@@ -2294,7 +2608,7 @@ fn gate_icons(pr: &PrRef, gates: &[GateState; 4], live: bool) -> Div {
                         .child(label.clone())
                 })
                 .build(window, cx)
-            }))
+            })
         }))
 }
 /// The color and word for a state, shared by gate icons, tooltips, and status badges.
@@ -2391,6 +2705,7 @@ impl Render for AppView {
         let (header, body) = match &self.page {
             Page::PullRequests => self.render_dashboard(cx),
             Page::Settings(SettingsPage::Repositories) => self.render_repos(cx),
+            Page::Settings(SettingsPage::App) => self.render_app_settings(cx),
             Page::Settings(SettingsPage::Repo(repo)) => self.render_repo_settings(repo, cx),
         };
         div()

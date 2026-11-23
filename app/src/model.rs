@@ -108,25 +108,91 @@ mod duration_serde {
     }
 }
 
-fn default_draft_timeout() -> Duration {
-    Duration::from_secs(7200)
+mod optional_duration_serde {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(duration) => duration_serde::serialize(duration, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Duration>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| parse_duration(&value).map_err(de::Error::custom))
+            .transpose()
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RepoSettings {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Defaults {
     #[serde(with = "duration_serde")]
     pub timeout: Duration,
-    #[serde(default = "default_draft_timeout", with = "duration_serde")]
+    #[serde(with = "duration_serde")]
     pub draft_timeout: Duration,
     #[serde(with = "duration_serde")]
     pub interval: Duration,
 }
-impl Default for RepoSettings {
+
+impl Default for Defaults {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(7200),
-            draft_timeout: default_draft_timeout(),
+            draft_timeout: Duration::from_secs(7200),
             interval: Duration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    pub defaults: Defaults,
+    pub auto_dismiss_merged: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepoSettings {
+    #[serde(
+        default,
+        with = "optional_duration_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout: Option<Duration>,
+    #[serde(
+        default,
+        with = "optional_duration_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub draft_timeout: Option<Duration>,
+    #[serde(
+        default,
+        with = "optional_duration_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub interval: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Resolved {
+    pub timeout: Duration,
+    pub draft_timeout: Duration,
+    pub interval: Duration,
+}
+
+impl RepoSettings {
+    pub fn resolve(&self, defaults: &Defaults) -> Resolved {
+        Resolved {
+            timeout: self.timeout.unwrap_or(defaults.timeout),
+            draft_timeout: self.draft_timeout.unwrap_or(defaults.draft_timeout),
+            interval: self.interval.unwrap_or(defaults.interval),
         }
     }
 }
@@ -223,6 +289,14 @@ pub enum PrFilter {
 impl PrFilter {
     pub const ALL: [Self; 4] = [Self::All, Self::Watched, Self::Unwatched, Self::Merged];
 
+    pub fn visible(auto_dismiss_merged: bool) -> &'static [Self] {
+        if auto_dismiss_merged {
+            &Self::ALL[..3]
+        } else {
+            &Self::ALL
+        }
+    }
+
     pub fn admits(self, status: PrStatus) -> bool {
         match self {
             Self::All => true,
@@ -243,6 +317,8 @@ pub enum PrStatus {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(default)]
+    pub app: AppSettings,
     pub repos: BTreeMap<RepoName, RepoSettings>,
     pub active: BTreeMap<PrRef, u64>,
     #[serde(default)]
@@ -545,6 +621,87 @@ mod tests {
 
     fn repos(names: &[&str]) -> Vec<RepoName> {
         names.iter().map(|name| name.parse().unwrap()).collect()
+    }
+    #[test]
+    fn repository_settings_resolve_each_inherited_or_overridden_duration() {
+        let defaults = Defaults {
+            timeout: Duration::from_secs(3600),
+            draft_timeout: Duration::from_secs(7200),
+            interval: Duration::from_secs(45),
+        };
+        let settings = RepoSettings {
+            timeout: Some(Duration::from_secs(1800)),
+            draft_timeout: None,
+            interval: Some(Duration::from_secs(10)),
+        };
+        assert_eq!(
+            settings.resolve(&defaults),
+            Resolved {
+                timeout: Duration::from_secs(1800),
+                draft_timeout: Duration::from_secs(7200),
+                interval: Duration::from_secs(10),
+            }
+        );
+        assert_eq!(
+            RepoSettings {
+                draft_timeout: Some(Duration::from_secs(14400)),
+                ..RepoSettings::default()
+            }
+            .resolve(&defaults),
+            Resolved {
+                timeout: Duration::from_secs(3600),
+                draft_timeout: Duration::from_secs(14400),
+                interval: Duration::from_secs(45),
+            }
+        );
+        assert_eq!(
+            RepoSettings::default().resolve(&defaults),
+            Resolved {
+                timeout: Duration::from_secs(3600),
+                draft_timeout: Duration::from_secs(7200),
+                interval: Duration::from_secs(45),
+            }
+        );
+    }
+
+    #[test]
+    fn repository_settings_omit_inherited_fields_when_serialized() {
+        let settings = RepoSettings {
+            timeout: None,
+            draft_timeout: Some(Duration::from_secs(5400)),
+            interval: None,
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json, serde_json::json!({ "draft_timeout": "90m" }));
+        assert_eq!(
+            serde_json::from_value::<RepoSettings>(json).unwrap(),
+            settings
+        );
+        assert_eq!(
+            serde_json::to_value(RepoSettings::default()).unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::from_str::<RepoSettings>("{}").unwrap(),
+            RepoSettings::default()
+        );
+    }
+
+    #[test]
+    fn merged_filter_is_only_available_when_auto_dismiss_is_off() {
+        assert_eq!(
+            PrFilter::visible(false),
+            &[
+                PrFilter::All,
+                PrFilter::Watched,
+                PrFilter::Unwatched,
+                PrFilter::Merged
+            ]
+        );
+        assert_eq!(
+            PrFilter::visible(true),
+            &[PrFilter::All, PrFilter::Watched, PrFilter::Unwatched]
+        );
     }
 
     #[test]
@@ -1038,8 +1195,14 @@ mod tests {
         let json = r#"{"repos":{"owner/repo":{"timeout":"1h","interval":"30s"}}}"#;
         let mut config: Config = serde_json::from_str(json).unwrap();
         let repo: RepoName = "owner/repo".parse().unwrap();
-        assert_eq!(config.repos[&repo].draft_timeout, Duration::from_secs(7200));
-        config.repos.get_mut(&repo).unwrap().draft_timeout = Duration::from_secs(28800);
+        assert_eq!(config.repos[&repo].draft_timeout, None);
+        assert_eq!(
+            config.repos[&repo]
+                .resolve(&config.app.defaults)
+                .draft_timeout,
+            Duration::from_secs(7200)
+        );
+        config.repos.get_mut(&repo).unwrap().draft_timeout = Some(Duration::from_secs(28800));
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains(r#""draft_timeout":"8h""#));
         assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), config);

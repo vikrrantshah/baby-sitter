@@ -1,6 +1,6 @@
 use crate::{
     gh::{self, ChildEnv},
-    model::{self, Outcome, PrRef, RepoName, RepoSettings, SitState, unix_now},
+    model::{self, Outcome, PrRef, RepoName, Resolved, SitState, unix_now},
 };
 use anyhow::{Context, Result, bail};
 use async_channel::Sender;
@@ -366,7 +366,7 @@ struct Runner {
     data: PathBuf,
     env: ChildEnv,
     deadline: u64,
-    settings: RepoSettings,
+    settings: Resolved,
     registry: Registry,
     locks: RepoLocks,
     control: Arc<Control>,
@@ -690,7 +690,7 @@ impl Runner {
 
 pub fn spawn(
     pr: PrRef,
-    settings: RepoSettings,
+    settings: Resolved,
     deadline: u64,
     data: PathBuf,
     env: ChildEnv,
@@ -726,14 +726,9 @@ pub fn spawn(
         if QUITTING.load(Ordering::SeqCst) {
             return;
         }
-        let merged = outcome == Outcome::Merged;
         notify(&runner.pr, &outcome);
-        if QUITTING.load(Ordering::SeqCst) {
-            return;
-        }
-        emit(&runner.tx, &runner.pr, SitState::Finished(outcome));
-        if merged && !QUITTING.load(Ordering::SeqCst) {
-            let _ = remove_worktree(&runner.env, &runner.data, &runner.locks, &runner.pr);
+        if !QUITTING.load(Ordering::SeqCst) {
+            emit(&runner.tx, &runner.pr, SitState::Finished(outcome));
         }
     });
     SitHandle { control }
@@ -762,7 +757,7 @@ mod tests {
             data: PathBuf::new(),
             env: ChildEnv::new(),
             deadline: unix_now() + 60,
-            settings: RepoSettings::default(),
+            settings: model::RepoSettings::default().resolve(&model::Defaults::default()),
             registry: Arc::new(Mutex::new(BTreeMap::new())),
             locks: Arc::new(Mutex::new(BTreeMap::new())),
             control: Arc::new(Control {
@@ -975,7 +970,7 @@ mod tests {
             data: dir.clone(),
             env: ChildEnv::new(),
             deadline: unix_now() + 60,
-            settings: RepoSettings::default(),
+            settings: model::RepoSettings::default().resolve(&model::Defaults::default()),
             registry: registry.clone(),
             locks: Arc::new(Mutex::new(BTreeMap::new())),
             control,
