@@ -137,6 +137,26 @@ pub enum RepoScope {
     Watched,
 }
 
+impl RepoScope {
+    pub const ALL: [Self; 2] = [Self::All, Self::Watched];
+}
+
+pub fn repo_counts(
+    repos: &[RepoName],
+    selected: &BTreeMap<RepoName, RepoSettings>,
+    org: Option<&str>,
+) -> [(RepoScope, usize); 2] {
+    let mut counts = [(RepoScope::All, 0), (RepoScope::Watched, 0)];
+    for repo in repos
+        .iter()
+        .filter(|repo| org.is_none_or(|org| org == repo.owner))
+    {
+        counts[0].1 += 1;
+        counts[1].1 += usize::from(selected.contains_key(repo));
+    }
+    counts
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepoListItem {
     Org {
@@ -191,13 +211,26 @@ pub struct PastSit {
     pub finished_at: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PrFilter {
     #[default]
     All,
     Watched,
     Unwatched,
     Merged,
+}
+
+impl PrFilter {
+    pub const ALL: [Self; 4] = [Self::All, Self::Watched, Self::Unwatched, Self::Merged];
+
+    pub fn admits(self, status: PrStatus) -> bool {
+        match self {
+            Self::All => true,
+            Self::Watched => status == PrStatus::Watched,
+            Self::Unwatched => status == PrStatus::Unwatched,
+            Self::Merged => status == PrStatus::Merged,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,13 +267,7 @@ pub fn dashboard_rows<'a>(
     repo: Option<&RepoName>,
 ) -> Vec<Cow<'a, PrRow>> {
     let matches_filter = |pr: &PrRef| {
-        let matches_status = match filter {
-            PrFilter::All => true,
-            PrFilter::Watched => pr_status(sits.get(pr)) == PrStatus::Watched,
-            PrFilter::Unwatched => pr_status(sits.get(pr)) == PrStatus::Unwatched,
-            PrFilter::Merged => pr_status(sits.get(pr)) == PrStatus::Merged,
-        };
-        matches_status && repo.is_none_or(|repo| &pr.repo == repo)
+        filter.admits(pr_status(sits.get(pr))) && repo.is_none_or(|repo| &pr.repo == repo)
     };
     let mut existing = BTreeSet::new();
     let mut rows: Vec<_> = prs
@@ -274,6 +301,19 @@ pub fn dashboard_rows<'a>(
     );
     rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     rows
+}
+
+pub fn pr_counts(
+    rows: &[Cow<'_, PrRow>],
+    sits: &BTreeMap<PrRef, SitState>,
+) -> [(PrFilter, usize); 4] {
+    PrFilter::ALL.map(|filter| {
+        let count = rows
+            .iter()
+            .filter(|row| filter.admits(pr_status(sits.get(&row.pr))))
+            .count();
+        (filter, count)
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -525,6 +565,69 @@ mod tests {
         assert!(repo_list(&catalog, &BTreeMap::new(), None, RepoScope::Watched).is_empty());
     }
 
+    #[test]
+    fn repo_counts_follow_organization_filter() {
+        let catalog = repos(&["alpha/one", "alpha/two", "beta/three"]);
+        let selected = BTreeMap::from([
+            ("alpha/one".parse().unwrap(), RepoSettings::default()),
+            ("beta/three".parse().unwrap(), RepoSettings::default()),
+        ]);
+        assert_eq!(
+            repo_counts(&catalog, &selected, Some("alpha")),
+            [(RepoScope::All, 2), (RepoScope::Watched, 1)]
+        );
+        assert_eq!(
+            repo_counts(&catalog, &selected, Some("missing")),
+            [(RepoScope::All, 0), (RepoScope::Watched, 0)]
+        );
+    }
+
+    #[test]
+    fn pr_counts_follow_repository_filter() {
+        let prs = [
+            row("owner/one#1", "2026-01-01"),
+            row("owner/one#2", "2026-01-02"),
+            row("owner/two#3", "2026-01-03"),
+        ];
+        let merged: PrRef = "owner/two#4".parse().unwrap();
+        let history = BTreeMap::from([(
+            merged.clone(),
+            PastSit {
+                title: "Merged".into(),
+                outcome: Outcome::Merged,
+                finished_at: 1,
+            },
+        )]);
+        let sits = BTreeMap::from([
+            ("owner/one#1".parse().unwrap(), SitState::Preparing),
+            (merged, SitState::Finished(Outcome::Merged)),
+        ]);
+        let watched = BTreeMap::from([
+            ("owner/one".parse().unwrap(), RepoSettings::default()),
+            ("owner/two".parse().unwrap(), RepoSettings::default()),
+        ]);
+        let rows = dashboard_rows(&prs, &history, &sits, &watched, PrFilter::All, None);
+        assert_eq!(
+            pr_counts(&rows, &sits),
+            [
+                (PrFilter::All, 4),
+                (PrFilter::Watched, 1),
+                (PrFilter::Unwatched, 2),
+                (PrFilter::Merged, 1)
+            ]
+        );
+        let repo = "owner/one".parse().unwrap();
+        let rows = dashboard_rows(&prs, &history, &sits, &watched, PrFilter::All, Some(&repo));
+        assert_eq!(
+            pr_counts(&rows, &sits),
+            [
+                (PrFilter::All, 2),
+                (PrFilter::Watched, 1),
+                (PrFilter::Unwatched, 1),
+                (PrFilter::Merged, 0)
+            ]
+        );
+    }
     #[test]
     fn dashboard_filters_candidates_by_status_and_repository() {
         let prs = [

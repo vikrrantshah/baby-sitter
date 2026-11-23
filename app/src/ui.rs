@@ -965,6 +965,14 @@ impl AppView {
             .into_any_element()
     }
     fn render_repos(&self, cx: &mut Context<Self>) -> (Div, Div) {
+        let repo_counts = model::repo_counts(
+            match &self.repos {
+                Load::Ready(repos) => repos,
+                _ => &[],
+            },
+            &self.config.repos,
+            self.org_filter.as_deref(),
+        );
         let list = match &self.repos {
             Load::Loading => message("Loading repositories…", None),
             Load::Error(error) => {
@@ -1065,27 +1073,37 @@ impl AppView {
                 }
             }
         };
-        let segment = |id: &'static str, label: &'static str, scope: RepoScope| {
-            let selected = self.scope == scope;
-            Button::new(id).selected(selected).child(
-                div()
-                    .text_color(if selected { accent() } else { muted() })
-                    .when(selected, |d| d.font_semibold())
-                    .child(label),
-            )
-        };
         let scope = ButtonGroup::new("repo-scope")
             .with_size(Size::Medium)
             .outline()
-            .child(segment("scope-all", "All", RepoScope::All))
-            .child(segment("scope-watched", "Watched", RepoScope::Watched))
+            .children(
+                RepoScope::ALL
+                    .into_iter()
+                    .zip(repo_counts)
+                    .map(|(scope, (_, count))| {
+                        let (id, label) = match scope {
+                            RepoScope::All => ("scope-all", "All"),
+                            RepoScope::Watched => ("scope-watched", "Watched"),
+                        };
+                        let selected = self.scope == scope;
+                        Button::new(id).selected(selected).child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_color(if selected { accent() } else { muted() })
+                                .when(selected, |d| d.font_semibold())
+                                .child(label)
+                                .when(count > 0, |d| d.child(count.to_string())),
+                        )
+                    }),
+            )
             .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
-                if let Some(index) = selected.first() {
-                    this.scope = if *index == 0 {
-                        RepoScope::All
-                    } else {
-                        RepoScope::Watched
-                    };
+                if let Some(scope) = selected
+                    .first()
+                    .and_then(|index| RepoScope::ALL.get(*index))
+                {
+                    this.scope = *scope;
                     cx.notify();
                 }
             }));
@@ -1275,7 +1293,7 @@ impl AppView {
             &self.config.history,
             &self.states,
             &self.config.repos,
-            self.pr_filter,
+            PrFilter::All,
             self.selected_filter.as_ref(),
         )
     }
@@ -1528,7 +1546,12 @@ impl AppView {
             }))
     }
     fn render_dashboard(&self, cx: &mut Context<Self>) -> (Div, Div) {
-        let rows = self.dashboard_rows();
+        let mut rows = self.dashboard_rows();
+        let counts = model::pr_counts(&rows, &self.states);
+        rows.retain(|row| {
+            self.pr_filter
+                .admits(model::pr_status(self.states.get(&row.pr)))
+        });
         let list = match &self.prs {
             Load::Loading if rows.is_empty() => message("Loading pull requests…", None),
             Load::Error(error) if rows.is_empty() => {
@@ -1656,34 +1679,35 @@ impl AppView {
                         })),
                     ),
             );
-        let segment = |id: &'static str, label: &'static str, filter: PrFilter| {
-            let selected = self.pr_filter == filter;
-            Button::new(id).selected(selected).child(
-                div()
-                    .text_color(if selected { accent() } else { muted() })
-                    .when(selected, |d| d.font_semibold())
-                    .child(label),
-            )
-        };
         let filter = ButtonGroup::new("pr-filter")
             .with_size(Size::Medium)
             .outline()
-            .child(segment("pr-filter-all", "All", PrFilter::All))
-            .child(segment("pr-filter-watched", "Watched", PrFilter::Watched))
-            .child(segment(
-                "pr-filter-unwatched",
-                "Unwatched",
-                PrFilter::Unwatched,
-            ))
-            .child(segment("pr-filter-merged", "Merged", PrFilter::Merged))
+            .children(
+                PrFilter::ALL
+                    .into_iter()
+                    .zip(counts)
+                    .map(|(filter, (_, count))| {
+                        let (id, label) = match filter {
+                            PrFilter::All => ("pr-filter-all", "All"),
+                            PrFilter::Watched => ("pr-filter-watched", "Watched"),
+                            PrFilter::Unwatched => ("pr-filter-unwatched", "Unwatched"),
+                            PrFilter::Merged => ("pr-filter-merged", "Merged"),
+                        };
+                        let selected = self.pr_filter == filter;
+                        Button::new(id).selected(selected).child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_color(if selected { accent() } else { muted() })
+                                .when(selected, |d| d.font_semibold())
+                                .child(label)
+                                .when(count > 0, |d| d.child(count.to_string())),
+                        )
+                    }),
+            )
             .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
-                let filters = [
-                    PrFilter::All,
-                    PrFilter::Watched,
-                    PrFilter::Unwatched,
-                    PrFilter::Merged,
-                ];
-                if let Some(filter) = selected.first().and_then(|index| filters.get(*index)) {
+                if let Some(filter) = selected.first().and_then(|index| PrFilter::ALL.get(*index)) {
                     this.pr_filter = *filter;
                     cx.notify();
                 }
