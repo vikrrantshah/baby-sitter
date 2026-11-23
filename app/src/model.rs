@@ -156,6 +156,14 @@ impl Default for Defaults {
 pub struct AppSettings {
     pub defaults: Defaults,
     pub auto_dismiss_merged: bool,
+    #[serde(default, with = "duration_serde")]
+    pub clear_merged_after: Duration,
+}
+
+impl AppSettings {
+    pub fn hides_merged_filter(&self) -> bool {
+        self.auto_dismiss_merged && self.clear_merged_after.is_zero()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -277,6 +285,27 @@ pub struct PastSit {
     pub finished_at: u64,
 }
 
+pub fn merged_due(
+    history: &BTreeMap<PrRef, PastSit>,
+    settings: &AppSettings,
+    now: u64,
+) -> Vec<PrRef> {
+    if !settings.auto_dismiss_merged {
+        return Vec::new();
+    }
+    history
+        .iter()
+        .filter(|(_, past)| {
+            past.outcome == Outcome::Merged
+                && past
+                    .finished_at
+                    .checked_add(settings.clear_merged_after.as_secs())
+                    .is_some_and(|deadline| deadline <= now)
+        })
+        .map(|(pr, _)| pr.clone())
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PrFilter {
     #[default]
@@ -289,8 +318,8 @@ pub enum PrFilter {
 impl PrFilter {
     pub const ALL: [Self; 4] = [Self::All, Self::Watched, Self::Unwatched, Self::Merged];
 
-    pub fn visible(auto_dismiss_merged: bool) -> &'static [Self] {
-        if auto_dismiss_merged {
+    pub fn visible(hides_merged_filter: bool) -> &'static [Self] {
+        if hides_merged_filter {
             &Self::ALL[..3]
         } else {
             &Self::ALL
@@ -607,6 +636,80 @@ pub fn classify(code: Option<i32>, stderr: &str, cancel_requested: bool) -> Outc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merged_retention_respects_delay_and_outcome() {
+        let recent: PrRef = "owner/repo#1".parse().unwrap();
+        let old: PrRef = "owner/repo#2".parse().unwrap();
+        let other: PrRef = "owner/repo#3".parse().unwrap();
+        let history = BTreeMap::from([
+            (
+                recent.clone(),
+                PastSit {
+                    title: String::new(),
+                    outcome: Outcome::Merged,
+                    finished_at: 9_400,
+                },
+            ),
+            (
+                old.clone(),
+                PastSit {
+                    title: String::new(),
+                    outcome: Outcome::Merged,
+                    finished_at: 2_800,
+                },
+            ),
+            (
+                other,
+                PastSit {
+                    title: String::new(),
+                    outcome: Outcome::Cancelled,
+                    finished_at: 1,
+                },
+            ),
+        ]);
+        let mut settings = AppSettings {
+            auto_dismiss_merged: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            merged_due(&history, &settings, 9_400),
+            vec![recent.clone(), old.clone()]
+        );
+        settings.clear_merged_after = Duration::from_secs(3600);
+        assert_eq!(merged_due(&history, &settings, 10_000), vec![old]);
+        settings.auto_dismiss_merged = false;
+        assert!(merged_due(&history, &settings, 10_000).is_empty());
+    }
+
+    #[test]
+    fn merged_filter_hides_only_for_immediate_auto_dismiss() {
+        for enabled in [false, true] {
+            for seconds in [0, 3600] {
+                let settings = AppSettings {
+                    auto_dismiss_merged: enabled,
+                    clear_merged_after: Duration::from_secs(seconds),
+                    ..Default::default()
+                };
+                assert_eq!(settings.hides_merged_filter(), enabled && seconds == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn merged_retention_settings_round_trip_and_default() {
+        let settings = AppSettings {
+            auto_dismiss_merged: true,
+            clear_merged_after: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AppSettings>(&json).unwrap(),
+            settings
+        );
+        let old: Config = serde_json::from_str(r#"{"app":{"auto_dismiss_merged":true}}"#).unwrap();
+        assert_eq!(old.app.clear_merged_after, Duration::ZERO);
+    }
     use super::*;
     fn row(pr: &str, updated_at: &str) -> PrRow {
         let pr: PrRef = pr.parse().unwrap();

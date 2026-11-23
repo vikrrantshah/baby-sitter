@@ -187,6 +187,8 @@ pub struct AppView {
     dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
     selected_filter: Option<RepoName>,
     app_inputs: RepoInputs,
+    clear_merged_input: Entity<InputState>,
+    clear_merged_error: Option<String>,
     inputs: BTreeMap<RepoName, RepoInputs>,
     states: BTreeMap<PrRef, SitState>,
     /// Each babysit's latest gate report; kept after it finishes to show what held it.
@@ -307,10 +309,14 @@ impl AppView {
                                     finished_at: model::unix_now(),
                                 },
                             );
-                            if *outcome == Outcome::Merged {
+                            if *outcome == Outcome::Merged
+                                && (!this.config.app.auto_dismiss_merged
+                                    || this.config.app.clear_merged_after.is_zero())
+                            {
                                 this.remove_worktree(event.pr.clone(), window, cx);
                             }
-                            if *outcome == Outcome::Merged && this.config.app.auto_dismiss_merged {
+                            if *outcome == Outcome::Merged && this.config.app.hides_merged_filter()
+                            {
                                 this.states.insert(event.pr.clone(), event.state);
                                 this.dismiss(event.pr, window, cx);
                                 return;
@@ -340,12 +346,18 @@ impl AppView {
             }
         });
         // Keeps countdowns and step durations current between output lines.
-        let clock = cx.spawn(async move |view, cx| {
+        let clock = cx.spawn_in(window, async move |view, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_secs(30))
                     .await;
-                if view.update(cx, |_, cx| cx.notify()).is_err() {
+                if view
+                    .update_in(cx, |this, window, cx| {
+                        this.dismiss_merged_history(window, cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -368,6 +380,21 @@ impl AppView {
             window,
             cx,
         );
+        let clear_merged_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(model::format_duration(config.app.clear_merged_after))
+        });
+        let clear_subscription = cx.subscribe_in(
+            &clear_merged_input,
+            window,
+            |this: &mut Self, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    let value = input.read(cx).value().to_string();
+                    this.update_clear_merged_after(&value, window, cx);
+                    cx.notify();
+                }
+            },
+        );
         let mut this = Self {
             data,
             config,
@@ -389,6 +416,8 @@ impl AppView {
             dashboard_filter,
             selected_filter: None,
             app_inputs,
+            clear_merged_input,
+            clear_merged_error: None,
             inputs: BTreeMap::new(),
             states: BTreeMap::new(),
             gates: BTreeMap::new(),
@@ -398,7 +427,11 @@ impl AppView {
             refresh_error: None,
             loading_repos: false,
             loading_prs: false,
-            _subscriptions: subscriptions,
+            _subscriptions: {
+                let mut subscriptions = subscriptions;
+                subscriptions.push(clear_subscription);
+                subscriptions
+            },
             _events: events,
             _clock: clock,
             repo_task: None,
@@ -419,9 +452,7 @@ impl AppView {
         for (pr, deadline) in this.config.active.clone() {
             this.resume(pr, deadline);
         }
-        if this.config.app.auto_dismiss_merged {
-            this.dismiss_merged_history(window, cx);
-        }
+        this.dismiss_merged_history(window, cx);
         this.update_filter(window, cx);
         this.refresh(window, cx);
         this
@@ -586,6 +617,39 @@ impl AppView {
         if let Some(inputs) = inputs {
             *inputs.error_mut(field) = error;
         }
+    }
+    fn update_clear_merged_after(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.trim();
+        let parsed = if text.is_empty() {
+            Ok(Duration::ZERO)
+        } else {
+            model::parse_duration(text)
+        };
+        self.clear_merged_error = match parsed {
+            Ok(duration) => {
+                let previous = self.config.app.clear_merged_after;
+                if previous != duration {
+                    self.config.app.clear_merged_after = duration;
+                    if self.save() {
+                        if self.config.app.hides_merged_filter()
+                            && self.pr_filter == PrFilter::Merged
+                        {
+                            self.pr_filter = PrFilter::All;
+                        }
+                        self.dismiss_merged_history(window, cx);
+                    } else {
+                        self.config.app.clear_merged_after = previous;
+                    }
+                }
+                None
+            }
+            Err(error) => Some(error),
+        };
     }
     fn toggle_repo(
         &mut self,
@@ -1042,14 +1106,8 @@ impl AppView {
         true
     }
     fn dismiss_merged_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let merged: Vec<_> = self
-            .config
-            .history
-            .iter()
-            .filter(|(_, past)| past.outcome == Outcome::Merged)
-            .map(|(pr, _)| pr.clone())
-            .collect();
-        for pr in merged {
+        let due = model::merged_due(&self.config.history, &self.config.app, model::unix_now());
+        for pr in due {
             if !self.dismiss(pr, window, cx) {
                 break;
             }
@@ -1070,7 +1128,7 @@ impl AppView {
         if !self.save() {
             self.config.app.auto_dismiss_merged = previous;
         } else if checked {
-            if self.pr_filter == PrFilter::Merged {
+            if self.config.app.hides_merged_filter() && self.pr_filter == PrFilter::Merged {
                 self.pr_filter = PrFilter::All;
             }
             self.dismiss_merged_history(window, cx);
@@ -1539,8 +1597,16 @@ impl AppView {
                                         .text_size(px(12.))
                                         .line_height(relative(1.4))
                                         .text_color(muted())
-                                        .child("Remove a merged PR's row and worktree as soon as it merges. Hides the Merged filter."),
-                                ),
+                                        .child("Remove a merged PR's row and worktree after the delay below."),
+                                )
+                                .child(duration_field(
+                                    Icon::empty().path("icons/timer.svg"),
+                                    "Clear after",
+                                    "How long a merged PR stays listed before it is cleared, for example 1h. 0s clears it at once.",
+                                    &self.clear_merged_input,
+                                    &self.clear_merged_error,
+                                    !self.config.app.auto_dismiss_merged,
+                                )),
                         ),
                 ),
         );
@@ -2117,7 +2183,7 @@ impl AppView {
             .with_size(Size::Medium)
             .outline()
             .children(
-                PrFilter::visible(self.config.app.auto_dismiss_merged)
+                PrFilter::visible(self.config.app.hides_merged_filter())
                     .iter()
                     .copied()
                     .zip(counts)
@@ -2143,7 +2209,7 @@ impl AppView {
             )
             .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
                 if let Some(filter) = selected.first().and_then(|index| {
-                    PrFilter::visible(this.config.app.auto_dismiss_merged).get(*index)
+                    PrFilter::visible(this.config.app.hides_merged_filter()).get(*index)
                 }) {
                     this.pr_filter = *filter;
                     cx.notify();
@@ -2295,79 +2361,86 @@ impl AppView {
     }
 }
 
-fn duration_fields(inputs: &RepoInputs) -> Div {
-    let field = |icon: Icon,
-                 label: &'static str,
-                 hint: &'static str,
-                 input: &Entity<InputState>,
-                 error: &Option<String>| {
-        let note = match error {
-            Some(error) => div().text_color(danger()).child(error.clone()),
-            None => div().text_color(muted()).child(hint),
-        };
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap(px(SETTINGS_COLUMN_GAP))
-                    .child(
-                        div()
-                            .w(px(SETTINGS_LABEL_WIDTH))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .text_size(px(14.))
-                            .font_semibold()
-                            .text_color(ink())
-                            .child(icon.size(px(14.)).text_color(muted()))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .max_w(px(SETTINGS_INPUT_WIDTH))
-                            .child(Input::new(input)),
-                    ),
-            )
-            .child(
-                note.ml(px(SETTINGS_LABEL_WIDTH + SETTINGS_COLUMN_GAP))
-                    .max_w(px(SETTINGS_INPUT_WIDTH))
-                    .text_size(px(12.))
-                    .line_height(relative(1.4)),
-            )
+fn duration_field(
+    icon: Icon,
+    label: &'static str,
+    hint: &'static str,
+    input: &Entity<InputState>,
+    error: &Option<String>,
+    disabled: bool,
+) -> Div {
+    let note = match error {
+        Some(error) => div().text_color(danger()).child(error.clone()),
+        None => div().text_color(muted()).child(hint),
     };
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(SETTINGS_COLUMN_GAP))
+                .child(
+                    div()
+                        .w(px(SETTINGS_LABEL_WIDTH))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(14.))
+                        .font_semibold()
+                        .text_color(ink())
+                        .child(icon.size(px(14.)).text_color(muted()))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .max_w(px(SETTINGS_INPUT_WIDTH))
+                        .child(Input::new(input).disabled(disabled)),
+                ),
+        )
+        .child(
+            note.ml(px(SETTINGS_LABEL_WIDTH + SETTINGS_COLUMN_GAP))
+                .max_w(px(SETTINGS_INPUT_WIDTH))
+                .text_size(px(12.))
+                .line_height(relative(1.4)),
+        )
+}
+
+fn duration_fields(inputs: &RepoInputs) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(px(20.))
-        .child(field(
+        .child(duration_field(
             Icon::empty().path("icons/timer.svg"),
             "Timeout",
             "How long to wait for the merge, for example 2h.",
             &inputs.timeout,
             &inputs.timeout_error,
+            false,
         ))
-        .child(field(
+        .child(duration_field(
             Icon::new(IconName::GitPullRequestDraft),
             "Draft timeout",
             "How long to babysit a draft pull request.",
             &inputs.draft_timeout,
             &inputs.draft_timeout_error,
+            false,
         ))
-        .child(field(
+        .child(duration_field(
             Icon::new(IconName::RefreshCw),
             "Interval",
             "How long to wait between checks, for example 30s.",
             &inputs.interval,
             &inputs.interval_error,
+            false,
         ))
 }
 
