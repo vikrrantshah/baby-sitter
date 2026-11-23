@@ -22,7 +22,7 @@ filled! {
     "building-2" => "buildings-fill.svg",
     "check" => "check-circle-fill.svg",
     "chevron-down" => "caret-down-fill.svg",
-    "chevron-left" => "caret-left-fill.svg",
+    "chevron-left" => "chevron-left-16.svg",
     "chevron-right" => "caret-right-fill.svg",
     "close" => "x-circle-fill.svg",
     "ellipsis" => "dots-three-bold.svg",
