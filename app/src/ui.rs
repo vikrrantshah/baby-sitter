@@ -1724,7 +1724,7 @@ impl AppView {
                     let view = view.clone();
                     let (icon, color) = match action {
                         RowAction::MarkReady => {
-                            Icon::empty().path("icons/git-pull-request-arrow.svg")
+                            ("icons/git-pull-request.svg", pr_state_color(PrState::Ready))
                         }
                         RowAction::ConvertToDraft => (
                             "icons/git-pull-request-draft.svg",
@@ -1736,30 +1736,38 @@ impl AppView {
                         ),
                         RowAction::CopyLink => ("icons/link.svg", muted()),
                     };
-                    menu = menu.item(PopupMenuItem::new(label).icon(icon).on_click(
-                        move |_, window, cx| {
-                            if action == RowAction::CopyLink {
-                                copy_pr_link(&pr, &url, window, cx);
-                            } else {
-                                let _ = view.update(cx, |this, cx| match action {
-                                    RowAction::MarkReady => this.run_pr_action(
-                                        pr.clone(),
-                                        gh::GhPrAction::Ready,
-                                        window,
-                                        cx,
-                                    ),
-                                    RowAction::ConvertToDraft => this.run_pr_action(
-                                        pr.clone(),
-                                        gh::GhPrAction::Draft,
-                                        window,
-                                        cx,
-                                    ),
-                                    RowAction::Close => this.ask_close(pr.clone(), window, cx),
-                                    RowAction::CopyLink => {}
-                                });
-                            }
-                        },
-                    ));
+                    let item = PopupMenuItem::element(move |_, _| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(4.))
+                            .py(px(6.))
+                            .child(Icon::empty().path(icon).size(px(16.)).text_color(color))
+                            .child(label)
+                    });
+                    menu = menu.item(item.on_click(move |_, window, cx| {
+                        if action == RowAction::CopyLink {
+                            copy_pr_link(&pr, &url, window, cx);
+                        } else {
+                            let _ = view.update(cx, |this, cx| match action {
+                                RowAction::MarkReady => this.run_pr_action(
+                                    pr.clone(),
+                                    gh::GhPrAction::Ready,
+                                    window,
+                                    cx,
+                                ),
+                                RowAction::ConvertToDraft => this.run_pr_action(
+                                    pr.clone(),
+                                    gh::GhPrAction::Draft,
+                                    window,
+                                    cx,
+                                ),
+                                RowAction::Close => this.ask_close(pr.clone(), window, cx),
+                                RowAction::CopyLink => {}
+                            });
+                        }
+                    }));
                 }
             }
             menu
