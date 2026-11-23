@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, time::Duration};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Login(pub String);
@@ -144,6 +144,11 @@ pub struct FailedCheck {
     pub source: CheckSource,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelledCheck {
+    pub name: String,
+    pub run_id: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckSource {
     Actions { job_id: u64 },
     External { url: Option<String> },
@@ -161,6 +166,7 @@ pub enum Ci {
     Rollup {
         state: RollupState,
         failing: Vec<FailedCheck>,
+        cancelled: Vec<CancelledCheck>,
         pending: Vec<String>,
     },
 }
@@ -186,6 +192,7 @@ pub struct Snapshot {
     pub lifecycle: Lifecycle,
     pub draft: bool,
     pub head: Head,
+    pub head_age: Option<Duration>,
     pub mergeable: Mergeable,
     pub merge_state: MergeState,
     pub commits_behind: Option<u64>,

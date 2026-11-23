@@ -1,5 +1,5 @@
 use crate::domain::*;
-use std::fmt;
+use std::{collections::BTreeSet, fmt, time::Duration};
 
 const MAX_CI_FIX_ATTEMPTS: u32 = 3;
 
@@ -67,6 +67,10 @@ pub enum Action {
         batch: Batch,
         head: Head,
     },
+    RerunCi {
+        runs: BTreeSet<u64>,
+        checks: Vec<String>,
+    },
     FixCi {
         checks: Vec<FailedCheck>,
         head: Head,
@@ -105,6 +109,9 @@ impl fmt::Display for Action {
                     plural(batch.0.len()),
                     names(batch.0.iter())
                 )
+            }
+            Self::RerunCi { checks, .. } => {
+                write!(f, "Rerunning cancelled CI: {}", names(checks.iter()))
             }
             Self::FixCi { checks, .. } => write!(f, "Fixing CI: {}", check_names(checks)),
             Self::UpdateBranch => f.write_str("Updating the branch with its base"),
@@ -221,6 +228,11 @@ const RULES: &[Rule] = &[
         eval: unhandled_items,
     },
     Rule {
+        name: "rerun-cancelled",
+        gate: Gate::Checks,
+        eval: rerun_cancelled,
+    },
+    Rule {
         name: "fix-ci",
         gate: Gate::Checks,
         eval: fix_ci,
@@ -234,6 +246,11 @@ const RULES: &[Rule] = &[
         name: "ci-pending",
         gate: Gate::Checks,
         eval: ci_pending,
+    },
+    Rule {
+        name: "ci-starting",
+        gate: Gate::Checks,
+        eval: ci_starting,
     },
     Rule {
         name: "merge-state",
@@ -280,7 +297,7 @@ impl Gate {
         }
     }
 }
-/// Ordered from least to most severe, so the worst rule in a gate decides it.
+/// Gate states. Skipped is assigned after severity aggregation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GateState {
     /// Merge only: other gates are still open, so merging has not started.
@@ -290,6 +307,8 @@ pub enum GateState {
     Waiting,
     /// A rule stops the run.
     Blocked,
+    /// Draft PRs do not enter the merge gate.
+    Skipped,
 }
 impl GateState {
     fn name(self) -> &'static str {
@@ -297,6 +316,7 @@ impl GateState {
             GateState::Pending => "pending",
             GateState::Met => "met",
             GateState::Waiting => "waiting",
+            GateState::Skipped => "skipped",
             GateState::Blocked => "blocked",
         }
     }
@@ -320,8 +340,13 @@ impl fmt::Display for Gates {
 }
 /// Evaluates every rule, not just the first match, and files each verdict under its gate.
 pub fn gates(f: &Facts<'_>) -> Gates {
+    let draft = f.snap.draft || f.snap.merge_state == MergeState::Draft;
     if f.snap.lifecycle == Lifecycle::Merged {
-        return Gates([GateState::Met; 4]);
+        let mut states = [GateState::Met; 4];
+        if draft {
+            states[Gate::Merge as usize] = GateState::Skipped;
+        }
+        return Gates(states);
     }
     let mut states = [GateState::Met; 4];
     // Only rules that stop the PR or hold it in a queue; merging itself is decided below.
@@ -348,10 +373,14 @@ pub fn gates(f: &Facts<'_>) -> Gates {
         }
     }
     let others_met = states[..3].iter().all(|s| *s == GateState::Met);
-    states[Gate::Merge as usize] = match merge {
-        Some(state) => state,
-        None if others_met => GateState::Waiting,
-        None => GateState::Pending,
+    states[Gate::Merge as usize] = if draft {
+        GateState::Skipped
+    } else {
+        match merge {
+            Some(state) => state,
+            None if others_met => GateState::Waiting,
+            None => GateState::Pending,
+        }
     };
     Gates(states)
 }
@@ -416,7 +445,10 @@ fn closed(f: &Facts<'_>) -> Option<Verdict> {
 }
 fn draft(f: &Facts<'_>) -> Option<Verdict> {
     (f.snap.draft || f.snap.merge_state == MergeState::Draft).then(|| {
-        Verdict::Wait("Draft: everything else is done. Mark it ready for review to merge.".into())
+        Verdict::Wait(
+            "Draft is up to date. Watching for new commits, CI results, and review comments."
+                .into(),
+        )
     })
 }
 fn conflict(f: &Facts<'_>) -> Option<Verdict> {
@@ -429,6 +461,7 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
             state: RollupState::Failure | RollupState::Error,
             failing,
             pending,
+            ..
         } if !pending.is_empty() => Some(Verdict::Wait(format!(
             "Waiting for {} more check{} before fixing {}",
             pending.len(),
@@ -442,18 +475,21 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
         Ci::Rollup {
             state: RollupState::Failure | RollupState::Error,
             failing,
+            cancelled,
             ..
-        } if failing.is_empty() => Some(Verdict::Stop(
+        } if failing.is_empty() && cancelled.is_empty() => Some(Verdict::Stop(
             "CI failed, but GitHub didn't say which check".into(),
         )),
         Ci::Rollup {
             state: RollupState::Failure | RollupState::Error,
             failing,
             ..
-        } if f.snap.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS => Some(Verdict::Stop(format!(
-            "CI still fails after 3 fix attempts: {}",
-            check_names(failing)
-        ))),
+        } if !failing.is_empty() && f.snap.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS => {
+            Some(Verdict::Stop(format!(
+                "CI still fails after 3 fix attempts: {}",
+                check_names(failing)
+            )))
+        }
         _ => None,
     }
 }
@@ -550,12 +586,29 @@ fn unhandled_items(f: &Facts<'_>) -> Option<Verdict> {
         })
     })
 }
+fn rerun_cancelled(f: &Facts<'_>) -> Option<Verdict> {
+    match &f.snap.ci {
+        Ci::Rollup {
+            state: RollupState::Failure | RollupState::Error,
+            failing,
+            cancelled,
+            pending,
+        } if failing.is_empty() && !cancelled.is_empty() && pending.is_empty() => {
+            Some(Verdict::Act(Action::RerunCi {
+                runs: cancelled.iter().map(|check| check.run_id).collect(),
+                checks: cancelled.iter().map(|check| check.name.clone()).collect(),
+            }))
+        }
+        _ => None,
+    }
+}
 fn fix_ci(f: &Facts<'_>) -> Option<Verdict> {
     match &f.snap.ci {
         Ci::Rollup {
             state: RollupState::Failure | RollupState::Error,
             failing,
             pending,
+            ..
         } if !failing.is_empty()
             && pending.is_empty()
             && f.snap.ci_fix_attempts < MAX_CI_FIX_ATTEMPTS =>
@@ -588,6 +641,13 @@ fn ci_pending(f: &Facts<'_>) -> Option<Verdict> {
         })),
         _ => None,
     }
+}
+fn ci_starting(f: &Facts<'_>) -> Option<Verdict> {
+    (matches!(f.snap.ci, Ci::NoChecks)
+        && f.snap
+            .head_age
+            .is_some_and(|age| age < Duration::from_secs(3 * 60)))
+    .then(|| Verdict::Wait("Waiting for CI to start on the new commit".into()))
 }
 fn merge_state(f: &Facts<'_>) -> Option<Verdict> {
     if f.snap.mergeable == Mergeable::Unknown {
@@ -748,6 +808,7 @@ mod tests {
                         branch: "feature".into(),
                         sha: sha.clone(),
                     },
+                    head_age: None,
                     mergeable: Mergeable::Yes,
                     merge_state: MergeState::Clean,
                     commits_behind: None,
@@ -772,6 +833,62 @@ mod tests {
                 local: Some(&self.local),
                 method: MergeMethod::Squash,
             })
+        }
+    }
+    #[test]
+    fn fresh_head_without_checks_waits_for_ci_and_reports_the_gate() {
+        let mut w = World::new();
+        w.snap.head_age = Some(Duration::from_secs(10));
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "ci-starting",
+                verdict: Verdict::Wait("Waiting for CI to start on the new commit".into()),
+            }
+        );
+        let facts = Facts {
+            snap: &w.snap,
+            local: Some(&w.local),
+            method: MergeMethod::Squash,
+        };
+        assert_eq!(
+            gates(&facts).to_string(),
+            "reviews=met checks=waiting branch=met merge=pending"
+        );
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec!["github-actions checks".into()],
+        };
+        assert_eq!(w.decision().rule, "ci-pending");
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Success,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec![],
+        };
+        assert_eq!(w.decision().rule, "merge");
+    }
+    #[test]
+    fn old_or_unknown_head_without_checks_can_merge() {
+        for age in [
+            Some(Duration::from_secs(180)),
+            Some(Duration::from_secs(600)),
+            None,
+        ] {
+            let mut w = World::new();
+            w.snap.head_age = age;
+            assert_eq!(
+                w.decision(),
+                Decision {
+                    rule: "merge",
+                    verdict: Verdict::Act(Action::Merge {
+                        head: w.snap.head.sha.clone(),
+                        method: MergeMethod::Squash,
+                    }),
+                }
+            );
         }
     }
     fn comment(id: u64, actor: Actor, body: &str) -> Comment {
@@ -926,6 +1043,7 @@ mod tests {
         w.snap.ci = Ci::Rollup {
             state: RollupState::Pending,
             failing: vec![],
+            cancelled: vec![],
             pending: vec![],
         };
         assert_eq!(w.decision().rule, "unhandled-items");
@@ -941,12 +1059,19 @@ mod tests {
         let mut w = World::new();
         w.snap.draft = true;
         w.snap.merge_state = MergeState::Draft;
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Success,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec![],
+        };
         let decision = w.decision();
         assert_eq!(decision.rule, "draft");
         assert_eq!(
             decision.verdict,
             Verdict::Wait(
-                "Draft: everything else is done. Mark it ready for review to merge.".into()
+                "Draft is up to date. Watching for new commits, CI results, and review comments."
+                    .into()
             )
         );
         let facts = Facts {
@@ -956,7 +1081,7 @@ mod tests {
         };
         assert_eq!(
             gates(&facts).to_string(),
-            "reviews=met checks=met branch=met merge=waiting"
+            "reviews=met checks=met branch=met merge=skipped"
         );
         w.snap.draft = false;
         w.snap.merge_state = MergeState::Clean;
@@ -967,6 +1092,32 @@ mod tests {
                 method: MergeMethod::Squash,
             })
         );
+    }
+    #[test]
+    fn draft_skips_only_merge_even_when_other_gates_are_open() {
+        let mut w = World::new();
+        w.snap.review_decision = Some(ReviewDecision::ReviewRequired);
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Pending,
+            failing: vec![],
+            cancelled: vec![],
+            pending: vec!["tests".into()],
+        };
+        w.snap.mergeable = Mergeable::Conflicting;
+        w.snap.lifecycle = Lifecycle::Closed;
+        for (draft, state) in [(true, MergeState::Clean), (false, MergeState::Draft)] {
+            w.snap.draft = draft;
+            w.snap.merge_state = state;
+            let facts = Facts {
+                snap: &w.snap,
+                local: Some(&w.local),
+                method: MergeMethod::Squash,
+            };
+            assert_eq!(
+                gates(&facts).to_string(),
+                "reviews=waiting checks=waiting branch=blocked merge=skipped"
+            );
+        }
     }
     #[test]
     fn draft_work_precedes_waiting_for_ready() {
@@ -988,6 +1139,7 @@ mod tests {
         w.snap.ci = Ci::Rollup {
             state: RollupState::Failure,
             failing: checks.clone(),
+            cancelled: vec![],
             pending: vec![],
         };
         assert_eq!(
@@ -1014,12 +1166,94 @@ mod tests {
                 name: "build".into(),
                 source: CheckSource::Actions { job_id: 17 },
             }],
+            cancelled: vec![],
             pending: vec!["test".into()],
         };
         assert_eq!(w.decision().rule, "ci-failed");
         assert_eq!(
             w.decision().verdict,
             Verdict::Wait("Waiting for 1 more check before fixing build".into())
+        );
+    }
+    #[test]
+    fn cancelled_actions_runs_are_deduplicated_and_rerun() {
+        for state in [RollupState::Failure, RollupState::Error] {
+            let mut w = World::new();
+            w.snap.ci_fix_attempts = 3;
+            w.snap.ci = Ci::Rollup {
+                state,
+                failing: vec![],
+                cancelled: vec![
+                    CancelledCheck {
+                        name: "build".into(),
+                        run_id: 12,
+                    },
+                    CancelledCheck {
+                        name: "test".into(),
+                        run_id: 12,
+                    },
+                    CancelledCheck {
+                        name: "lint".into(),
+                        run_id: 14,
+                    },
+                ],
+                pending: vec![],
+            };
+            let decision = w.decision();
+            assert_eq!(decision.rule, "rerun-cancelled");
+            assert_eq!(
+                decision.verdict.to_string(),
+                "Rerunning cancelled CI: build, test and lint"
+            );
+            assert_eq!(
+                decision.verdict,
+                Verdict::Act(Action::RerunCi {
+                    runs: BTreeSet::from([12, 14]),
+                    checks: vec!["build".into(), "test".into(), "lint".into()],
+                })
+            );
+        }
+    }
+    #[test]
+    fn real_failures_are_fixed_without_including_cancelled_checks() {
+        let mut w = World::new();
+        let checks = vec![FailedCheck {
+            name: "build".into(),
+            source: CheckSource::Actions { job_id: 17 },
+        }];
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Failure,
+            failing: checks.clone(),
+            cancelled: vec![CancelledCheck {
+                name: "tests".into(),
+                run_id: 12,
+            }],
+            pending: vec![],
+        };
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Act(Action::FixCi {
+                checks,
+                head: w.snap.head.clone(),
+            })
+        );
+    }
+    #[test]
+    fn cancelled_checks_wait_for_pending_checks() {
+        let mut w = World::new();
+        w.snap.ci = Ci::Rollup {
+            state: RollupState::Failure,
+            failing: vec![],
+            cancelled: vec![CancelledCheck {
+                name: "build".into(),
+                run_id: 12,
+            }],
+            pending: vec!["tests".into()],
+        };
+        assert_eq!(w.decision().rule, "ci-failed");
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Wait("Waiting for 1 more check before fixing CI".into())
         );
     }
     #[test]
@@ -1038,6 +1272,7 @@ mod tests {
         w.snap.ci = Ci::Rollup {
             state: RollupState::Error,
             failing: checks.clone(),
+            cancelled: vec![],
             pending: vec![],
         };
         w.local.dirty.push(" M file".into());
@@ -1072,6 +1307,7 @@ mod tests {
             w.snap.ci = Ci::Rollup {
                 state,
                 failing: vec![],
+                cancelled: vec![],
                 pending: vec![],
             };
             assert_eq!(w.decision().rule, "ci-failed");
@@ -1087,6 +1323,7 @@ mod tests {
         w.snap.ci = Ci::Rollup {
             state: RollupState::Success,
             failing: vec![],
+            cancelled: vec![],
             pending: vec![],
         };
         w.snap.ci_fix_attempts = 3;
@@ -1192,6 +1429,7 @@ mod tests {
         w.snap.ci = Ci::Rollup {
             state: RollupState::Pending,
             failing: vec![],
+            cancelled: vec![],
             pending: vec![],
         };
         w.snap.mergeable = Mergeable::Unknown;

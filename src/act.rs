@@ -99,6 +99,17 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Action::RerunCi { runs, .. } => {
+            for run_id in runs {
+                if env.gh.run_attempt(run_id)? >= 3 {
+                    bail!(
+                        "CI run {run_id} was cancelled on 3 attempts; find out why it keeps getting cancelled"
+                    );
+                }
+                env.gh.rerun_failed(run_id)?;
+            }
+            Ok(())
+        }
         Action::FixCi { checks, head } => {
             ensure!(
                 env.git.head()? == head.sha,
@@ -130,30 +141,52 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 env.git.head()? == head.sha,
                 "codex changed HEAD; inspect the checkout"
             );
-            let protected = env.git.ci_configuration_changes()?;
-            ensure!(
-                protected.is_empty(),
-                "codex edited CI configuration: {}; changes left uncommitted for inspection",
-                protected.join(", ")
-            );
-            let result = result?;
-            if result.outcome == codex::CiFixOutcome::NeedsHuman {
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    ensure_ci_configuration_unchanged(&env.git)?;
+                    return Err(error);
+                }
+            };
+            if result.outcome == codex::CiFixOutcome::NeedsHuman && env.git.is_clean()? {
                 bail!("CI failed: {names}: {}", result.summary.trim());
             }
-            ensure!(
-                env.git
-                    .commit_all_with(&ci_commit_message(&result.summary))?,
-                "codex reported a fix but changed nothing"
-            );
-            let protected = env.git.committed_ci_changes(&head.sha)?;
-            ensure!(
-                protected.is_empty(),
-                "fix commit touches CI configuration: {}; commit left local, not pushed",
-                protected.join(", ")
-            );
-            env.git.push(&head.branch)
+            commit_ci_fix(env, &head, &result.summary)?;
+            if result.outcome == codex::CiFixOutcome::NeedsHuman {
+                let sha = env.git.head()?;
+                bail!(
+                    "CI needs a person: {names}: {}\nPushed a partial fix {}.",
+                    result.summary.trim(),
+                    &sha.as_str()[..7]
+                );
+            }
+            Ok(())
         }
     }
+}
+fn ensure_ci_configuration_unchanged(git: &Git) -> anyhow::Result<()> {
+    let protected = git.ci_configuration_changes()?;
+    ensure!(
+        protected.is_empty(),
+        "codex edited CI configuration: {}; changes left uncommitted for inspection",
+        protected.join(", ")
+    );
+    Ok(())
+}
+
+fn commit_ci_fix(env: &Env, head: &Head, summary: &str) -> anyhow::Result<()> {
+    ensure_ci_configuration_unchanged(&env.git)?;
+    ensure!(
+        env.git.commit_all_with(&ci_commit_message(summary))?,
+        "codex reported a fix but changed nothing"
+    );
+    let protected = env.git.committed_ci_changes(&head.sha)?;
+    ensure!(
+        protected.is_empty(),
+        "fix commit touches CI configuration: {}; commit left local, not pushed",
+        protected.join(", ")
+    );
+    env.git.push(&head.branch)
 }
 
 fn optional_job_log(result: anyhow::Result<String>) -> anyhow::Result<Option<String>> {

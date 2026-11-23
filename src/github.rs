@@ -1,6 +1,9 @@
 use crate::{domain::*, proc, wire};
 use anyhow::{Context, bail};
-use std::{process::Command, time::Instant};
+use std::{
+    process::Command,
+    time::{Instant, SystemTime},
+};
 
 const MAX_JOB_LOG_BYTES: usize = 60_000;
 pub struct Gh {
@@ -75,7 +78,7 @@ impl Gh {
         if response["data"]["repository"]["pullRequest"]["baseRefName"].as_str() != Some(base) {
             bail!("base branch changed during snapshot");
         }
-        wire::parse_snapshot(out.as_bytes())
+        wire::parse_snapshot(out.as_bytes(), SystemTime::now())
     }
     pub fn failed_job_log(&self, job_id: u64) -> anyhow::Result<String> {
         let path = format!("repos/{}/actions/jobs/{job_id}/logs", self.repo());
@@ -127,6 +130,30 @@ impl Gh {
     pub fn update_branch(&self) -> anyhow::Result<()> {
         proc::run(
             Command::new("gh").args(["pr", "update-branch", &self.number(), "-R", &self.repo()]),
+            None,
+            self.deadline,
+        )?;
+        Ok(())
+    }
+    pub fn run_attempt(&self, run_id: u64) -> anyhow::Result<u64> {
+        let path = format!("repos/{}/actions/runs/{run_id}", self.repo());
+        let out = proc::run(
+            Command::new("gh").args(["api", &path, "--jq", ".run_attempt"]),
+            None,
+            self.deadline,
+        )?;
+        out.trim().parse().context("invalid CI run attempt")
+    }
+    pub fn rerun_failed(&self, run_id: u64) -> anyhow::Result<()> {
+        proc::run(
+            Command::new("gh").args([
+                "run",
+                "rerun",
+                &run_id.to_string(),
+                "--failed",
+                "-R",
+                &self.repo(),
+            ]),
             None,
             self.deadline,
         )?;
