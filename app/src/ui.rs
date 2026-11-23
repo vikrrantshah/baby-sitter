@@ -1,8 +1,8 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, Config, GateState, Outcome, PastSit, PrFilter, PrRef, PrRow, RepoListItem, RepoName,
-        RepoScope, RepoSettings, SitState, VerdictKind,
+        self, Config, GateState, Outcome, PastSit, PrFilter, PrRef, PrRow, PrState, RepoListItem,
+        RepoName, RepoScope, RepoSettings, SitState, VerdictKind,
     },
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
@@ -78,6 +78,16 @@ impl RowAction {
     }
 }
 
+fn pr_state_color(state: PrState) -> Hsla {
+    match state {
+        PrState::Draft => muted(),
+        PrState::Ready => rgb(0x3fb950).into(),
+        PrState::Queued => warning(),
+        PrState::Merged => rgb(0x8250df).into(),
+        PrState::Closed => danger(),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ClosedPr {
     AwaitingSearch,
@@ -129,6 +139,7 @@ pub struct AppView {
     avatars: BTreeMap<String, PathBuf>,
     scope: RepoScope,
     pr_filter: PrFilter,
+    drafts_only: bool,
     dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
     selected_filter: Option<RepoName>,
     inputs: BTreeMap<RepoName, RepoInputs>,
@@ -306,6 +317,7 @@ impl AppView {
             avatars: BTreeMap::new(),
             scope: RepoScope::All,
             pr_filter: PrFilter::default(),
+            drafts_only: false,
             dashboard_filter,
             selected_filter: None,
             inputs: BTreeMap::new(),
@@ -669,7 +681,11 @@ impl AppView {
                                 gh::GhPrAction::Ready | gh::GhPrAction::Draft => {
                                     if let Some(row) = rows.iter_mut().find(|row| row.pr == task_pr)
                                     {
-                                        row.is_draft = matches!(action, gh::GhPrAction::Draft);
+                                        row.state = if matches!(action, gh::GhPrAction::Draft) {
+                                            PrState::Draft
+                                        } else {
+                                            PrState::Ready
+                                        };
                                     }
                                 }
                                 gh::GhPrAction::Close => {
@@ -820,7 +836,7 @@ impl AppView {
         let Some(settings) = self.config.repos.get(&pr.repo) else {
             return;
         };
-        let timeout = if matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|row| row.pr == pr && row.is_draft))
+        let timeout = if matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|row| row.pr == pr && row.state == PrState::Draft))
         {
             settings.draft_timeout
         } else {
@@ -1201,11 +1217,11 @@ impl AppView {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(px(4.))
+                                .gap(px(6.))
                                 .text_color(if selected { accent() } else { muted() })
                                 .when(selected, |d| d.font_semibold())
                                 .child(label)
-                                .when(count > 0, |d| d.child(count.to_string())),
+                                .when(count > 0, |d| d.child(count_pill(count, selected))),
                         )
                     }),
             )
@@ -1270,7 +1286,8 @@ impl AppView {
             .inputs
             .get(repo)
             .expect("watched repositories have duration inputs");
-        let field = |label: &'static str,
+        let field = |icon: Icon,
+                     label: &'static str,
                      hint: &'static str,
                      input: &Entity<InputState>,
                      error: &Option<String>| {
@@ -1293,9 +1310,13 @@ impl AppView {
                             div()
                                 .w(px(SETTINGS_LABEL_WIDTH))
                                 .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
                                 .text_size(px(14.))
                                 .font_semibold()
                                 .text_color(ink())
+                                .child(icon.size(px(14.)).text_color(muted()))
                                 .child(label),
                         )
                         .child(
@@ -1373,18 +1394,21 @@ impl AppView {
                         .flex_col()
                         .gap(px(20.))
                         .child(field(
+                            Icon::empty().path("icons/timer.svg"),
                             "Timeout",
                             "How long to wait for the merge, for example 2h.",
                             &inputs.timeout,
                             &inputs.timeout_error,
                         ))
                         .child(field(
+                            Icon::new(IconName::GitPullRequestDraft),
                             "Draft timeout",
                             "How long to babysit a draft pull request.",
                             &inputs.draft_timeout,
                             &inputs.draft_timeout_error,
                         ))
                         .child(field(
+                            Icon::new(IconName::RefreshCw),
                             "Interval",
                             "How long to wait between checks, for example 30s.",
                             &inputs.interval,
@@ -1470,9 +1494,9 @@ impl AppView {
             .then(|| self.config.active.get(&row.pr))
             .flatten()
             .map(|deadline| time_left(deadline.saturating_sub(model::unix_now())));
-        let is_open =
-            matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|item| item.pr == row.pr));
-        let is_draft = row.is_draft;
+        let is_open = matches!(row.state, PrState::Draft | PrState::Ready | PrState::Queued)
+            && matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|item| item.pr == row.pr));
+        let is_draft = row.state == PrState::Draft;
         let merged = reading.merged;
         let menu_pr = row.pr.clone();
         let menu_url = row.url.clone();
@@ -1492,28 +1516,38 @@ impl AppView {
                     let pr = menu_pr.clone();
                     let url = menu_url.clone();
                     let view = view.clone();
-                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        if action == RowAction::CopyLink {
-                            copy_pr_link(&pr, &url, window, cx);
-                        } else {
-                            let _ = view.update(cx, |this, cx| match action {
-                                RowAction::MarkReady => this.run_pr_action(
-                                    pr.clone(),
-                                    gh::GhPrAction::Ready,
-                                    window,
-                                    cx,
-                                ),
-                                RowAction::ConvertToDraft => this.run_pr_action(
-                                    pr.clone(),
-                                    gh::GhPrAction::Draft,
-                                    window,
-                                    cx,
-                                ),
-                                RowAction::Close => this.ask_close(pr.clone(), window, cx),
-                                RowAction::CopyLink => {}
-                            });
+                    let icon = match action {
+                        RowAction::MarkReady => {
+                            Icon::empty().path("icons/git-pull-request-arrow.svg")
                         }
-                    }));
+                        RowAction::ConvertToDraft => Icon::new(IconName::GitPullRequestDraft),
+                        RowAction::Close => Icon::new(IconName::X),
+                        RowAction::CopyLink => Icon::empty().path("icons/link.svg"),
+                    };
+                    menu = menu.item(PopupMenuItem::new(label).icon(icon).on_click(
+                        move |_, window, cx| {
+                            if action == RowAction::CopyLink {
+                                copy_pr_link(&pr, &url, window, cx);
+                            } else {
+                                let _ = view.update(cx, |this, cx| match action {
+                                    RowAction::MarkReady => this.run_pr_action(
+                                        pr.clone(),
+                                        gh::GhPrAction::Ready,
+                                        window,
+                                        cx,
+                                    ),
+                                    RowAction::ConvertToDraft => this.run_pr_action(
+                                        pr.clone(),
+                                        gh::GhPrAction::Draft,
+                                        window,
+                                        cx,
+                                    ),
+                                    RowAction::Close => this.ask_close(pr.clone(), window, cx),
+                                    RowAction::CopyLink => {}
+                                });
+                            }
+                        },
+                    ));
                 }
             }
             menu
@@ -1539,23 +1573,39 @@ impl AppView {
             .gap(px(8.))
             .child(
                 div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .rounded_full()
+                    .px(px(8.))
+                    .py(px(2.))
+                    .bg(pr_state_color(row.state).opacity(0.12))
+                    .text_color(pr_state_color(row.state))
+                    .text_size(px(12.))
+                    .font_semibold()
+                    .child(
+                        Icon::empty()
+                            .path(match row.state {
+                                PrState::Draft => "icons/git-pull-request-draft.svg",
+                                PrState::Ready => "icons/git-pull-request.svg",
+                                PrState::Queued => "icons/git-merge-queue-16.svg",
+                                PrState::Merged => "icons/git-merge.svg",
+                                PrState::Closed => "icons/git-pull-request-closed.svg",
+                            })
+                            .size(px(16.)),
+                    )
+                    .child(row.state.label()),
+            )
+            .child(
+                div()
                     .min_w_0()
                     .text_size(px(16.))
                     .line_height(relative(1.3))
                     .font_semibold()
                     .text_color(ink())
                     .child(row.title.clone()),
-            )
-            .when(row.is_draft, |title| {
-                title.child(
-                    div()
-                        .id(SharedString::from(format!("draft-{}", row.pr)))
-                        .flex_shrink_0()
-                        .text_color(muted())
-                        .child(Icon::new(IconName::GitPullRequestDraft).size(px(16.)))
-                        .tooltip(|window, cx| Tooltip::new("Draft").build(window, cx)),
-                )
-            });
+            );
         let place = format!("{} #{}", row.pr.repo, row.pr.number);
         let copy_url = row.url.clone();
         let copy_pr = row.pr.clone();
@@ -1704,6 +1754,9 @@ impl AppView {
     }
     fn render_dashboard(&self, cx: &mut Context<Self>) -> (Div, Div) {
         let mut rows = self.dashboard_rows();
+        if self.drafts_only {
+            model::only_drafts(&mut rows);
+        }
         let counts = model::pr_counts(&rows, &self.states);
         rows.retain(|row| {
             self.pr_filter
@@ -1716,7 +1769,9 @@ impl AppView {
                     .child(Self::retry_prs_button(cx))
             }
             _ if rows.is_empty() => {
-                if self.pr_filter == PrFilter::All && self.config.repos.is_empty() {
+                if self.drafts_only {
+                    message("No draft pull requests", None)
+                } else if self.pr_filter == PrFilter::All && self.config.repos.is_empty() {
                     message(
                         "No watched repositories",
                         Some("Watch a repository to see its pull requests.".into()),
@@ -1855,11 +1910,11 @@ impl AppView {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(px(4.))
+                                .gap(px(6.))
                                 .text_color(if selected { accent() } else { muted() })
                                 .when(selected, |d| d.font_semibold())
                                 .child(label)
-                                .when(count > 0, |d| d.child(count.to_string())),
+                                .when(count > 0, |d| d.child(count_pill(count, selected))),
                         )
                     }),
             )
@@ -1884,7 +1939,34 @@ impl AppView {
                 "All repositories",
                 Size::Medium,
             ))
-            .child(filter);
+            .child(filter)
+            .child(
+                div()
+                    .flex()
+                    .self_stretch()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .id("drafts-only-label")
+                            .cursor_pointer()
+                            .text_color(muted())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drafts_only = !this.drafts_only;
+                                cx.notify();
+                            }))
+                            .child("Drafts only"),
+                    )
+                    .child(
+                        Switch::new("drafts-only")
+                            .accessibility_label("Drafts only")
+                            .checked(self.drafts_only)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.drafts_only = *checked;
+                                cx.notify();
+                            })),
+                    ),
+            );
         let body = div()
             .size_full()
             .flex()
@@ -1954,6 +2036,24 @@ impl AppView {
                 ),
             )
     }
+}
+
+fn count_pill(count: usize, selected: bool) -> Div {
+    div()
+        .h(px(16.))
+        .px(px(6.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(if selected {
+            accent().opacity(0.15)
+        } else {
+            raised()
+        })
+        .text_size(px(11.))
+        .text_color(if selected { accent() } else { muted() })
+        .child(count.to_string())
 }
 
 fn copy_pr_link(pr: &PrRef, url: &str, window: &mut Window, cx: &mut App) {

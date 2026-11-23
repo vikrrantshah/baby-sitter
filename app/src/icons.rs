@@ -29,11 +29,14 @@ filled! {
     "folder-git-2" => "folder-simple-fill.svg",
     "folder-open" => "folder-open-fill.svg",
     "git-branch" => "git-branch-fill.svg",
-    "git-merge" => "git-merge-fill.svg",
+    "git-merge" => "git-merge-16.svg",
+    "git-pull-request" => "git-pull-request-16.svg",
     "git-pull-request-arrow" => "git-pull-request-fill.svg",
-    "git-pull-request-draft" => "pencil-simple-fill.svg",
+    "git-pull-request-closed" => "git-pull-request-closed-16.svg",
+    "git-pull-request-draft" => "git-pull-request-draft-16.svg",
     "github" => "mark-github-24.svg",
     "inbox" => "tray-fill.svg",
+    "link" => "link-simple-fill.svg",
     "list-checks" => "list-checks-fill.svg",
     "message-square" => "chat-centered-text-fill.svg",
     "minus" => "minus-circle-fill.svg",
@@ -50,6 +53,11 @@ pub struct FilledAssets;
 
 impl AssetSource for FilledAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path == "icons/git-merge-queue-16.svg" {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/git-merge-queue-16.svg"
+            ))));
+        }
         match FILLED.iter().find(|(lucide, _)| *lucide == path) {
             Some((_, svg)) => Ok(Some(Cow::Borrowed(svg))),
             None => assets::AllAssets.load(path),

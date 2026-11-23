@@ -1,4 +1,4 @@
-use crate::model::{PrRef, PrRow, RepoName};
+use crate::model::{PrRef, PrRow, PrState, RepoName};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
@@ -97,6 +97,29 @@ mod tests {
             OsString::from("/usr/bin:/opt/homebrew/bin:/usr/local/bin")
         );
     }
+    #[test]
+    fn graphql_search_parses_all_pull_request_states() {
+        let fixture = r#"[
+          {"data":{"search":{"nodes":[
+            {"number":1,"title":"draft","url":"https://example.com/1","isDraft":true,"isInMergeQueue":false,"state":"OPEN","updatedAt":"1","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":2,"title":"ready","url":"https://example.com/2","isDraft":false,"isInMergeQueue":false,"state":"OPEN","updatedAt":"2","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":3,"title":"queued","url":"https://example.com/3","isDraft":true,"isInMergeQueue":true,"state":"OPEN","updatedAt":"3","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":4,"title":"merged","url":"https://example.com/4","isDraft":true,"isInMergeQueue":true,"state":"MERGED","updatedAt":"4","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":5,"title":"closed","url":"https://example.com/5","isDraft":true,"isInMergeQueue":true,"state":"CLOSED","updatedAt":"5","repository":{"nameWithOwner":"owner/repo"}}
+          ]}}}
+        ]"#;
+        let rows = parse_pr_search(fixture.as_bytes()).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.state).collect::<Vec<_>>(),
+            [
+                PrState::Draft,
+                PrState::Ready,
+                PrState::Queued,
+                PrState::Merged,
+                PrState::Closed
+            ]
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -187,6 +210,31 @@ pub fn list_repos(env: &ChildEnv) -> Result<Vec<RepoName>> {
     Ok(repos)
 }
 
+const PR_SEARCH_QUERY: &str = r#"query($endCursor: String) {
+  search(query: "is:pr author:@me is:open", type: ISSUE, first: 100, after: $endCursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number title url isDraft isInMergeQueue state updatedAt
+        repository { nameWithOwner }
+      }
+    }
+  }
+}"#;
+
+#[derive(Deserialize)]
+struct SearchPage {
+    data: SearchData,
+}
+#[derive(Deserialize)]
+struct SearchData {
+    search: SearchResults,
+}
+#[derive(Deserialize)]
+struct SearchResults {
+    nodes: Vec<SearchPr>,
+}
+
 #[derive(Deserialize)]
 struct SearchRepo {
     #[serde(rename = "nameWithOwner")]
@@ -200,27 +248,25 @@ struct SearchPr {
     url: String,
     #[serde(rename = "isDraft")]
     is_draft: bool,
+    #[serde(rename = "isInMergeQueue")]
+    is_in_merge_queue: bool,
+    state: SearchPrState,
     #[serde(rename = "updatedAt")]
     updated_at: String,
 }
-pub fn list_my_prs(env: &ChildEnv) -> Result<Vec<PrRow>> {
-    let mut command = env.command("gh");
-    command.args([
-        "search",
-        "prs",
-        "--author",
-        "@me",
-        "--state",
-        "open",
-        "--limit",
-        "1000",
-        "--json",
-        "number,title,repository,url,isDraft,updatedAt",
-    ]);
-    let rows: Vec<SearchPr> =
-        serde_json::from_slice(&output(command)?).context("parse pull requests")?;
-    Ok(rows
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum SearchPrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+fn parse_pr_search(bytes: &[u8]) -> Result<Vec<PrRow>> {
+    let pages: Vec<SearchPage> = serde_json::from_slice(bytes).context("parse pull requests")?;
+    Ok(pages
         .into_iter()
+        .flat_map(|page| page.data.search.nodes)
         .map(|row| PrRow {
             pr: PrRef {
                 repo: row.repository.name_with_owner,
@@ -228,10 +274,29 @@ pub fn list_my_prs(env: &ChildEnv) -> Result<Vec<PrRow>> {
             },
             title: row.title,
             url: row.url,
-            is_draft: row.is_draft,
+            state: match row.state {
+                SearchPrState::Merged => PrState::Merged,
+                SearchPrState::Closed => PrState::Closed,
+                SearchPrState::Open if row.is_in_merge_queue => PrState::Queued,
+                SearchPrState::Open if row.is_draft => PrState::Draft,
+                SearchPrState::Open => PrState::Ready,
+            },
             updated_at: row.updated_at,
         })
         .collect())
+}
+
+pub fn list_my_prs(env: &ChildEnv) -> Result<Vec<PrRow>> {
+    let mut command = env.command("gh");
+    command.args([
+        "api",
+        "graphql",
+        "--paginate",
+        "--slurp",
+        "-f",
+        &format!("query={PR_SEARCH_QUERY}"),
+    ]);
+    parse_pr_search(&output(command)?)
 }
 
 #[derive(Clone, Copy)]

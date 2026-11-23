@@ -249,12 +249,33 @@ pub struct Config {
     pub history: BTreeMap<PrRef, PastSit>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrState {
+    Draft,
+    Ready,
+    Queued,
+    Merged,
+    Closed,
+}
+
+impl PrState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft",
+            Self::Ready => "Ready",
+            Self::Queued => "In queue",
+            Self::Merged => "Merged",
+            Self::Closed => "Closed",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PrRow {
     pub pr: PrRef,
     pub title: String,
     pub url: String,
-    pub is_draft: bool,
+    pub state: PrState,
     pub updated_at: String,
 }
 
@@ -294,13 +315,25 @@ pub fn dashboard_rows<'a>(
                         |past| past.title.clone(),
                     ),
                     url: pr.url(),
-                    is_draft: false,
+                    state: if history
+                        .get(pr)
+                        .is_some_and(|past| past.outcome == Outcome::Merged)
+                        || matches!(sits.get(pr), Some(SitState::Finished(Outcome::Merged)))
+                    {
+                        PrState::Merged
+                    } else {
+                        PrState::Ready
+                    },
                     updated_at: String::new(),
                 })
             }),
     );
     rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     rows
+}
+
+pub fn only_drafts(rows: &mut Vec<Cow<'_, PrRow>>) {
+    rows.retain(|row| row.state == PrState::Draft);
 }
 
 pub fn pr_counts(
@@ -505,7 +538,7 @@ mod tests {
             url: pr.url(),
             title: format!("PR {}", pr.number),
             pr,
-            is_draft: false,
+            state: PrState::Ready,
             updated_at: updated_at.into(),
         }
     }
@@ -621,6 +654,36 @@ mod tests {
         );
         let repo = "owner/one".parse().unwrap();
         let rows = dashboard_rows(&prs, &history, &sits, &watched, PrFilter::All, Some(&repo));
+        assert_eq!(
+            pr_counts(&rows, &sits),
+            [
+                (PrFilter::All, 2),
+                (PrFilter::Watched, 1),
+                (PrFilter::Unwatched, 1),
+                (PrFilter::Merged, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn draft_filter_limits_status_counts() {
+        let mut draft_watched = row("owner/one#1", "2026-01-01");
+        draft_watched.state = PrState::Draft;
+        let mut draft_unwatched = row("owner/one#2", "2026-01-02");
+        draft_unwatched.state = PrState::Draft;
+        let prs = [
+            draft_watched,
+            draft_unwatched,
+            row("owner/one#3", "2026-01-03"),
+        ];
+        let sits = BTreeMap::from([
+            ("owner/one#1".parse().unwrap(), SitState::Preparing),
+            ("owner/one#3".parse().unwrap(), SitState::Preparing),
+        ]);
+        let watched = BTreeMap::from([("owner/one".parse().unwrap(), RepoSettings::default())]);
+        let history = BTreeMap::new();
+        let mut rows = dashboard_rows(&prs, &history, &sits, &watched, PrFilter::All, None);
+        only_drafts(&mut rows);
         assert_eq!(
             pr_counts(&rows, &sits),
             [
