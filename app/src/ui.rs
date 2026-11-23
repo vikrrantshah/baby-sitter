@@ -1543,9 +1543,9 @@ impl AppView {
             .pt(px(20.))
             .child(
                 div().px(px(ROW_INSET)).flex().items_start().child(
-                    Button::new("back-to-pull-requests")
+                    Button::new("back-home")
                         .icon(IconName::ChevronLeft)
-                        .label("Pull requests")
+                        .label("Home")
                         .ghost()
                         .ml(px(-8.))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2662,10 +2662,17 @@ impl AppView {
             .child(drag_area().h(px(52.)))
             .child(
                 div()
+                    .id("settings-home")
                     .px(px(20.))
                     .flex()
                     .items_center()
                     .gap(px(10.))
+                    .cursor_pointer()
+                    .tooltip(|window, cx| Tooltip::new("Home").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page = Page::PullRequests;
+                        cx.notify();
+                    }))
                     .child(pair_mark())
                     .child(
                         div()
