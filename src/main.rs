@@ -1,6 +1,7 @@
 mod act;
 mod codex;
 mod decide;
+mod deps;
 mod domain;
 mod git;
 mod github;
