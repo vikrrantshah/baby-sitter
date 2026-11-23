@@ -1222,7 +1222,7 @@ impl AppView {
                                 .text_color(if selected { accent() } else { muted() })
                                 .when(selected, |d| d.font_semibold())
                                 .child(label)
-                                .when(count > 0, |d| d.child(count_pill(count))),
+                                .when(count > 0, |d| d.child(count.to_string())),
                         )
                     }),
             )
@@ -1918,7 +1918,7 @@ impl AppView {
                                 .text_color(if selected { accent() } else { muted() })
                                 .when(selected, |d| d.font_semibold())
                                 .child(label)
-                                .when(count > 0, |d| d.child(count_pill(count))),
+                                .when(count > 0, |d| d.child(count.to_string())),
                         )
                     }),
             )
@@ -2040,21 +2040,6 @@ impl AppView {
                 ),
             )
     }
-}
-
-fn count_pill(count: usize) -> Div {
-    div()
-        .h(px(16.))
-        .px(px(6.))
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(accent())
-        .text_size(px(11.))
-        .font_semibold()
-        .text_color(surface())
-        .child(count.to_string())
 }
 
 fn copy_pr_link(pr: &PrRef, url: &str, window: &mut Window, cx: &mut App) {
