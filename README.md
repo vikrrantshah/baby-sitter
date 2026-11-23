@@ -35,7 +35,7 @@ The bundle contains both binaries. For development, `cargo build --workspace && 
 
 ## Babysit pull requests with the app
 
-1. Open **Settings** with Cmd+, and select **Status**. Every required check should be green. A red check names the command that fixes it, such as `gh auth login` or `codex login`. While a required check fails, the Pull requests page shows a banner that links here.
+1. Open **Settings** with Cmd+, and select **Status**. Every required check should be green. A red check names the command that fixes it, such as `gh auth login` or `codex login`. While a required check fails, the Pull requests page shows a banner that links here. Under **Permissions**, allow notifications so you hear when a babysit merges or needs you. Baby Sitter needs no other macOS permission.
 2. Select **Repositories** and turn on the repositories you want to babysit.
 3. On **Pull requests**, press play on a PR. Its row shows the four phases and what the babysitter is doing now.
 4. Wait for the notification. A babysit ends when the PR merges, when its timeout passes, or when it needs you, and the row then shows the reason.

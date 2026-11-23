@@ -1,4 +1,7 @@
-use crate::gh::ChildEnv;
+use crate::{
+    gh::ChildEnv,
+    notifications::{self, NotificationAccess},
+};
 use std::{
     os::unix::process::CommandExt,
     process::{Output, Stdio},
@@ -6,17 +9,31 @@ use std::{
     time::Duration,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Required,
+    Optional,
+    Permissions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fix {
+    Copy(String),
+    OpenSettings(&'static str),
+    AllowNotifications,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckState {
     Ok(String),
-    Missing { detail: String, fix: String },
+    Missing { detail: String, fix: Fix },
     Failed(String),
 }
 
 pub struct CheckSpec {
     pub id: &'static str,
     pub label: &'static str,
-    pub required: bool,
+    pub section: Section,
     pub run: fn(&ChildEnv) -> CheckState,
 }
 
@@ -24,50 +41,56 @@ pub const CHECKS: &[CheckSpec] = &[
     CheckSpec {
         id: "gh",
         label: "GitHub CLI",
-        required: true,
+        section: Section::Required,
         run: check_gh,
     },
     CheckSpec {
         id: "gh-auth",
         label: "GitHub sign-in",
-        required: true,
+        section: Section::Required,
         run: check_gh_auth,
     },
     CheckSpec {
         id: "git",
         label: "Git",
-        required: true,
+        section: Section::Required,
         run: check_git,
     },
     CheckSpec {
         id: "codex",
         label: "Codex CLI",
-        required: true,
+        section: Section::Required,
         run: check_codex,
     },
     CheckSpec {
         id: "codex-auth",
         label: "Codex sign-in",
-        required: true,
+        section: Section::Required,
         run: check_codex_auth,
     },
     CheckSpec {
         id: "pnpm",
         label: "pnpm",
-        required: false,
+        section: Section::Optional,
         run: check_pnpm,
     },
     CheckSpec {
         id: "npm",
         label: "npm",
-        required: false,
+        section: Section::Optional,
         run: check_npm,
     },
     CheckSpec {
         id: "yarn",
         label: "Yarn",
-        required: false,
+        section: Section::Optional,
         run: check_yarn,
+    },
+    CheckSpec {
+        id: "notifications",
+        label: "Notifications",
+        section: Section::Permissions,
+        run: check_notifications,
     },
 ];
 
@@ -107,7 +130,7 @@ fn command(env: &ChildEnv, program: &str, args: &[&str]) -> Result<Output, Strin
 fn missing(detail: &str, fix: &str) -> CheckState {
     CheckState::Missing {
         detail: detail.into(),
-        fix: fix.into(),
+        fix: Fix::Copy(fix.into()),
     }
 }
 
@@ -267,6 +290,58 @@ fn check_yarn(env: &ChildEnv) -> CheckState {
     )
 }
 
+const NOTIFICATION_SETTINGS_URL: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.github.vikrrantshah.baby-sitter";
+
+fn notifications_state(access: NotificationAccess) -> CheckState {
+    let detail = match access {
+        NotificationAccess::Unbundled => {
+            return CheckState::Failed("Available only in the bundled app".into());
+        }
+        NotificationAccess::NotDetermined => {
+            return CheckState::Missing {
+                detail: "Not requested yet".into(),
+                fix: Fix::AllowNotifications,
+            };
+        }
+        NotificationAccess::Denied => "Turned off in System Settings",
+        NotificationAccess::Allowed {
+            banners: true,
+            notification_center: true,
+        } => return CheckState::Ok("Banners and Notification Center".into()),
+        NotificationAccess::Allowed {
+            banners: false,
+            notification_center: true,
+        } => "Allowed, but banners are off",
+        NotificationAccess::Allowed {
+            banners: true,
+            notification_center: false,
+        } => "Allowed, but hidden from Notification Center",
+        NotificationAccess::Allowed {
+            banners: false,
+            notification_center: false,
+        } => "Allowed, but banners and Notification Center are off",
+    };
+    CheckState::Missing {
+        detail: detail.into(),
+        fix: Fix::OpenSettings(NOTIFICATION_SETTINGS_URL),
+    }
+}
+
+fn check_notifications(_: &ChildEnv) -> CheckState {
+    match notifications::access() {
+        Ok(access) => notifications_state(access),
+        Err(error) => CheckState::Failed(error.into()),
+    }
+}
+
+pub fn required_failures<'a>(
+    results: &'a [(&'static CheckSpec, CheckState)],
+) -> impl Iterator<Item = &'a (&'static CheckSpec, CheckState)> {
+    results.iter().filter(|(spec, state)| {
+        spec.section == Section::Required && !matches!(state, CheckState::Ok(_))
+    })
+}
+
 pub fn run_all(env: &ChildEnv) -> Vec<(&'static CheckSpec, CheckState)> {
     let mut results = Vec::with_capacity(CHECKS.len());
     for spec in CHECKS {
@@ -288,6 +363,79 @@ pub fn run_all(env: &ChildEnv) -> Vec<(&'static CheckSpec, CheckState)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notification_access_reports_each_status_and_action() {
+        let settings = |detail: &str| CheckState::Missing {
+            detail: detail.into(),
+            fix: Fix::OpenSettings(
+                "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.github.vikrrantshah.baby-sitter",
+            ),
+        };
+        let cases = [
+            (
+                NotificationAccess::Allowed {
+                    banners: true,
+                    notification_center: true,
+                },
+                CheckState::Ok("Banners and Notification Center".into()),
+            ),
+            (
+                NotificationAccess::Allowed {
+                    banners: false,
+                    notification_center: true,
+                },
+                settings("Allowed, but banners are off"),
+            ),
+            (
+                NotificationAccess::Allowed {
+                    banners: true,
+                    notification_center: false,
+                },
+                settings("Allowed, but hidden from Notification Center"),
+            ),
+            (
+                NotificationAccess::Allowed {
+                    banners: false,
+                    notification_center: false,
+                },
+                settings("Allowed, but banners and Notification Center are off"),
+            ),
+            (
+                NotificationAccess::Denied,
+                settings("Turned off in System Settings"),
+            ),
+            (
+                NotificationAccess::NotDetermined,
+                CheckState::Missing {
+                    detail: "Not requested yet".into(),
+                    fix: Fix::AllowNotifications,
+                },
+            ),
+            (
+                NotificationAccess::Unbundled,
+                CheckState::Failed("Available only in the bundled app".into()),
+            ),
+        ];
+        for (access, expected) in cases {
+            assert_eq!(notifications_state(access), expected);
+        }
+    }
+
+    #[test]
+    fn banner_failures_exclude_optional_and_permission_checks() {
+        let results = vec![
+            (&CHECKS[0], CheckState::Ok("ready".into())),
+            (&CHECKS[1], CheckState::Failed("required".into())),
+            (&CHECKS[5], CheckState::Failed("optional".into())),
+            (&CHECKS[8], CheckState::Failed("permission".into())),
+        ];
+        let labels: Vec<_> = required_failures(&results)
+            .map(|(spec, _)| spec.label)
+            .collect();
+        assert_eq!(labels, ["GitHub sign-in"]);
+        assert_eq!(required_failures(&results[2..]).count(), 0);
+    }
+
     #[test]
     fn parses_real_versions_and_authentication() {
         assert_eq!(

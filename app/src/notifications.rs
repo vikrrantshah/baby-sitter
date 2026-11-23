@@ -1,3 +1,14 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationAccess {
+    Unbundled,
+    NotDetermined,
+    Denied,
+    Allowed {
+        banners: bool,
+        notification_center: bool,
+    },
+}
+
 #[cfg(target_os = "macos")]
 use {
     block2::{DynBlock, RcBlock},
@@ -8,13 +19,15 @@ use {
     },
     objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString},
     objc2_user_notifications::{
-        UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
-        UNNotificationPresentationOptions, UNNotificationRequest, UNUserNotificationCenter,
+        UNAlertStyle, UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent,
+        UNNotification, UNNotificationPresentationOptions, UNNotificationRequest,
+        UNNotificationSetting, UNNotificationSettings, UNUserNotificationCenter,
         UNUserNotificationCenterDelegate,
     },
     std::{
-        sync::Once,
-        time::{SystemTime, UNIX_EPOCH},
+        ptr::NonNull,
+        sync::{Once, mpsc},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
 };
 
@@ -61,13 +74,71 @@ pub fn init() {
             let _ = Retained::into_raw(delegate);
         });
 
-        let completion = RcBlock::new(|_: Bool, _: *mut NSError| {});
-        UNUserNotificationCenter::currentNotificationCenter()
-            .requestAuthorizationWithOptions_completionHandler(
-                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
-                &completion,
-            );
+        request_authorization_with_completion(RcBlock::new(|_: Bool, _: *mut NSError| {}));
     });
+}
+
+#[cfg(target_os = "macos")]
+fn request_authorization_with_completion(completion: RcBlock<dyn Fn(Bool, *mut NSError)>) {
+    UNUserNotificationCenter::currentNotificationCenter()
+        .requestAuthorizationWithOptions_completionHandler(
+            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+            &completion,
+        );
+}
+
+#[cfg(target_os = "macos")]
+pub fn request_authorization() {
+    autoreleasepool(|_| {
+        if NSBundle::mainBundle().bundleIdentifier().is_none() {
+            return;
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        request_authorization_with_completion(RcBlock::new(move |_: Bool, _: *mut NSError| {
+            let _ = tx.send(());
+        }));
+        let _ = rx.recv();
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub fn access() -> Result<NotificationAccess, &'static str> {
+    autoreleasepool(|_| {
+        if NSBundle::mainBundle().bundleIdentifier().is_none() {
+            return Ok(NotificationAccess::Unbundled);
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        let completion = RcBlock::new(move |settings: NonNull<UNNotificationSettings>| {
+            // SAFETY: The framework supplies a non-null settings object valid for this callback.
+            let settings = unsafe { settings.as_ref() };
+            let access = match settings.authorizationStatus() {
+                UNAuthorizationStatus::NotDetermined => Ok(NotificationAccess::NotDetermined),
+                UNAuthorizationStatus::Denied => Ok(NotificationAccess::Denied),
+                UNAuthorizationStatus::Authorized
+                | UNAuthorizationStatus::Provisional
+                | UNAuthorizationStatus::Ephemeral => Ok(NotificationAccess::Allowed {
+                    banners: settings.alertStyle() != UNAlertStyle::None
+                        && settings.alertSetting() == UNNotificationSetting::Enabled,
+                    notification_center: settings.notificationCenterSetting()
+                        == UNNotificationSetting::Enabled,
+                }),
+                _ => Err("Unknown macOS notification authorization status"),
+            };
+            let _ = tx.send(access);
+        });
+        UNUserNotificationCenter::currentNotificationCenter()
+            .getNotificationSettingsWithCompletionHandler(&completion);
+        rx.recv_timeout(Duration::from_secs(5))
+            .unwrap_or(Err("macOS did not answer"))
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_authorization() {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn access() -> Result<NotificationAccess, &'static str> {
+    Ok(NotificationAccess::Unbundled)
 }
 
 #[cfg(target_os = "macos")]

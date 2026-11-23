@@ -4,7 +4,8 @@ use crate::{
         self, Config, Defaults, GateState, Outcome, PastSit, PrFilter, PrRef, PrRow, PrState,
         RepoListItem, RepoName, RepoScope, RepoSettings, SitState, VerdictKind,
     },
-    setup::{self, CheckSpec, CheckState},
+    notifications,
+    setup::{self, CheckSpec, CheckState, Fix, Section},
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
     store,
     theme::{accent, danger, divider, ink, muted, panel, raised, success, surface, warning},
@@ -2790,6 +2791,15 @@ impl AppView {
 
 impl AppView {
     fn load_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_setup_with_authorization(false, window, cx);
+    }
+
+    fn load_setup_with_authorization(
+        &mut self,
+        request_authorization: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(self.setup, Load::Loading) && self.setup_task.is_some() {
             return;
         }
@@ -2797,7 +2807,12 @@ impl AppView {
         let env = self.env.clone();
         self.setup_task = Some(cx.spawn_in(window, async move |view, cx| {
             let results = cx
-                .background_spawn(async move { setup::run_all(&env) })
+                .background_spawn(async move {
+                    if request_authorization {
+                        notifications::request_authorization();
+                    }
+                    setup::run_all(&env)
+                })
                 .await;
             let _ = view.update_in(cx, |this, _, cx| {
                 this.setup = Load::Ready(results);
@@ -2812,9 +2827,7 @@ impl AppView {
         let Load::Ready(results) = &self.setup else {
             return None;
         };
-        let mut failures = results
-            .iter()
-            .filter(|(spec, state)| spec.required && !matches!(state, CheckState::Ok(_)));
+        let mut failures = setup::required_failures(results);
         let (first, _) = failures.next()?;
         let more = failures.count();
         let text = if more == 0 {
@@ -2894,17 +2907,27 @@ impl AppView {
                 body = body.child(div().text_color(danger()).child(error.clone()));
             }
             Load::Ready(results) => {
-                for (required, title) in [(true, "Required"), (false, "Optional")] {
+                for (section, title) in [
+                    (Section::Required, "Required"),
+                    (Section::Optional, "Optional"),
+                    (Section::Permissions, "Permissions"),
+                ] {
                     body = body.child(div().pt(px(20.)).pb(px(8.)).font_semibold().child(title));
-                    for (spec, state) in
-                        results.iter().filter(|(spec, _)| spec.required == required)
+                    if section == Section::Permissions {
+                        body = body.child(
+                            div().text_size(px(13.)).text_color(muted()).child(
+                                "Baby Sitter needs no other macOS permissions. If macOS asks for Desktop, Documents, or Photos while a babysit runs, that request comes from Codex reading outside the checkout. Choose Don't Allow.",
+                            ),
+                        );
+                    }
+                    for (spec, state) in results.iter().filter(|(spec, _)| spec.section == section)
                     {
                         let (detail, fix, badge) = match state {
                             CheckState::Ok(detail) => (detail.as_str(), None, GateState::Met),
                             CheckState::Missing { detail, fix } => (
                                 detail.as_str(),
-                                Some(fix.as_str()),
-                                if required {
+                                Some(fix.clone()),
+                                if section == Section::Required {
                                     GateState::Blocked
                                 } else {
                                     GateState::Pending
@@ -2919,9 +2942,14 @@ impl AppView {
                                     "codex-auth" if detail == "Install Codex first" => {
                                         "brew install --cask codex"
                                     }
+                                    _ if section == Section::Permissions => "",
                                     _ => "Check again",
                                 };
-                                (detail.as_str(), Some(fix), GateState::Blocked)
+                                (
+                                    detail.as_str(),
+                                    (!fix.is_empty()).then(|| Fix::Copy(fix.into())),
+                                    GateState::Blocked,
+                                )
                             }
                         };
                         let mut row = div()
@@ -2947,10 +2975,9 @@ impl AppView {
                                             .child(detail.to_owned()),
                                     ),
                             );
-                        if let Some(fix) = fix {
-                            let value = fix.to_owned();
-                            row =
-                                row.child(
+                        match fix {
+                            Some(Fix::Copy(value)) => {
+                                row = row.child(
                                     div()
                                         .flex()
                                         .items_center()
@@ -2983,6 +3010,37 @@ impl AppView {
                                             })),
                                         ),
                                 );
+                            }
+                            Some(Fix::OpenSettings(url)) => {
+                                row = row.child(
+                                    Button::new(SharedString::from(format!(
+                                        "settings-{}",
+                                        spec.id
+                                    )))
+                                    .label("Open System Settings")
+                                    .outline()
+                                    .on_click(
+                                        move |_, _, _| {
+                                            std::thread::spawn(move || {
+                                                let _ = std::process::Command::new("open")
+                                                    .arg(url)
+                                                    .status();
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            Some(Fix::AllowNotifications) => {
+                                row = row.child(
+                                    Button::new("allow-notifications")
+                                        .label("Allow notifications")
+                                        .outline()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.load_setup_with_authorization(true, window, cx);
+                                        })),
+                                );
+                            }
+                            None => {}
                         }
                         body = body.child(row);
                     }

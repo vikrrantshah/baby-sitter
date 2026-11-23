@@ -159,3 +159,7 @@ After a merge, the app removes the worktree. After any other outcome, it keeps t
 | Codex CLI | yes | `codex --version` runs |
 | Codex sign-in | yes | `codex login status` exits 0 |
 | pnpm, npm, Yarn | no | The tool runs. Each one is needed only for repositories with its lockfile |
+
+The **Permissions** section reads Baby Sitter's notification settings from macOS. It is green when notifications are allowed with banners and Notification Center on. When macOS has not asked yet, **Allow notifications** shows the prompt. When notifications are off, or allowed but hidden from banners or Notification Center, **Open System Settings** opens Baby Sitter's notification settings. A permission problem does not raise the banner on the Pull requests page, because babysits run without notifications.
+
+Baby Sitter needs no other macOS permission. It writes only under `~/Library/Application Support/baby-sitter`. A prompt for Desktop, Documents, or Photos during a babysit comes from Codex reading outside the checkout. Choose **Don't Allow**.
