@@ -1555,7 +1555,7 @@ impl AppView {
             }
         }
     }
-    fn repo_row(&self, repo: &RepoName, cx: &mut Context<Self>) -> AnyElement {
+    fn repo_row(&self, repo: &RepoName, last: bool, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.config.repos.contains_key(repo);
         let count = self.active_count(repo);
         let switch_repo = repo.clone();
@@ -1585,8 +1585,7 @@ impl AppView {
             .h(px(REPO_ROW_HEIGHT))
             .w_full()
             .px(px(ROW_INSET))
-            .border_b_1()
-            .border_color(divider())
+            .when(!last, |row| row.border_b_1().border_color(divider()))
             .flex()
             .items_center()
             .gap(px(20.))
@@ -1713,48 +1712,56 @@ impl AppView {
                             count,
                             cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                                 range
-                                    .filter_map(|index| items.get(index))
-                                    .map(|item| match item {
-                                        RepoListItem::Org {
-                                            name,
-                                            watched,
-                                            total,
-                                        } => div()
-                                            .h(px(REPO_ROW_HEIGHT))
-                                            .w_full()
-                                            .px(px(ROW_INSET))
-                                            .bg(panel())
-                                            .border_b_1()
-                                            .border_color(divider())
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(20.))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(10.))
-                                                    .child(avatar(this.avatars.get(name), 20.))
-                                                    .child(
-                                                        div()
-                                                            .min_w_0()
-                                                            .font_semibold()
-                                                            .text_ellipsis()
-                                                            .text_color(ink())
-                                                            .child(name.clone()),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_shrink_0()
-                                                    .text_size(px(12.))
-                                                    .text_color(muted())
-                                                    .child(format!("{watched} of {total} watched")),
-                                            )
-                                            .into_any_element(),
-                                        RepoListItem::Repo(repo) => this.repo_row(repo, cx),
+                                    .filter_map(|index| items.get(index).map(|item| (index, item)))
+                                    .map(|(index, item)| {
+                                        let last = index + 1 == count;
+                                        match item {
+                                            RepoListItem::Org {
+                                                name,
+                                                watched,
+                                                total,
+                                            } => div()
+                                                .h(px(REPO_ROW_HEIGHT))
+                                                .w_full()
+                                                .px(px(ROW_INSET))
+                                                .bg(panel())
+                                                .when(!last, |row| {
+                                                    row.border_b_1().border_color(divider())
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(20.))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(10.))
+                                                        .child(avatar(this.avatars.get(name), 20.))
+                                                        .child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .font_semibold()
+                                                                .text_ellipsis()
+                                                                .text_color(ink())
+                                                                .child(name.clone()),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_size(px(12.))
+                                                        .text_color(muted())
+                                                        .child(format!(
+                                                            "{watched} of {total} watched"
+                                                        )),
+                                                )
+                                                .into_any_element(),
+                                            RepoListItem::Repo(repo) => {
+                                                this.repo_row(repo, last, cx)
+                                            }
+                                        }
                                     })
                                     .collect::<Vec<_>>()
                             }),
@@ -2172,7 +2179,7 @@ impl AppView {
         .filter(|row| !self.closed_prs.contains_key(&row.pr))
         .collect()
     }
-    fn pr_row(&self, row: &PrRow, cx: &mut Context<Self>) -> AnyElement {
+    fn pr_row(&self, row: &PrRow, last: bool, cx: &mut Context<Self>) -> AnyElement {
         let state = self.states.get(&row.pr);
         let reading = self.reading(&row.pr);
         let active = state.is_some_and(SitState::is_active);
@@ -2468,8 +2475,7 @@ impl AppView {
             .px(px(ROW_INSET))
             .flex_shrink_0()
             .py(px(18.))
-            .border_b_1()
-            .border_color(divider())
+            .when(!last, |item| item.border_b_1().border_color(divider()))
             .flex()
             .items_start()
             .gap(px(20.))
@@ -2612,7 +2618,11 @@ impl AppView {
                         .overflow_y_scroll()
                         .flex()
                         .flex_col()
-                        .children(rows.iter().map(|row| self.pr_row(row, cx))),
+                        .children(
+                            rows.iter()
+                                .enumerate()
+                                .map(|(index, row)| self.pr_row(row, index + 1 == rows.len(), cx)),
+                        ),
                 )
             }
         };
@@ -3007,8 +3017,13 @@ impl AppView {
                             ),
                         );
                     }
-                    for (spec, state) in results.iter().filter(|(spec, _)| spec.section == section)
-                    {
+                    let section_rows: Vec<_> = results
+                        .iter()
+                        .filter(|(spec, _)| spec.section == section)
+                        .collect();
+                    let count = section_rows.len();
+                    for (index, (spec, state)) in section_rows.into_iter().enumerate() {
+                        let last = index + 1 == count;
                         let (detail, fix, badge) = match state {
                             CheckState::Ok(detail) => (detail.as_str(), None, GateState::Met),
                             CheckState::Missing { detail, fix } => (
@@ -3041,8 +3056,7 @@ impl AppView {
                         };
                         let mut row = div()
                             .py(px(10.))
-                            .border_b_1()
-                            .border_color(divider())
+                            .when(!last, |row| row.border_b_1().border_color(divider()))
                             .flex()
                             .items_start()
                             .gap(px(10.))
