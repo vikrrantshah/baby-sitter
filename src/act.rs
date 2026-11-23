@@ -149,15 +149,13 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 }
             };
             if result.outcome == codex::CiFixOutcome::NeedsHuman && env.git.is_clean()? {
-                bail!("CI failed: {names}: {}", result.summary.trim());
+                bail!("CI needs a person: {names}: {}", result.summary.trim());
             }
             commit_ci_fix(env, &head, &result.summary)?;
             if result.outcome == codex::CiFixOutcome::NeedsHuman {
-                let sha = env.git.head()?;
-                bail!(
-                    "CI needs a person: {names}: {}\nPushed a partial fix {}.",
-                    result.summary.trim(),
-                    &sha.as_str()[..7]
+                eprintln!(
+                    "baby-sitter: pushed a partial CI fix for {names}: {}",
+                    result.summary.trim()
                 );
             }
             Ok(())

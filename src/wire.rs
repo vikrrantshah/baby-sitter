@@ -1,7 +1,10 @@
 use crate::domain::*;
 use anyhow::{Context, bail};
 use serde_json::Value;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$base:String!){
  viewer{login} repository(owner:$owner,name:$repo){
@@ -12,7 +15,7 @@ pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$
  mergeQueueEntry{state position}
  timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{__typename ... on RemovedFromMergeQueueEvent{reason beforeCommit{oid}}}}
  reviewRequests(first:100){pageInfo{hasNextPage} nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login} ... on Team{slug}}}}
- commits(last:1){nodes{commit{oid committedDate checkSuites(first:100){pageInfo{hasNextPage} nodes{status app{slug}}} statusCheckRollup{state contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name conclusion status databaseId detailsUrl checkSuite{app{slug} workflowRun{databaseId}}} ... on StatusContext{context state targetUrl}}}}}}}
+ commits(last:1){nodes{commit{oid committedDate checkSuites(first:100){pageInfo{hasNextPage} nodes{status app{slug}}} statusCheckRollup{state contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name conclusion status databaseId detailsUrl checkSuite{databaseId app{slug} workflowRun{databaseId workflow{name}}}} ... on StatusContext{context state targetUrl}}}}}}}
  recent: commits(last:20){nodes{commit{oid message}}}
  reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(last:100){pageInfo{hasPreviousPage} nodes{databaseId author{__typename login} body url}}}}
  reviews(last:100){pageInfo{hasPreviousPage} nodes{author{__typename login} state}}
@@ -40,6 +43,21 @@ fn nodes<'a>(v: &'a Value, name: &str, direction: &str) -> anyhow::Result<&'a Ve
     p["nodes"]
         .as_array()
         .with_context(|| format!("missing {name} nodes"))
+}
+#[derive(Eq, Hash, PartialEq)]
+enum CheckRunKey<'a> {
+    Workflow(&'a str),
+    Check(Option<&'a str>, &'a str),
+}
+fn check_run_key(c: &Value) -> anyhow::Result<CheckRunKey<'_>> {
+    let app = c["checkSuite"]["app"]["slug"].as_str();
+    if app == Some("github-actions")
+        && let Some(workflow) = c["checkSuite"]["workflowRun"]["workflow"]["name"].as_str()
+    {
+        Ok(CheckRunKey::Workflow(workflow))
+    } else {
+        Ok(CheckRunKey::Check(app, string(c, "name")?))
+    }
 }
 fn actor(v: &Value, viewer: &str) -> anyhow::Result<Actor> {
     if v.is_null() {
@@ -237,9 +255,28 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         let mut failing = Vec::new();
         let mut cancelled = Vec::new();
         let mut pending = Vec::new();
-        for c in nodes(rollup, "contexts", "hasNextPage")? {
+        let contexts = nodes(rollup, "contexts", "hasNextPage")?;
+        let mut newest = HashMap::new();
+        for c in contexts {
+            if c["__typename"] != "CheckRun" {
+                continue;
+            }
+            let Some(suite_id) = c["checkSuite"]["databaseId"].as_u64() else {
+                continue;
+            };
+            newest
+                .entry(check_run_key(c)?)
+                .and_modify(|previous: &mut u64| *previous = (*previous).max(suite_id))
+                .or_insert(suite_id);
+        }
+        for c in contexts {
             match string(c, "__typename")? {
                 "CheckRun" => {
+                    if let Some(suite_id) = c["checkSuite"]["databaseId"].as_u64()
+                        && newest[&check_run_key(c)?] != suite_id
+                    {
+                        continue;
+                    }
                     let name = string(c, "name")?.to_owned();
                     if string(c, "status")? != "COMPLETED" {
                         pending.push(name);
@@ -289,6 +326,15 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
                 x => bail!("unknown check context {x}"),
             }
         }
+        let state = if !failing.is_empty() || !cancelled.is_empty() {
+            RollupState::Failure
+        } else if !pending.is_empty() {
+            RollupState::Pending
+        } else if matches!(state, RollupState::Pending | RollupState::Expected) {
+            state
+        } else {
+            RollupState::Success
+        };
         Ci::Rollup {
             state,
             failing,
