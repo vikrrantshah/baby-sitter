@@ -149,7 +149,7 @@ Stopping a babysit sends `SIGTERM` to its process group and sends `SIGKILL` to w
 
 After a merge, the app removes the worktree. After any other outcome, it keeps the worktree until you dismiss the row. Dismiss moves the worktree into a trash folder at once and deletes it in the background, so a large `node_modules` never blocks a restart. The app clears leftover trash at launch.
 
-**Settings > Status** runs these checks at launch and when you select **Check again**, with the same `PATH` babysits use. Each command has a 10-second limit.
+**Settings > Status** runs these checks at launch, when you select **Check again**, and when the window comes back to the front while the page is open, with the same `PATH` babysits use. Each command has a 10-second limit. While the page is open, the notifications check also repeats every second, because macOS does not announce changes to notification settings. Turning notifications on or off in System Settings updates the row within a second.
 
 | Check | Required | Passes when |
 |---|---|---|

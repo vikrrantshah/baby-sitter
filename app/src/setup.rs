@@ -334,6 +334,12 @@ fn check_notifications(_: &ChildEnv) -> CheckState {
     }
 }
 
+/// The notifications check alone. It asks macOS in-process and starts no tools,
+/// so the Status page can repeat it often.
+pub fn recheck_notifications() -> CheckState {
+    check_notifications(&ChildEnv::new())
+}
+
 pub fn required_failures<'a>(
     results: &'a [(&'static CheckSpec, CheckState)],
 ) -> impl Iterator<Item = &'a (&'static CheckSpec, CheckState)> {

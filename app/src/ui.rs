@@ -268,6 +268,7 @@ pub struct AppView {
     _subscriptions: Vec<Subscription>,
     _events: Task<()>,
     _clock: Task<()>,
+    _permission_watch: Task<()>,
     pulse_epoch: Instant,
     repo_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
@@ -359,6 +360,14 @@ impl AppView {
                     cx.notify();
                 }
             }),
+            cx.observe_window_activation(window, |this: &mut Self, window, cx| {
+                if window.is_window_active()
+                    && this.page == Page::Settings(SettingsPage::Status)
+                    && !matches!(this.setup, Load::Loading)
+                {
+                    this.load_setup(window, cx);
+                }
+            }),
         ];
         let (event_tx, event_rx) = async_channel::unbounded::<SitEvent>();
         let events = cx.spawn_in(window, async move |view, cx| {
@@ -432,6 +441,40 @@ impl AppView {
                     .update_in(cx, |this, window, cx| {
                         this.dismiss_merged_history(window, cx);
                         cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        // macOS does not announce notification-setting changes, so the Status page polls them.
+        let permission_watch = cx.spawn_in(window, async move |view, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let Ok(watching) = view.update(cx, |this, _| {
+                    this.page == Page::Settings(SettingsPage::Status)
+                        && matches!(this.setup, Load::Ready(_))
+                }) else {
+                    break;
+                };
+                if !watching {
+                    continue;
+                }
+                let state = cx
+                    .background_spawn(async { setup::recheck_notifications() })
+                    .await;
+                if view
+                    .update(cx, |this, cx| {
+                        if let Load::Ready(results) = &mut this.setup
+                            && let Some((_, current)) = results
+                                .iter_mut()
+                                .find(|(spec, _)| spec.id == "notifications")
+                            && *current != state
+                        {
+                            *current = state;
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -514,6 +557,7 @@ impl AppView {
             },
             _events: events,
             _clock: clock,
+            _permission_watch: permission_watch,
             pulse_epoch: Instant::now(),
             repo_task: None,
             avatar_task: None,
