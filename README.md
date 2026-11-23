@@ -146,6 +146,14 @@ A PR that conflicts with its base branch gets the same treatment as failing CI: 
 
 The binary stops if the PR still conflicts after three resolve commits among its last 20 commits. A resolve commit that was made but not pushed is pushed on the next pass, like other baby-sitter commits.
 
+## Checking Codex's edits
+
+Before every Codex call (review threads, CI fixes, and merge conflicts), the binary installs the checkout's JavaScript dependencies so Codex can typecheck and test what it changes. It reads the lockfile at the checkout root: `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile --prefer-offline`, `package-lock.json` runs `npm ci`, and `yarn.lock` runs `yarn install --frozen-lockfile`. The binary runs the install itself, outside Codex's sandbox, and skips it when the lockfile is unchanged since the last install in that checkout. Codex keeps no network access and may not install packages.
+
+Codex is told to run the narrowest type checks, linters, and tests that cover the files it changed, and to fix what they report before it answers. When the install fails, Codex is told that checks are unavailable and must say so in its summary. Installs run the repository's install scripts with your permissions, as a local install does.
+
+The desktop app gives the binary, Codex, and the package managers the PATH from your login shell, so version-managed tools such as `nvm` work when the app is opened from Finder.
+
 ## Review threads and replies
 
 The binary handles unresolved review threads from people and bots. It replies only in those threads and never posts a top-level PR comment.
