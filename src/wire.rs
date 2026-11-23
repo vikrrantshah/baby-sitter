@@ -356,6 +356,357 @@ mod tests {
     fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
         super::parse_snapshot(json, std::time::UNIX_EPOCH)
     }
+
+    fn ci_from_contexts(state: &str, contexts: Value) -> Ci {
+        let mut v = fixture();
+        v["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = serde_json::json!({
+            "state": state,
+            "contexts": {"pageInfo": {"hasNextPage": false}, "nodes": contexts}
+        });
+        parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().ci
+    }
+
+    #[test]
+    fn newer_success_supersedes_failed_check_from_same_workflow() {
+        let ci = ci_from_contexts(
+            "FAILURE",
+            serde_json::json!([
+                {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED",
+                 "conclusion": "SUCCESS", "databaseId": 202,
+                 "checkSuite": {"databaseId": 200, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 2000, "workflow": {"name": "Pull Request CI"}}}},
+                {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED",
+                 "conclusion": "FAILURE", "databaseId": 101,
+                 "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 1000, "workflow": {"name": "Pull Request CI"}}}}
+            ]),
+        );
+        assert_eq!(
+            ci,
+            Ci::Rollup {
+                state: RollupState::Success,
+                failing: vec![],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn newest_failure_supersedes_older_runs_from_same_workflow() {
+        let ci = ci_from_contexts(
+            "FAILURE",
+            serde_json::json!([
+                {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED",
+                 "conclusion": "FAILURE", "databaseId": 51,
+                 "checkSuite": {"databaseId": 50, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 500, "workflow": {"name": "Pull Request CI"}}}},
+                {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED",
+                 "conclusion": "FAILURE", "databaseId": 201,
+                 "checkSuite": {"databaseId": 200, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 2000, "workflow": {"name": "Pull Request CI"}}}},
+                {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED",
+                 "conclusion": "SUCCESS", "databaseId": 101,
+                 "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 1000, "workflow": {"name": "Pull Request CI"}}}}
+            ]),
+        );
+        assert_eq!(
+            ci,
+            Ci::Rollup {
+                state: RollupState::Failure,
+                failing: vec![FailedCheck {
+                    name: "CI Gate".into(),
+                    source: CheckSource::Actions { job_id: 201 },
+                }],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn same_check_name_in_different_workflows_is_not_deduplicated() {
+        let ci = ci_from_contexts(
+            "FAILURE",
+            serde_json::json!([
+                {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                 "conclusion": "FAILURE", "databaseId": 101,
+                 "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 1000, "workflow": {"name": "A"}}}},
+                {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                 "conclusion": "SUCCESS", "databaseId": 201,
+                 "checkSuite": {"databaseId": 200, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 2000, "workflow": {"name": "B"}}}},
+                {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                 "conclusion": "FAILURE", "databaseId": 51,
+                 "checkSuite": {"databaseId": 50, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 500, "workflow": {"name": "B"}}}}
+            ]),
+        );
+        assert_eq!(
+            ci,
+            Ci::Rollup {
+                state: RollupState::Failure,
+                failing: vec![FailedCheck {
+                    name: "test".into(),
+                    source: CheckSource::Actions { job_id: 101 },
+                }],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn superseded_cancelled_and_pending_checks_do_not_block() {
+        let ci = ci_from_contexts(
+            "FAILURE",
+            serde_json::json!([
+                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED",
+                 "conclusion": "CANCELLED", "databaseId": 101,
+                 "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 1000, "workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "name": "tests", "status": "IN_PROGRESS",
+                 "conclusion": null, "databaseId": 102,
+                 "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 1000, "workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED",
+                 "conclusion": "SUCCESS", "databaseId": 201,
+                 "checkSuite": {"databaseId": 200, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 2000, "workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "name": "tests", "status": "COMPLETED",
+                 "conclusion": "SUCCESS", "databaseId": 202,
+                 "checkSuite": {"databaseId": 200, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 2000, "workflow": {"name": "CI"}}}}
+            ]),
+        );
+        assert_eq!(
+            ci,
+            Ci::Rollup {
+                state: RollupState::Success,
+                failing: vec![],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn newer_workflow_suite_supersedes_old_only_checks() {
+        let ci = ci_from_contexts(
+            "FAILURE",
+            serde_json::json!([
+                {"__typename": "CheckRun", "name": "preview (${{ matrix.stack.name }})",
+                 "status": "COMPLETED", "conclusion": "CANCELLED", "databaseId": 101,
+                 "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 1000, "workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "name": "old-only failure",
+                 "status": "COMPLETED", "conclusion": "FAILURE", "databaseId": 102,
+                 "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 1000, "workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "name": "preview (pms)",
+                 "status": "COMPLETED", "conclusion": "SUCCESS", "databaseId": 201,
+                 "checkSuite": {"databaseId": 200, "app": {"slug": "github-actions"},
+                                "workflowRun": {"databaseId": 2000, "workflow": {"name": "CI"}}}}
+            ]),
+        );
+        assert_eq!(
+            ci,
+            Ci::Rollup {
+                state: RollupState::Success,
+                failing: vec![],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn missing_or_pending_required_checks_keep_rollup_pending() {
+        for (github_state, expected) in [
+            ("PENDING", RollupState::Pending),
+            ("EXPECTED", RollupState::Expected),
+        ] {
+            assert_eq!(
+                ci_from_contexts(github_state, serde_json::json!([])),
+                Ci::Rollup {
+                    state: expected,
+                    failing: vec![],
+                    cancelled: vec![],
+                    pending: vec![],
+                }
+            );
+        }
+        assert_eq!(
+            ci_from_contexts(
+                "FAILURE",
+                serde_json::json!([
+                    {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED",
+                     "conclusion": "FAILURE", "databaseId": 101,
+                     "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                    "workflowRun": {"databaseId": 1000, "workflow": {"name": "CI"}}}},
+                    {"__typename": "CheckRun", "name": "CI Gate", "status": "IN_PROGRESS",
+                     "conclusion": null, "databaseId": 201,
+                     "checkSuite": {"databaseId": 200, "app": {"slug": "github-actions"},
+                                    "workflowRun": {"databaseId": 2000, "workflow": {"name": "CI"}}}}
+                ])
+            ),
+            Ci::Rollup {
+                state: RollupState::Pending,
+                failing: vec![],
+                cancelled: vec![],
+                pending: vec!["CI Gate".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn status_context_errors_are_not_discarded() {
+        assert_eq!(
+            ci_from_contexts(
+                "ERROR",
+                serde_json::json!([
+                    {"__typename": "StatusContext", "context": "security",
+                     "state": "ERROR", "targetUrl": "https://example.com/security"},
+                    {"__typename": "StatusContext", "context": "review", "state": "PENDING"}
+                ])
+            ),
+            Ci::Rollup {
+                state: RollupState::Failure,
+                failing: vec![FailedCheck {
+                    name: "security".into(),
+                    source: CheckSource::External {
+                        url: Some("https://example.com/security".into()),
+                    },
+                }],
+                cancelled: vec![],
+                pending: vec!["review".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn same_check_name_from_different_apps_and_statuses_stays_separate() {
+        assert_eq!(
+            ci_from_contexts(
+                "SUCCESS",
+                serde_json::json!([
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "SUCCESS", "databaseId": 201,
+                     "checkSuite": {"databaseId": 200, "app": {"slug": "github-actions"},
+                                    "workflowRun": {"databaseId": 2000, "workflow": {"name": "CI"}}}},
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "FAILURE", "databaseId": 101,
+                     "detailsUrl": "https://example.com/test",
+                     "checkSuite": {"databaseId": 100, "app": {"slug": "other"}, "workflowRun": null}},
+                    {"__typename": "StatusContext", "context": "test",
+                     "state": "FAILURE", "targetUrl": null},
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "SUCCESS", "databaseId": 51,
+                     "checkSuite": {"databaseId": 50, "app": {"slug": "other"}, "workflowRun": null}}
+                ])
+            ),
+            Ci::Rollup {
+                state: RollupState::Failure,
+                failing: vec![
+                    FailedCheck {
+                        name: "test".into(),
+                        source: CheckSource::External {
+                            url: Some("https://example.com/test".into()),
+                        },
+                    },
+                    FailedCheck {
+                        name: "test".into(),
+                        source: CheckSource::External { url: None },
+                    },
+                ],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn checks_with_same_name_in_latest_workflow_suite_all_count() {
+        assert_eq!(
+            ci_from_contexts(
+                "FAILURE",
+                serde_json::json!([
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "SUCCESS", "databaseId": 102,
+                     "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                    "workflowRun": {"databaseId": 1000, "workflow": {"name": "CI"}}}},
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "FAILURE", "databaseId": 101,
+                     "checkSuite": {"databaseId": 100, "app": {"slug": "github-actions"},
+                                    "workflowRun": {"databaseId": 1000, "workflow": {"name": "CI"}}}}
+                ])
+            ),
+            Ci::Rollup {
+                state: RollupState::Failure,
+                failing: vec![FailedCheck {
+                    name: "test".into(),
+                    source: CheckSource::Actions { job_id: 101 },
+                }],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn checks_without_suite_ids_remain_separate() {
+        assert_eq!(
+            ci_from_contexts(
+                "FAILURE",
+                serde_json::json!([
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "FAILURE", "databaseId": 101, "checkSuite": null},
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "SUCCESS", "databaseId": 201, "checkSuite": null}
+                ])
+            ),
+            Ci::Rollup {
+                state: RollupState::Failure,
+                failing: vec![FailedCheck {
+                    name: "test".into(),
+                    source: CheckSource::External { url: None },
+                }],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn external_checks_are_grouped_by_app_and_name() {
+        assert_eq!(
+            ci_from_contexts(
+                "FAILURE",
+                serde_json::json!([
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "FAILURE", "databaseId": 101,
+                     "checkSuite": {"databaseId": 100, "app": {"slug": "other"}, "workflowRun": null}},
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "SUCCESS", "databaseId": 201,
+                     "checkSuite": {"databaseId": 200, "app": {"slug": "other"}, "workflowRun": null}},
+                    {"__typename": "CheckRun", "name": "security", "status": "COMPLETED",
+                     "conclusion": "FAILURE", "databaseId": 102,
+                     "checkSuite": {"databaseId": 100, "app": {"slug": "other"}, "workflowRun": null}}
+                ])
+            ),
+            Ci::Rollup {
+                state: RollupState::Failure,
+                failing: vec![FailedCheck {
+                    name: "security".into(),
+                    source: CheckSource::External { url: None },
+                }],
+                cancelled: vec![],
+                pending: vec![],
+            }
+        );
+    }
     #[test]
     fn parses_head_age_from_validated_commit_date() {
         use std::time::{Duration, UNIX_EPOCH};
