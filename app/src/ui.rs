@@ -2019,8 +2019,8 @@ impl AppView {
                             .flex()
                             .items_center()
                             .gap(px(12.))
-                            .child(open)
                             .when_some(dismiss, |d, dismiss| d.child(dismiss))
+                            .child(open)
                             .child(menu),
                     )
                     .when_some(time_left, |d, left| {
