@@ -11,9 +11,10 @@ use crate::{
 use gpui_kit::{assets::IconName, component::StyledExt, prelude::FluentBuilder};
 use gpui_kit::{
     component::{
-        Disableable, Icon, Selectable, Sizable, Size,
+        Disableable, Icon, Selectable, Sizable, Size, WindowExt,
         button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
         input::{Input, InputEvent, InputState},
+        notification::Notification,
         select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
         switch::Switch,
         tooltip::Tooltip,
@@ -1426,6 +1427,8 @@ impl AppView {
                 )
             });
         let place = format!("{} #{}", row.pr.repo, row.pr.number);
+        let copy_url = row.url.clone();
+        let copy_message = format!("Copied link to {place}");
         let gates = self.gates.get(&row.pr);
         let status = reading.verb.map(|verb| {
             div()
@@ -1502,7 +1505,21 @@ impl AppView {
             .flex_col()
             .gap(px(4.))
             .child(title)
-            .child(div().text_size(px(13.)).text_color(muted()).child(place))
+            .child(
+                div()
+                    .id(SharedString::from(format!("copy-link-{}", row.pr)))
+                    .self_start()
+                    .text_size(px(13.))
+                    .text_color(muted())
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(ink()).underline())
+                    .tooltip(|window, cx| Tooltip::new("Copy link").build(window, cx))
+                    .on_click(move |_, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                        window.push_notification(Notification::success(copy_message.clone()), cx);
+                    })
+                    .child(place),
+            )
             .when_some(meta, |d, meta| d.child(meta));
         div()
             .px(px(ROW_INSET))
