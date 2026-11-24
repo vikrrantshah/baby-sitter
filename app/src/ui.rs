@@ -1293,7 +1293,6 @@ impl AppView {
             &self.config.history,
             &self.states,
             &self.config.repos,
-            WatchFilter::All,
             None,
         )
         .into_iter()
@@ -2244,7 +2243,6 @@ impl AppView {
             &self.config.history,
             &self.states,
             &self.config.repos,
-            WatchFilter::All,
             self.selected_filter.as_ref(),
         )
         .into_iter()
@@ -2675,16 +2673,18 @@ impl AppView {
         let mut rows = self.dashboard_rows();
         let query = self.search.read(cx).value().to_string();
         rows.retain(|row| model::matches_search(row, &query));
-        let watch_counts = model::watch_counts(&rows, &self.states, self.state_filter);
-        let state_counts = model::state_counts(&rows, &self.states, self.watch_filter);
-        rows.retain(|row| {
-            let sit = self.states.get(&row.pr);
-            self.watch_filter.admits(sit) && self.state_filter.admits(row, sit)
-        });
         let parents = match &self.prs {
             Load::Ready(prs) => model::stack_parents(prs),
             _ => BTreeMap::new(),
         };
+        let watched = model::watched_prs(&rows, &self.states, &parents);
+        let watch_counts = model::watch_counts(&rows, &self.states, &watched, self.state_filter);
+        let state_counts = model::state_counts(&rows, &self.states, &watched, self.watch_filter);
+        rows.retain(|row| {
+            let sit = self.states.get(&row.pr);
+            self.watch_filter.admits(watched.contains(&row.pr))
+                && self.state_filter.admits(row, sit)
+        });
         let rows = model::order_stacks(rows, &parents);
         let list = match &self.prs {
             Load::Loading if rows.is_empty() => message("Loading pull requests…", None),

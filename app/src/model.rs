@@ -326,10 +326,7 @@ pub enum WatchFilter {
 impl WatchFilter {
     pub const ALL: [Self; 3] = [Self::All, Self::Watched, Self::Unwatched];
 
-    pub fn admits(self, sit: Option<&SitState>) -> bool {
-        let watched = sit.is_some_and(|sit| {
-            sit.is_active() || matches!(sit, SitState::Finished(Outcome::Merged))
-        });
+    pub fn admits(self, watched: bool) -> bool {
         match self {
             Self::All => true,
             Self::Watched => watched,
@@ -597,6 +594,23 @@ pub fn stack_tree(pr: &PrRef, parents: &BTreeMap<PrRef, PrRef>) -> Vec<PrRef> {
     tree
 }
 
+pub fn watched_prs(
+    rows: &[Cow<'_, PrRow>],
+    sits: &BTreeMap<PrRef, SitState>,
+    parents: &BTreeMap<PrRef, PrRef>,
+) -> BTreeSet<PrRef> {
+    rows.iter()
+        .filter(|row| {
+            stack_tree(&row.pr, parents).iter().any(|pr| {
+                sits.get(pr).is_some_and(|sit| {
+                    sit.is_active() || matches!(sit, SitState::Finished(Outcome::Merged))
+                })
+            })
+        })
+        .map(|row| row.pr.clone())
+        .collect()
+}
+
 pub fn stack_mode_of(
     pr: &PrRef,
     parents: &BTreeMap<PrRef, PrRef>,
@@ -676,19 +690,9 @@ pub fn dashboard_rows<'a>(
     history: &'a BTreeMap<PrRef, PastSit>,
     sits: &'a BTreeMap<PrRef, SitState>,
     watched: &BTreeMap<RepoName, RepoSettings>,
-    filter: WatchFilter,
     repo: Option<&RepoName>,
 ) -> Vec<Cow<'a, PrRow>> {
-    let matches_filter = |pr: &PrRef| {
-        let history_merged = SitState::Finished(Outcome::Merged);
-        let sit = sits.get(pr).or_else(|| {
-            history
-                .get(pr)
-                .filter(|past| past.outcome == Outcome::Merged)
-                .map(|_| &history_merged)
-        });
-        filter.admits(sit) && repo.is_none_or(|repo| &pr.repo == repo)
-    };
+    let matches_filter = |pr: &PrRef| repo.is_none_or(|repo| &pr.repo == repo);
     let mut existing = BTreeSet::new();
     let mut rows: Vec<_> = prs
         .iter()
@@ -750,6 +754,7 @@ pub fn matches_search(row: &PrRow, query: &str) -> bool {
 pub fn watch_counts(
     rows: &[Cow<'_, PrRow>],
     sits: &BTreeMap<PrRef, SitState>,
+    watched: &BTreeSet<PrRef>,
     state_filter: StateFilter,
 ) -> [(WatchFilter, usize); 3] {
     WatchFilter::ALL.map(|filter| {
@@ -757,7 +762,7 @@ pub fn watch_counts(
             .iter()
             .filter(|row| {
                 let sit = sits.get(&row.pr);
-                state_filter.admits(row, sit) && filter.admits(sit)
+                state_filter.admits(row, sit) && filter.admits(watched.contains(&row.pr))
             })
             .count();
         (filter, count)
@@ -767,6 +772,7 @@ pub fn watch_counts(
 pub fn state_counts(
     rows: &[Cow<'_, PrRow>],
     sits: &BTreeMap<PrRef, SitState>,
+    watched: &BTreeSet<PrRef>,
     watch_filter: WatchFilter,
 ) -> [(StateFilter, usize); 4] {
     StateFilter::ALL.map(|filter| {
@@ -774,7 +780,7 @@ pub fn state_counts(
             .iter()
             .filter(|row| {
                 let sit = sits.get(&row.pr);
-                watch_filter.admits(sit) && filter.admits(row, sit)
+                watch_filter.admits(watched.contains(&row.pr)) && filter.admits(row, sit)
             })
             .count();
         (filter, count)
@@ -1098,6 +1104,39 @@ mod tests {
             row
         })
         .collect()
+    }
+
+    #[test]
+    fn watched_filter_includes_the_entire_stack() {
+        let prs = stack_rows();
+        let parents = stack_parents(&prs);
+        let sits = BTreeMap::from([(prs[1].pr.clone(), SitState::Preparing)]);
+        let rows: Vec<_> = prs.iter().map(Cow::Borrowed).collect();
+        let watched = watched_prs(&rows, &sits, &parents);
+        let admitted = |filter: WatchFilter| {
+            rows.iter()
+                .filter(|row| filter.admits(watched.contains(&row.pr)))
+                .map(|row| row.pr.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            admitted(WatchFilter::Watched),
+            prs[..4].iter().map(|row| row.pr.clone()).collect()
+        );
+        assert_eq!(
+            admitted(WatchFilter::Unwatched),
+            prs[4..].iter().map(|row| row.pr.clone()).collect()
+        );
+        let counts = watch_counts(&rows, &sits, &watched, StateFilter::All);
+        assert_eq!(
+            counts,
+            [
+                (WatchFilter::All, 6),
+                (WatchFilter::Watched, 4),
+                (WatchFilter::Unwatched, 2)
+            ]
+        );
+        assert_eq!(counts[0].1, counts[1].1 + counts[2].1);
     }
 
     #[test]
@@ -1461,16 +1500,10 @@ mod tests {
         ]);
         let repo = "owner/one".parse().unwrap();
         let history = BTreeMap::new();
-        let rows = dashboard_rows(
-            &prs,
-            &history,
-            &sits,
-            &watched,
-            WatchFilter::All,
-            Some(&repo),
-        );
+        let rows = dashboard_rows(&prs, &history, &sits, &watched, Some(&repo));
+        let watched_prs = watched_prs(&rows, &sits, &stack_parents(&prs));
         assert_eq!(
-            watch_counts(&rows, &sits, StateFilter::Drafts),
+            watch_counts(&rows, &sits, &watched_prs, StateFilter::Drafts),
             [
                 (WatchFilter::All, 2),
                 (WatchFilter::Watched, 1),
@@ -1478,7 +1511,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            state_counts(&rows, &sits, WatchFilter::Watched),
+            state_counts(&rows, &sits, &watched_prs, WatchFilter::Watched),
             [
                 (StateFilter::All, 2),
                 (StateFilter::Open, 1),
@@ -1552,41 +1585,32 @@ mod tests {
             ("owner/two#12".parse().unwrap(), SitState::Cancelling),
         ]);
         let watched = BTreeMap::from([("owner/one".parse().unwrap(), RepoSettings::default())]);
+        let rows = dashboard_rows(&prs, &history, &sits, &watched, None);
+        let watched_prs = watched_prs(&rows, &sits, &stack_parents(&prs));
         for (filter, expected) in [
             (WatchFilter::All, vec![1, 3, 7, 8, 9, 10, 11, 12]),
             (WatchFilter::Watched, vec![3, 7, 8, 11, 12]),
             (WatchFilter::Unwatched, vec![1, 9, 10]),
         ] {
-            let mut numbers: Vec<_> = dashboard_rows(&prs, &history, &sits, &watched, filter, None)
+            let mut numbers: Vec<_> = rows
                 .iter()
+                .filter(|row| filter.admits(watched_prs.contains(&row.pr)))
                 .map(|row| row.pr.number)
                 .collect();
             numbers.sort_unstable();
             assert_eq!(numbers, expected, "{filter:?}");
         }
         let repo = "owner/one".parse().unwrap();
-        let rows = dashboard_rows(
-            &prs,
-            &history,
-            &sits,
-            &watched,
-            WatchFilter::All,
-            Some(&repo),
-        );
+        let rows = dashboard_rows(&prs, &history, &sits, &watched, Some(&repo));
         assert_eq!(
             rows.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
             [3, 1, 7, 11]
         );
-        let rows = dashboard_rows(
-            &prs,
-            &history,
-            &sits,
-            &watched,
-            WatchFilter::Watched,
-            Some(&repo),
-        );
         assert_eq!(
-            rows.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
+            rows.iter()
+                .filter(|row| WatchFilter::Watched.admits(watched_prs.contains(&row.pr)))
+                .map(|row| row.pr.number)
+                .collect::<Vec<_>>(),
             [3, 7, 11]
         );
         assert_eq!(WatchFilter::default(), WatchFilter::All);
@@ -1595,11 +1619,23 @@ mod tests {
     #[test]
     fn filters_classify_sits_and_pr_states() {
         let merged = SitState::Finished(Outcome::Merged);
-        let stopped = SitState::Finished(Outcome::Stopped("closed".into()));
-        assert!(WatchFilter::Watched.admits(Some(&merged)));
-        assert!(WatchFilter::Unwatched.admits(Some(&stopped)));
-        assert!(WatchFilter::Unwatched.admits(None));
-        assert!(WatchFilter::Watched.admits(Some(&SitState::Preparing)));
+        let rows: Vec<Cow<'_, PrRow>> = (1..=4)
+            .map(|n| Cow::Owned(row(&format!("owner/one#{n}"), "2026-01-01")))
+            .collect();
+        let sits = BTreeMap::from([
+            (rows[0].pr.clone(), merged.clone()),
+            (rows[1].pr.clone(), SitState::Preparing),
+            (
+                rows[2].pr.clone(),
+                SitState::Finished(Outcome::Stopped("closed".into())),
+            ),
+        ]);
+        let watched = watched_prs(&rows, &sits, &BTreeMap::new());
+        assert_eq!(
+            watched,
+            BTreeSet::from([rows[0].pr.clone(), rows[1].pr.clone()]),
+            "merged and running babysits are watched; stopped and never-started are not"
+        );
 
         let mut pr = row("owner/one#1", "2026-01-01");
         for state in [
@@ -1641,7 +1677,9 @@ mod tests {
             },
         )]);
         let mut sits = BTreeMap::from([(pr.clone(), SitState::Finished(Outcome::Merged))]);
-        let rows = dashboard_rows(&[], &history, &sits, &watched, WatchFilter::Watched, None);
+        let mut rows = dashboard_rows(&[], &history, &sits, &watched, None);
+        let watched_set = watched_prs(&rows, &sits, &BTreeMap::new());
+        rows.retain(|row| WatchFilter::Watched.admits(watched_set.contains(&row.pr)));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pr, pr);
         assert_eq!(rows[0].title, "The original title");
@@ -1649,21 +1687,18 @@ mod tests {
 
         history.remove(&pr);
         sits.remove(&pr);
-        assert!(dashboard_rows(&[], &history, &sits, &watched, WatchFilter::All, None).is_empty());
+        assert!(dashboard_rows(&[], &history, &sits, &watched, None).is_empty());
         let open = [row("owner/one#7", "2026-01-01")];
-        let rows = dashboard_rows(
-            &open,
-            &history,
-            &sits,
-            &watched,
-            WatchFilter::Unwatched,
-            None,
-        );
+        let mut rows = dashboard_rows(&open, &history, &sits, &watched, None);
+        let watched_set = watched_prs(&rows, &sits, &BTreeMap::new());
+        rows.retain(|row| WatchFilter::Unwatched.admits(watched_set.contains(&row.pr)));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "PR 7");
 
         sits.insert(pr.clone(), SitState::Preparing);
-        let rows = dashboard_rows(&[], &history, &sits, &watched, WatchFilter::Watched, None);
+        let mut rows = dashboard_rows(&[], &history, &sits, &watched, None);
+        let watched_set = watched_prs(&rows, &sits, &BTreeMap::new());
+        rows.retain(|row| WatchFilter::Watched.admits(watched_set.contains(&row.pr)));
         assert_eq!(rows[0].title, "Pull request #7");
     }
 
@@ -1680,14 +1715,7 @@ mod tests {
             },
         )]);
         let sits = BTreeMap::from([(pr, SitState::Finished(Outcome::Cancelled))]);
-        let rows = dashboard_rows(
-            &prs,
-            &history,
-            &sits,
-            &BTreeMap::new(),
-            WatchFilter::All,
-            None,
-        );
+        let rows = dashboard_rows(&prs, &history, &sits, &BTreeMap::new(), None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "PR 1");
     }
