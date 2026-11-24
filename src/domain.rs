@@ -77,6 +77,13 @@ pub enum ParentState {
     Merged,
     Closed,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum StackMode {
+    #[default]
+    BottomUp,
+    TopDown,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Parent {
     pub number: u64,
@@ -208,6 +215,7 @@ pub struct Snapshot {
     pub head: Head,
     pub base: String,
     pub parent: Option<Parent>,
+    pub children: Vec<u64>,
     pub head_age: Option<Duration>,
     pub mergeable: Mergeable,
     pub merge_state: MergeState,

@@ -37,6 +37,48 @@ pub struct Facts<'a> {
     pub snap: &'a Snapshot,
     pub local: Option<&'a LocalState>,
     pub method: MergeMethod,
+    pub stack: StackMode,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StackGate<'a> {
+    Clear,
+    Retarget { to: &'a str },
+    BelowClosed { number: u64 },
+    BelowOpen { number: u64 },
+    AboveOpen { numbers: &'a [u64] },
+}
+
+impl StackGate<'_> {
+    fn holds(&self) -> bool {
+        matches!(self, Self::BelowOpen { .. } | Self::AboveOpen { .. })
+    }
+}
+
+fn stack_gate<'a>(f: &Facts<'a>) -> StackGate<'a> {
+    if let Some(parent) = &f.snap.parent {
+        match parent.state {
+            ParentState::Merged => return StackGate::Retarget { to: &parent.base },
+            ParentState::Closed => {
+                return StackGate::BelowClosed {
+                    number: parent.number,
+                };
+            }
+            ParentState::Open if f.stack == StackMode::BottomUp => {
+                return StackGate::BelowOpen {
+                    number: parent.number,
+                };
+            }
+            ParentState::Open => {}
+        }
+    }
+    if f.stack == StackMode::TopDown && !f.snap.children.is_empty() {
+        StackGate::AboveOpen {
+            numbers: &f.snap.children,
+        }
+    } else {
+        StackGate::Clear
+    }
 }
 #[derive(Debug, PartialEq)]
 pub struct Decision {
@@ -275,6 +317,11 @@ const RULES: &[Rule] = &[
         eval: stacked,
     },
     Rule {
+        name: "stack-above",
+        stage: Stage::Phase(Gate::Merge),
+        eval: stack_above,
+    },
+    Rule {
         name: "in-queue",
         stage: Stage::Phase(Gate::Merge),
         eval: in_queue,
@@ -397,6 +444,7 @@ pub fn gates(f: &Facts<'_>) -> Gates {
         }
     }
 
+    let held = stack_gate(f).holds();
     for phase in Gate::ORDER {
         let state = if phase == Gate::Merge && draft {
             GateState::Skipped
@@ -405,13 +453,8 @@ pub fn gates(f: &Facts<'_>) -> Gates {
             for rule in RULES.iter().filter(|r| r.stage == Stage::Phase(phase)) {
                 if let Some(verdict) = (rule.eval)(f) {
                     let retarget = matches!(&verdict, Verdict::Act(Action::RetargetBase { .. }));
-                    let stack_wait = phase == Gate::Merge
-                        && f.snap
-                            .parent
-                            .as_ref()
-                            .is_some_and(|p| p.state == ParentState::Open);
                     state = state.max(GateState::from_verdict(verdict));
-                    if state == GateState::Blocked || retarget || stack_wait {
+                    if state == GateState::Blocked || retarget || (phase == Gate::Merge && held) {
                         break;
                     }
                 }
@@ -497,12 +540,10 @@ fn draft(f: &Facts<'_>) -> Option<Verdict> {
     })
 }
 fn stack_retarget(f: &Facts<'_>) -> Option<Verdict> {
-    let parent = f.snap.parent.as_ref()?;
-    (parent.state == ParentState::Merged).then(|| {
-        Verdict::Act(Action::RetargetBase {
-            to: parent.base.clone(),
-        })
-    })
+    match stack_gate(f) {
+        StackGate::Retarget { to } => Some(Verdict::Act(Action::RetargetBase { to: to.into() })),
+        _ => None,
+    }
 }
 fn mergeability_unknown(f: &Facts<'_>) -> Option<Verdict> {
     (f.snap.mergeable == Mergeable::Unknown)
@@ -564,17 +605,23 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn stacked(f: &Facts<'_>) -> Option<Verdict> {
-    let parent = f.snap.parent.as_ref()?;
-    match parent.state {
-        ParentState::Open => Some(Verdict::Wait(format!(
-            "Waiting for #{} below to merge",
-            parent.number
+    match stack_gate(f) {
+        StackGate::BelowOpen { number } => Some(Verdict::Wait(format!(
+            "Waiting for #{number} below to merge"
         ))),
-        ParentState::Closed => Some(Verdict::Stop(format!(
-            "The PR below, #{}, was closed without merging",
-            parent.number
+        StackGate::BelowClosed { number } => Some(Verdict::Stop(format!(
+            "The PR below, #{number}, was closed without merging"
         ))),
-        ParentState::Merged => None,
+        _ => None,
+    }
+}
+fn stack_above(f: &Facts<'_>) -> Option<Verdict> {
+    match stack_gate(f) {
+        StackGate::AboveOpen { numbers } => Some(Verdict::Wait(format!(
+            "Waiting for {} above to merge",
+            names(numbers.iter().map(|number| format!("#{number}")))
+        ))),
+        _ => None,
     }
 }
 fn in_queue(f: &Facts<'_>) -> Option<Verdict> {
@@ -1018,6 +1065,7 @@ mod tests {
     struct World {
         snap: Snapshot,
         local: LocalState,
+        stack: StackMode,
     }
     impl World {
         fn new() -> Self {
@@ -1036,6 +1084,7 @@ mod tests {
                     },
                     base: "main".into(),
                     parent: None,
+                    children: vec![],
                     head_age: None,
                     mergeable: Mergeable::Yes,
                     merge_state: MergeState::Clean,
@@ -1054,6 +1103,7 @@ mod tests {
                     dirty: vec![],
                     relation: Relation::Equal,
                 },
+                stack: StackMode::BottomUp,
             }
         }
         fn decision(&self) -> Decision {
@@ -1061,6 +1111,7 @@ mod tests {
                 snap: &self.snap,
                 local: Some(&self.local),
                 method: MergeMethod::Squash,
+                stack: self.stack,
             })
         }
         fn gates(&self) -> Gates {
@@ -1068,8 +1119,137 @@ mod tests {
                 snap: &self.snap,
                 local: Some(&self.local),
                 method: MergeMethod::Squash,
+                stack: self.stack,
             })
         }
+    }
+
+    #[test]
+    fn stack_decisions_and_gates_follow_mode_and_parent_precedence() {
+        for mode in [StackMode::BottomUp, StackMode::TopDown] {
+            for (parent, children, rule, verdict, branch, merge) in [
+                (
+                    None,
+                    false,
+                    "merge",
+                    "merge",
+                    GateState::Met,
+                    GateState::Waiting,
+                ),
+                (
+                    None,
+                    true,
+                    if mode == StackMode::TopDown {
+                        "stack-above"
+                    } else {
+                        "merge"
+                    },
+                    if mode == StackMode::TopDown {
+                        "wait: Waiting for #12 and #14 above to merge"
+                    } else {
+                        "merge"
+                    },
+                    GateState::Met,
+                    GateState::Waiting,
+                ),
+                (
+                    Some(ParentState::Open),
+                    false,
+                    if mode == StackMode::BottomUp {
+                        "stacked"
+                    } else {
+                        "merge"
+                    },
+                    if mode == StackMode::BottomUp {
+                        "wait: Waiting for #10 below to merge"
+                    } else {
+                        "merge"
+                    },
+                    GateState::Met,
+                    GateState::Waiting,
+                ),
+                (
+                    Some(ParentState::Open),
+                    true,
+                    if mode == StackMode::BottomUp {
+                        "stacked"
+                    } else {
+                        "stack-above"
+                    },
+                    if mode == StackMode::BottomUp {
+                        "wait: Waiting for #10 below to merge"
+                    } else {
+                        "wait: Waiting for #12 and #14 above to merge"
+                    },
+                    GateState::Met,
+                    GateState::Waiting,
+                ),
+                (
+                    Some(ParentState::Closed),
+                    true,
+                    "stacked",
+                    "stop: The PR below, #10, was closed without merging",
+                    GateState::Met,
+                    GateState::Blocked,
+                ),
+                (
+                    Some(ParentState::Merged),
+                    true,
+                    "stack-retarget",
+                    "Retargeting the base to main",
+                    GateState::Waiting,
+                    GateState::Pending,
+                ),
+            ] {
+                let mut w = World::new();
+                w.stack = mode;
+                w.snap.parent = parent.map(|state| Parent {
+                    number: 10,
+                    state,
+                    base: "main".into(),
+                });
+                if children {
+                    w.snap.children = vec![12, 14];
+                }
+                let decision = w.decision();
+                assert_eq!(decision.rule, rule, "{mode:?} {parent:?}");
+                if verdict == "merge" {
+                    assert!(matches!(
+                        decision.verdict,
+                        Verdict::Act(Action::Merge { .. })
+                    ));
+                } else {
+                    assert_eq!(decision.verdict.to_string(), verdict);
+                }
+                let gates = w.gates();
+                assert_eq!(gates.get(Gate::Branch), branch);
+                assert_eq!(gates.get(Gate::Merge), merge);
+            }
+        }
+    }
+
+    #[test]
+    fn top_down_children_hold_before_reviews_and_queue_removal() {
+        let mut w = World::new();
+        w.stack = StackMode::TopDown;
+        w.snap.children = vec![12];
+        w.snap.review_decision = Some(ReviewDecision::ReviewRequired);
+        w.snap.queue = QueueStatus::Removed {
+            reason: "checks failed".into(),
+            before_commit: Some(w.snap.head.sha.clone()),
+            removed_ago: None,
+        };
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "stack-above",
+                verdict: Verdict::Wait("Waiting for #12 above to merge".into()),
+            }
+        );
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=met branch=met merge=waiting"
+        );
     }
     #[test]
     fn open_parent_prevents_both_direct_merge_and_enqueue() {
@@ -1102,6 +1282,7 @@ mod tests {
                 snap: &w.snap,
                 local: Some(&w.local),
                 method: MergeMethod::Squash,
+                stack: w.stack,
             };
             let explanation = explain(&facts);
             let stacked = explanation
@@ -1235,6 +1416,7 @@ mod tests {
             snap: &w.snap,
             local: Some(&w.local),
             method: MergeMethod::Squash,
+            stack: w.stack,
         };
         assert_eq!(
             gates(&facts).to_string(),
@@ -1316,6 +1498,7 @@ mod tests {
             snap: &w.snap,
             local: None,
             method: MergeMethod::Squash,
+            stack: w.stack,
         };
         assert_eq!(decide(&facts).verdict, Verdict::Done);
         assert!(local_upstream(&facts).is_none());
@@ -1437,6 +1620,7 @@ mod tests {
                 snap: &w.snap,
                 local: Some(&w.local),
                 method: MergeMethod::Squash,
+                stack: w.stack,
             };
             assert_eq!(gates(&facts).get(Gate::Branch), GateState::Waiting);
             w.local.dirty.push(" M local-file".into());
@@ -1568,6 +1752,7 @@ mod tests {
             snap: &w.snap,
             local: Some(&w.local),
             method: MergeMethod::Squash,
+            stack: w.stack,
         };
         assert_eq!(
             gates(&facts).to_string(),

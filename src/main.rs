@@ -9,7 +9,7 @@ mod wire;
 
 use crate::{
     decide::{Facts, Verdict},
-    domain::{Lifecycle, LocalState, MergeMethod, Snapshot},
+    domain::{Lifecycle, LocalState, MergeMethod, Snapshot, StackMode},
 };
 use clap::Parser;
 use std::{
@@ -29,6 +29,9 @@ struct Cli {
     /// Method to use when merging.
     #[arg(long, value_enum, default_value_t = MergeMethod::Squash)]
     merge_method: MergeMethod,
+    /// Order in which stacked PRs merge.
+    #[arg(long, value_enum, default_value_t = StackMode::BottomUp)]
+    stack: StackMode,
     /// Whole-run deadline, for example 90s, 10m, or 2h.
     #[arg(long, default_value = "2h", value_parser = parse_duration)]
     timeout: Duration,
@@ -59,11 +62,12 @@ impl Observation {
         };
         Ok(Self { snap, local })
     }
-    fn facts(&self, method: MergeMethod) -> Facts<'_> {
+    fn facts(&self, method: MergeMethod, stack: StackMode) -> Facts<'_> {
         Facts {
             snap: &self.snap,
             local: self.local.as_ref(),
             method,
+            stack,
         }
     }
 }
@@ -153,7 +157,7 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
                 }
             }
         };
-        let facts = observation.facts(cli.merge_method);
+        let facts = observation.facts(cli.merge_method, cli.stack);
         let decision = decide::decide(&facts);
         if cli.dry_run {
             print!("{}", decide::explain(&facts));
@@ -212,6 +216,25 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_option_defaults_to_bottom_up_and_accepts_top_down() {
+        assert_eq!(
+            Cli::try_parse_from(["baby-sitter"]).unwrap().stack,
+            StackMode::BottomUp
+        );
+        assert_eq!(
+            Cli::try_parse_from(["baby-sitter", "--stack", "top-down"])
+                .unwrap()
+                .stack,
+            StackMode::TopDown
+        );
+        assert!(Cli::try_parse_from(["baby-sitter", "--stack", "sideways"]).is_err());
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--stack <STACK>"));
+        assert!(help.contains("bottom-up") && help.contains("top-down"));
+    }
 
     #[test]
     fn cli_parses_prompt_options() {

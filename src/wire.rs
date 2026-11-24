@@ -6,14 +6,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$base:String!){
+pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$base:String!,$head:String!){
  viewer{login} repository(owner:$owner,name:$repo){
  nameWithOwner defaultBranchRef{name}
  mergeQueue(branch:$base){configuration{mergeMethod}}
  openParents:pullRequests(headRefName:$base,states:[OPEN],first:20,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage} nodes{number state baseRefName headRepository{nameWithOwner}}}
  pastParents:pullRequests(headRefName:$base,states:[MERGED,CLOSED],first:20,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage} nodes{number state baseRefName headRepository{nameWithOwner}}}
+ children:pullRequests(baseRefName:$head,states:[OPEN],first:20){nodes{number}}
  pullRequest(number:$n){
- number id state isDraft headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision author{__typename login}
+ number id state isDraft isCrossRepository headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision author{__typename login}
  headRef{compare(headRef:$base){aheadBy}}
  mergeQueueEntry{state position}
  timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{__typename ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}
@@ -148,6 +149,21 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         bail!("PR not found");
     }
     let base = string(p, "baseRefName")?;
+    let child_nodes = repository["children"]["nodes"]
+        .as_array()
+        .context("missing children nodes")?;
+    let cross_repository = boolean(p, "isCrossRepository")?;
+    let mut children = Vec::new();
+    if !cross_repository {
+        let own_number = number(p, "number")?;
+        for node in child_nodes {
+            let child = number(node, "number")?;
+            if child != own_number {
+                children.push(child);
+            }
+        }
+        children.sort_unstable();
+    }
     let parent = if base == string(&repository["defaultBranchRef"], "name")? {
         None
     } else {
@@ -449,6 +465,7 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         head,
         base: base.into(),
         parent,
+        children,
         head_age: commit["committedDate"]
             .as_str()
             .and_then(|date| commit_age(date, now)),
@@ -479,8 +496,10 @@ mod tests {
             serde_json::json!({"pageInfo":{"hasNextPage":false},"nodes":[]});
         repository["pastParents"] =
             serde_json::json!({"pageInfo":{"hasNextPage":false},"nodes":[]});
+        repository["children"] = serde_json::json!({"nodes":[]});
         let p = &mut repository["pullRequest"];
         p["number"] = 15102.into();
+        p["isCrossRepository"] = false.into();
         p["recent"] = serde_json::json!({"nodes":[{"commit":{
             "oid": p["headRefOid"], "message":"existing commit"
         }}]});
@@ -490,6 +509,31 @@ mod tests {
     }
     fn parse_snapshot(json: &[u8]) -> anyhow::Result<Snapshot> {
         super::parse_snapshot(json, std::time::UNIX_EPOCH)
+    }
+
+    #[test]
+    fn parses_open_children_and_ignores_own_fork() {
+        let mut v = fixture();
+        v["data"]["repository"]["children"]["nodes"] =
+            serde_json::json!([{"number":14},{"number":15102},{"number":12}]);
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .children,
+            vec![12, 14]
+        );
+        v["data"]["repository"]["pullRequest"]["isCrossRepository"] = true.into();
+        assert!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .children
+                .is_empty()
+        );
+        v["data"]["repository"]["children"] = Value::Null;
+        assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
+        v["data"]["repository"]["children"] = serde_json::json!({"nodes":[]});
+        v["data"]["repository"]["pullRequest"]["isCrossRepository"] = Value::Null;
+        assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
     }
 
     #[test]
@@ -735,6 +779,7 @@ mod tests {
             snap: &snapshot,
             local: None,
             method: MergeMethod::Squash,
+            stack: StackMode::BottomUp,
         };
         assert_eq!(
             decide(&facts).verdict,
@@ -752,6 +797,7 @@ mod tests {
             snap: &snapshot,
             local: None,
             method: MergeMethod::Squash,
+            stack: StackMode::BottomUp,
         };
         assert_eq!(
             decide(&facts).verdict,
@@ -770,6 +816,7 @@ mod tests {
             snap: &snapshot,
             local: None,
             method: MergeMethod::Squash,
+            stack: StackMode::BottomUp,
         };
         assert_eq!(
             decide(&facts).verdict,
@@ -1237,6 +1284,7 @@ mod tests {
             snap: &snapshot,
             local: None,
             method: MergeMethod::Squash,
+            stack: StackMode::BottomUp,
         };
         assert_eq!(crate::decide::decide(&facts).rule, "merge");
         assert!(crate::decide::explain(&facts).contains("unhandled-items      pass"));

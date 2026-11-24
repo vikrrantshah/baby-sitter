@@ -47,7 +47,7 @@ impl Gh {
             Command::new("gh").args([
                 "api", "graphql", "-f", &format!("owner={}", self.pr.owner),
                 "-f", &format!("repo={}", self.pr.repo), "-F", &format!("n={}", self.pr.number),
-                "-f", "query=query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n){baseRefName}}}",
+                "-f", "query=query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n){baseRefName headRefName}}}",
             ]),
             None,
             self.deadline,
@@ -56,6 +56,9 @@ impl Gh {
         let base = base_json["data"]["repository"]["pullRequest"]["baseRefName"]
             .as_str()
             .context("missing PR base branch")?;
+        let head = base_json["data"]["repository"]["pullRequest"]["headRefName"]
+            .as_str()
+            .context("missing PR head branch")?;
         let out = proc::run(
             Command::new("gh").args([
                 "api",
@@ -69,15 +72,15 @@ impl Gh {
                 "-f",
                 &format!("base={base}"),
                 "-f",
+                &format!("head={head}"),
+                "-f",
                 &format!("query={}", wire::SNAPSHOT_QUERY),
             ]),
             None,
             self.deadline,
         )?;
         let response: serde_json::Value = serde_json::from_str(&out)?;
-        if response["data"]["repository"]["pullRequest"]["baseRefName"].as_str() != Some(base) {
-            bail!("base branch changed during snapshot");
-        }
+        check_snapshot_refs(&response, base, head)?;
         wire::parse_snapshot(out.as_bytes(), SystemTime::now())
     }
     pub fn failed_job_log(&self, job_id: u64) -> anyhow::Result<String> {
@@ -222,6 +225,17 @@ impl Gh {
     }
 }
 
+fn check_snapshot_refs(response: &serde_json::Value, base: &str, head: &str) -> anyhow::Result<()> {
+    let pr = &response["data"]["repository"]["pullRequest"];
+    if pr["baseRefName"].as_str() != Some(base) {
+        bail!("base branch changed during snapshot");
+    }
+    if pr["headRefName"].as_str() != Some(head) {
+        bail!("head branch changed during snapshot");
+    }
+    Ok(())
+}
+
 /// Actions logs carry ANSI color codes; they waste prompt space and can drive a terminal.
 fn strip_terminal_escapes(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -262,6 +276,20 @@ fn truncate_job_log(log: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_head_branch_rejects_snapshot() {
+        let response = serde_json::json!({"data":{"repository":{"pullRequest":{
+            "baseRefName":"main", "headRefName":"new-head"
+        }}}});
+        assert!(
+            check_snapshot_refs(&response, "main", "old-head")
+                .unwrap_err()
+                .to_string()
+                .contains("head branch changed during snapshot")
+        );
+        assert!(check_snapshot_refs(&response, "main", "new-head").is_ok());
+    }
 
     #[test]
     fn job_logs_keep_the_last_400_lines() {
