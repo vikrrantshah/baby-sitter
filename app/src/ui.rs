@@ -262,6 +262,7 @@ pub struct AppView {
     watch_filter: WatchFilter,
     state_filter: StateFilter,
     dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
+    search: Entity<InputState>,
     selected_filter: Option<RepoName>,
     app_inputs: RepoInputs,
     prompt_editors: Load<Vec<PromptEditor>>,
@@ -529,6 +530,13 @@ impl AppView {
                 }
             },
         );
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search by number or title"));
+        let search_subscription = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         let mut this = Self {
             data,
             config,
@@ -549,6 +557,7 @@ impl AppView {
             watch_filter: WatchFilter::default(),
             state_filter: StateFilter::default(),
             dashboard_filter,
+            search,
             selected_filter: None,
             app_inputs,
             prompt_editors: Load::Loading,
@@ -566,7 +575,7 @@ impl AppView {
             loading_prs: false,
             _subscriptions: {
                 let mut subscriptions = subscriptions;
-                subscriptions.push(clear_subscription);
+                subscriptions.extend([clear_subscription, search_subscription]);
                 subscriptions
             },
             _events: events,
@@ -2664,6 +2673,8 @@ impl AppView {
     }
     fn render_dashboard(&self, cx: &mut Context<Self>) -> (Div, Div) {
         let mut rows = self.dashboard_rows();
+        let query = self.search.read(cx).value().to_string();
+        rows.retain(|row| model::matches_search(row, &query));
         let watch_counts = model::watch_counts(&rows, &self.states, self.state_filter);
         let state_counts = model::state_counts(&rows, &self.states, self.watch_filter);
         rows.retain(|row| {
@@ -2682,7 +2693,9 @@ impl AppView {
                     .child(Self::retry_prs_button(cx))
             }
             _ if rows.is_empty() => {
-                if self.state_filter == StateFilter::Drafts {
+                if !query.trim().is_empty() {
+                    message("No pull requests match the search", None)
+                } else if self.state_filter == StateFilter::Drafts {
                     message("No draft pull requests", None)
                 } else if self.state_filter == StateFilter::Merged {
                     message("No merged pull requests", None)
@@ -2780,6 +2793,12 @@ impl AppView {
                                     .child("Baby Sitter"),
                             ),
                     )
+                    .child(header_picker(
+                        &self.dashboard_filter,
+                        "Filter by repository",
+                        "All repositories",
+                        Size::Medium,
+                    ))
                     .child(
                         round_button_with(
                             "refresh".into(),
@@ -2881,12 +2900,14 @@ impl AppView {
             .flex()
             .items_center()
             .gap(px(12.))
-            .child(header_picker(
-                &self.dashboard_filter,
-                "Filter by repository",
-                "All repositories",
-                Size::Medium,
-            ))
+            .child(
+                div().w(px(240.)).flex_shrink_0().child(
+                    Input::new(&self.search)
+                        .with_size(Size::Medium)
+                        .cleanable(true)
+                        .prefix(Icon::new(IconName::Search).text_color(muted())),
+                ),
+            )
             .child(watch_filter)
             .child(state_filter);
         let body = div()

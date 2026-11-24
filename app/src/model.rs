@@ -733,6 +733,20 @@ pub fn dashboard_rows<'a>(
     rows
 }
 
+/// Digits, with or without a leading `#`, match PR numbers that start with them.
+/// Any query also matches titles, ignoring case.
+pub fn matches_search(row: &PrRow, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let digits = query.strip_prefix('#').unwrap_or(query);
+    let by_number = !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && row.pr.number.to_string().starts_with(digits);
+    by_number || row.title.to_lowercase().contains(&query.to_lowercase())
+}
+
 pub fn watch_counts(
     rows: &[Cow<'_, PrRow>],
     sits: &BTreeMap<PrRef, SitState>,
@@ -1187,6 +1201,27 @@ mod tests {
             filtered.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
             [6381, 6386, 7000]
         );
+    }
+
+    #[test]
+    fn search_matches_number_prefix_or_title_ignoring_case() {
+        let mut pr = row("arbio/platform#6781", "");
+        pr.title = "chore(infra): NX-4585 disarm the production one-off".into();
+        for query in [
+            "",
+            "  ",
+            "6781",
+            "#678",
+            "678",
+            "nx-4585",
+            "DISARM the",
+            " production ",
+        ] {
+            assert!(matches_search(&pr, query), "{query:?} should match");
+        }
+        for query in ["781", "#", "#x", "6782", "arm the dev"] {
+            assert!(!matches_search(&pr, query), "{query:?} should not match");
+        }
     }
 
     #[test]

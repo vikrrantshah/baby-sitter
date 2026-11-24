@@ -43,6 +43,7 @@ filled! {
     "play" => "play-fill.svg",
     "plus" => "plus-circle-fill.svg",
     "refresh-cw" => "arrows-clockwise-fill.svg",
+    "search" => "search-16.svg",
     "settings" => "gear-six-fill.svg",
     "square" => "stop-fill.svg",
     "timer" => "timer-fill.svg",

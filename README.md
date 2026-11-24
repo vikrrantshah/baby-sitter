@@ -41,7 +41,7 @@ The bundle contains both binaries. For development, `cargo build --workspace && 
 4. Wait for the notification. A babysit ends when the PR merges, when its timeout passes, or when it needs you, and the row then shows the reason.
 5. Dismiss a finished row to delete its worktree.
 
-Two filter groups narrow the list. The first shows All, Watched, or Unwatched PRs. Watched covers running babysits and PRs whose babysit ended with a merge. The second shows All, Open, Drafts, or Merged PRs, where Open means ready for review or queued. Each button's count follows the other group's selection.
+The search box finds PRs by number or title. Digits, with or without a leading `#`, match PR numbers that start with them, and any text matches titles regardless of case. The repository picker next to the refresh button limits the list to one repository. Two filter groups narrow the list further. The first shows All, Watched, or Unwatched PRs. Watched covers running babysits and PRs whose babysit ended with a merge. The second shows All, Open, Drafts, or Merged PRs, where Open means ready for review or queued. Each button's count follows the search and the other group's selection.
 
 Each row also has a **More actions** menu to mark a draft ready for review, convert a PR to draft, close it, or copy its link.
 
