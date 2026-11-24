@@ -2767,63 +2767,63 @@ impl AppView {
         };
         let header = div()
             .flex_shrink_0()
+            .h(px(50.))
+            .pl(px(86.))
+            .pr(px(ROW_INSET))
             .flex()
-            .flex_col()
-            .child(drag_area().h(px(52.)))
+            .items_center()
+            .gap(px(10.))
             .child(
-                div()
-                    .px(px(ROW_INSET))
-                    .pb(px(20.))
+                drag_area()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
                     .flex()
                     .items_center()
-                    .gap(px(12.))
+                    .gap(px(8.))
+                    .child(pair_mark())
                     .child(
-                        drag_area()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .child(pair_mark())
-                            .child(
-                                div()
-                                    .text_size(px(24.))
-                                    .font_semibold()
-                                    .text_color(ink())
-                                    .child("Baby Sitter"),
-                            ),
-                    )
-                    .child(header_picker(
-                        &self.dashboard_filter,
-                        "Filter by repository",
-                        "All repositories",
-                        Size::Medium,
-                    ))
-                    .child(
-                        round_button_with(
-                            "refresh".into(),
-                            refresh_icon(self.loading_repos || self.loading_prs),
-                            "Refresh",
-                            raised(),
-                            ink(),
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.refresh(window, cx);
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        round_button(
-                            "settings".into(),
-                            IconName::Settings,
-                            "Settings",
-                            raised(),
-                            ink(),
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
+                        div()
+                            .text_size(px(15.))
+                            .font_semibold()
+                            .text_color(ink())
+                            .child("Baby Sitter"),
                     ),
+            )
+            .child(header_picker(
+                &self.dashboard_filter,
+                "Filter by repository",
+                "All repositories",
+                Size::Small,
+            ))
+            .child(
+                round_button_with(
+                    "refresh".into(),
+                    refresh_icon(self.loading_repos || self.loading_prs),
+                    "Refresh",
+                    raised(),
+                    ink(),
+                    cx,
+                )
+                .size(px(28.))
+                .rounded(px(14.))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.refresh(window, cx);
+                    cx.notify();
+                })),
+            )
+            .child(
+                round_button(
+                    "settings".into(),
+                    IconName::Settings,
+                    "Settings",
+                    raised(),
+                    ink(),
+                    cx,
+                )
+                .size(px(28.))
+                .rounded(px(14.))
+                .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
             );
         let watch_filter = ButtonGroup::new("watch-filter")
             .with_size(Size::Medium)
