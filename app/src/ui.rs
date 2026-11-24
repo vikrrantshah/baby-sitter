@@ -2581,10 +2581,10 @@ impl AppView {
         let rail_line = |segment: Div| {
             segment
                 .absolute()
-                .left(px(ROW_INSET + 16.))
-                .w(px(2.))
+                .left(px(ROW_INSET + 15.5))
+                .w(px(3.))
                 .rounded_full()
-                .bg(muted().opacity(0.45))
+                .bg(accent().opacity(0.7))
         };
         div()
             .relative()
