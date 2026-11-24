@@ -41,6 +41,8 @@ The bundle contains both binaries. For development, `cargo build --workspace && 
 4. Wait for the notification. A babysit ends when the PR merges, when its timeout passes, or when it needs you, and the row then shows the reason.
 5. Dismiss a finished row to delete its worktree.
 
+Two filter groups narrow the list. The first shows All, Watched, or Unwatched PRs. Watched covers running babysits and PRs whose babysit ended with a merge. The second shows All, Open, Drafts, or Merged PRs, where Open means ready for review or queued. Each button's count follows the other group's selection.
+
 Each row also has a **More actions** menu to mark a draft ready for review, convert a PR to draft, close it, or copy its link.
 
 **Settings > App** holds the defaults for every repository. The timeout and draft timeout are both `2h`, and the interval between checks is `30s`. To override a value for one repository, use the gear next to that repository. **Auto-dismiss merged PRs** clears merged rows and their worktrees after the **Clear after** delay.
@@ -90,6 +92,12 @@ Each pass reads the PR from GitHub and works on the first of four phases that is
 A phase starts only when every earlier phase is done. If an earlier phase slips, for example a new review comment arrives while the PR sits in the merge queue, the run goes back to it. The binary keeps no state file, so a crashed run restarts where it left off.
 
 [How baby-sitter works](docs/how-it-works.md) lists every rule, the reply markers, the conflict procedure, and the crash recovery table. [`design.html`](design.html) draws the flow.
+
+## Stacked pull requests
+
+A PR is stacked when its base branch is another PR's branch, the PR below it. Baby Sitter never merges a stacked PR into the PR below. Its babysit handles comments, branch updates, and CI as usual, then waits with "Waiting for #N below to merge". When the PR below merges, Baby Sitter moves the stacked PR onto that PR's base, if GitHub has not already done so, merges the new base in, waits for CI, and merges. A stack lands one PR at a time, from the bottom.
+
+In the app, a stacked row shows "on #N" next to its number and sits under the PR below it. **Babysit stack** in the row's More actions menu starts every open PR in the stack.
 
 ## What it never does
 
