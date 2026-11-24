@@ -119,9 +119,11 @@ pub enum QueueStatus {
         state: QueueEntryState,
         position: u32,
     },
+    /// GitHub sometimes reports a removal without the commit it removed.
     Removed {
         reason: String,
-        before_commit: Sha,
+        before_commit: Option<Sha>,
+        removed_ago: Option<Duration>,
     },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

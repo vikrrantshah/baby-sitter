@@ -13,7 +13,7 @@ pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$
  id state isDraft headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision author{__typename login}
  headRef{compare(headRef:$base){aheadBy}}
  mergeQueueEntry{state position}
- timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{__typename ... on RemovedFromMergeQueueEvent{reason beforeCommit{oid}}}}
+ timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{__typename ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}
  reviewRequests(first:100){pageInfo{hasNextPage} nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login} ... on Team{slug}}}}
  commits(last:1){nodes{commit{oid committedDate checkSuites(first:100){pageInfo{hasNextPage} nodes{status app{slug}}} statusCheckRollup{state contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name conclusion status databaseId detailsUrl checkSuite{databaseId app{slug} workflowRun{databaseId workflow{name}}}} ... on StatusContext{context state targetUrl}}}}}}}
  recent: commits(last:20){nodes{commit{oid message}}}
@@ -167,10 +167,19 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
             .context("missing queue timeline")?;
         match events.last() {
             Some(event) if string(event, "__typename")? == "RemovedFromMergeQueueEvent" => {
-                QueueStatus::Removed {
-                    reason: string(event, "reason")?.into(),
-                    before_commit: Sha::parse(string(&event["beforeCommit"], "oid")?)?,
-                }
+                (|| -> anyhow::Result<QueueStatus> {
+                    Ok(QueueStatus::Removed {
+                        reason: string(event, "reason")?.into(),
+                        before_commit: match &event["beforeCommit"] {
+                            Value::Null => None,
+                            commit => Some(Sha::parse(string(commit, "oid")?)?),
+                        },
+                        removed_ago: event["createdAt"]
+                            .as_str()
+                            .and_then(|date| commit_age(date, now)),
+                    })
+                })()
+                .context("merge queue removal event")?
             }
             _ => QueueStatus::NotQueued,
         }
@@ -950,8 +959,41 @@ mod tests {
             snapshot.queue,
             QueueStatus::Removed {
                 reason: "checks failed".into(),
-                before_commit: Sha::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                before_commit: Some(
+                    Sha::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap()
+                ),
+                removed_ago: None,
             }
+        );
+    }
+    #[test]
+    fn parses_queue_removal_that_names_no_commit() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_709_251_200);
+        let mut v = fixture();
+        v["data"]["repository"]["mergeQueue"] =
+            serde_json::json!({"configuration":{"mergeMethod":"SQUASH"}});
+        v["data"]["repository"]["pullRequest"]["mergeQueueEntry"] = Value::Null;
+        v["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"] = serde_json::json!([{
+            "__typename":"RemovedFromMergeQueueEvent", "createdAt":"2024-02-29T23:59:00Z",
+            "reason":"merge_conflict", "beforeCommit":null
+        }]);
+        let snapshot = super::parse_snapshot(&serde_json::to_vec(&v).unwrap(), now).unwrap();
+        assert_eq!(
+            snapshot.queue,
+            QueueStatus::Removed {
+                reason: "merge_conflict".into(),
+                before_commit: None,
+                removed_ago: Some(Duration::from_secs(60)),
+            }
+        );
+        v["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"][0]["beforeCommit"] =
+            serde_json::json!({"oid":"not a sha"});
+        let error = super::parse_snapshot(&serde_json::to_vec(&v).unwrap(), now).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("merge queue removal event"),
+            "{error:#}"
         );
     }
     #[test]

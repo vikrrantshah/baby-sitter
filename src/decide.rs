@@ -548,10 +548,29 @@ fn dequeued(f: &Facts<'_>) -> Option<Verdict> {
         QueueStatus::Removed {
             reason,
             before_commit,
-        } if *before_commit == f.snap.head.sha && !reason.eq_ignore_ascii_case("merged") => Some(
-            Verdict::Stop(format!("Merge queue removed the PR: {reason}")),
-        ),
+            removed_ago,
+        } if !reason.eq_ignore_ascii_case("merged")
+            && removed_current_head(before_commit.as_ref(), *removed_ago, f.snap) =>
+        {
+            Some(Verdict::Stop(format!(
+                "Merge queue removed the PR: {reason}"
+            )))
+        }
         _ => None,
+    }
+}
+/// Without the removed commit, a removal concerns the current head only if it happened after
+/// that head was committed. When either time is unknown, the run does not stop on it.
+fn removed_current_head(
+    before_commit: Option<&Sha>,
+    removed_ago: Option<Duration>,
+    snap: &Snapshot,
+) -> bool {
+    match before_commit {
+        Some(sha) => *sha == snap.head.sha,
+        None => {
+            matches!((removed_ago, snap.head_age), (Some(removed), Some(head)) if removed <= head)
+        }
     }
 }
 fn local_upstream(f: &Facts<'_>) -> Option<Verdict> {
@@ -1140,7 +1159,8 @@ mod tests {
         };
         w.snap.queue = QueueStatus::Removed {
             reason: "checks failed".into(),
-            before_commit: w.snap.head.sha.clone(),
+            before_commit: Some(w.snap.head.sha.clone()),
+            removed_ago: None,
         };
         assert_eq!(
             w.decision().verdict,
@@ -1153,6 +1173,35 @@ mod tests {
                 head: w.snap.head.sha.clone()
             })
         );
+    }
+    #[test]
+    fn queue_removal_naming_no_commit_stops_only_when_it_followed_the_head() {
+        let mut w = World::new();
+        w.snap.route = MergeRoute::Queue {
+            method: MergeMethod::Squash,
+        };
+        w.snap.head_age = Some(Duration::from_secs(600));
+        w.snap.queue = QueueStatus::Removed {
+            reason: "merge_conflict".into(),
+            before_commit: None,
+            removed_ago: Some(Duration::from_secs(3600)),
+        };
+        assert_eq!(
+            w.decision().rule,
+            "enqueue",
+            "a removal before the head was pushed concerns an older commit"
+        );
+        w.snap.queue = QueueStatus::Removed {
+            reason: "checks failed".into(),
+            before_commit: None,
+            removed_ago: Some(Duration::from_secs(60)),
+        };
+        assert_eq!(
+            w.decision().verdict,
+            Verdict::Stop("Merge queue removed the PR: checks failed".into())
+        );
+        w.snap.head_age = None;
+        assert_eq!(w.decision().rule, "enqueue", "unknown order does not stop");
     }
     #[test]
     fn conflicting_branches_are_resolved_after_checkout_guards() {
@@ -1220,7 +1269,8 @@ mod tests {
         w.snap.mergeable = Mergeable::Conflicting;
         w.snap.queue = QueueStatus::Removed {
             reason: "conflicts".into(),
-            before_commit: w.snap.head.sha.clone(),
+            before_commit: Some(w.snap.head.sha.clone()),
+            removed_ago: None,
         };
         assert_eq!(w.decision().rule, "conflict");
     }
