@@ -419,6 +419,69 @@ impl Prompts {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StackMode {
+    #[default]
+    BottomUp,
+    TopDown,
+}
+
+impl StackMode {
+    pub fn arg(self) -> &'static str {
+        match self {
+            Self::BottomUp => "bottom-up",
+            Self::TopDown => "top-down",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveSit {
+    pub deadline: u64,
+    pub stack: StackMode,
+}
+
+impl Serialize for ActiveSit {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Object {
+            deadline: u64,
+            stack: StackMode,
+        }
+        match self.stack {
+            StackMode::BottomUp => self.deadline.serialize(serializer),
+            StackMode::TopDown => Object {
+                deadline: self.deadline,
+                stack: self.stack,
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActiveSit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Deadline(u64),
+            Object {
+                deadline: u64,
+                #[serde(default)]
+                stack: StackMode,
+            },
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Deadline(deadline) => Self {
+                deadline,
+                stack: StackMode::BottomUp,
+            },
+            Raw::Object { deadline, stack } => Self { deadline, stack },
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -427,7 +490,7 @@ pub struct Config {
     #[serde(default)]
     pub prompts: Prompts,
     pub repos: BTreeMap<RepoName, RepoSettings>,
-    pub active: BTreeMap<PrRef, u64>,
+    pub active: BTreeMap<PrRef, ActiveSit>,
     #[serde(default)]
     pub history: BTreeMap<PrRef, PastSit>,
 }
@@ -508,6 +571,40 @@ pub fn stack_of(pr: &PrRef, parents: &BTreeMap<PrRef, PrRef>) -> Vec<PrRef> {
         }
     }
     stack
+}
+
+pub fn stack_tree(pr: &PrRef, parents: &BTreeMap<PrRef, PrRef>) -> Vec<PrRef> {
+    let mut bottom = pr;
+    let mut seen = BTreeSet::new();
+    while seen.insert(bottom.clone()) {
+        match parents.get(bottom) {
+            Some(parent) if !seen.contains(parent) => bottom = parent,
+            _ => break,
+        }
+    }
+    let mut tree = vec![bottom.clone()];
+    seen.clear();
+    seen.insert(bottom.clone());
+    let mut index = 0;
+    while index < tree.len() {
+        for (child, parent) in parents {
+            if *parent == tree[index] && seen.insert(child.clone()) {
+                tree.push(child.clone());
+            }
+        }
+        index += 1;
+    }
+    tree
+}
+
+pub fn stack_mode_of(
+    pr: &PrRef,
+    parents: &BTreeMap<PrRef, PrRef>,
+    active: &BTreeMap<PrRef, ActiveSit>,
+) -> Option<StackMode> {
+    stack_tree(pr, parents)
+        .iter()
+        .find_map(|member| active.get(member).map(|sit| sit.stack))
 }
 
 pub fn order_stacks<'a>(
@@ -1005,6 +1102,56 @@ mod tests {
         let mut closed = rows.clone();
         closed[1].state = PrState::Closed;
         assert!(!stack_parents(&closed).contains_key(&closed[2].pr));
+    }
+
+    #[test]
+    fn stack_tree_and_mode_include_side_branches() {
+        let mut rows = stack_rows();
+        let mut sibling = row("arbio/platform#7001", "");
+        sibling.base = "one".into();
+        sibling.head = "sibling".into();
+        rows.push(sibling);
+        let parents = stack_parents(&rows);
+        let expected = vec![
+            rows[0].pr.clone(),
+            rows[1].pr.clone(),
+            rows[6].pr.clone(),
+            rows[2].pr.clone(),
+            rows[3].pr.clone(),
+        ];
+        for pr in &expected {
+            assert_eq!(stack_tree(pr, &parents), expected);
+        }
+        let mut active = BTreeMap::new();
+        assert_eq!(stack_mode_of(&rows[3].pr, &parents, &active), None);
+        active.insert(
+            rows[6].pr.clone(),
+            ActiveSit {
+                deadline: 42,
+                stack: StackMode::TopDown,
+            },
+        );
+        assert_eq!(
+            stack_mode_of(&rows[3].pr, &parents, &active),
+            Some(StackMode::TopDown)
+        );
+        assert_eq!(stack_mode_of(&rows[4].pr, &parents, &active), None);
+    }
+
+    #[test]
+    fn active_sit_object_defaults_mode_and_rejects_unknown_mode() {
+        let sit: ActiveSit = serde_json::from_str(r#"{"deadline":123}"#).unwrap();
+        assert_eq!(
+            sit,
+            ActiveSit {
+                deadline: 123,
+                stack: StackMode::BottomUp
+            }
+        );
+        assert_eq!(serde_json::to_string(&sit).unwrap(), "123");
+        assert!(
+            serde_json::from_str::<ActiveSit>(r#"{"deadline":123,"stack":"sideways"}"#).is_err()
+        );
     }
 
     #[test]
@@ -1657,7 +1804,13 @@ mod tests {
         assert_eq!(pr.url(), "https://github.com/owner/repo/pull/42");
         let mut config = Config::default();
         config.repos.insert(repo, RepoSettings::default());
-        config.active.insert(pr.clone(), 1_700_000_000);
+        config.active.insert(
+            pr.clone(),
+            ActiveSit {
+                deadline: 1_700_000_000,
+                stack: StackMode::BottomUp,
+            },
+        );
         config.history.insert(
             pr,
             PastSit {

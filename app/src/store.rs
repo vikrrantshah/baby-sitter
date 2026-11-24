@@ -110,7 +110,7 @@ pub fn lock_instance(dir: &Path) -> Result<Option<File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PrRef, RepoName, RepoSettings};
+    use crate::model::{ActiveSit, PrRef, RepoName, RepoSettings, StackMode};
 
     #[test]
     fn prompt_file_tracks_overrides() {
@@ -227,12 +227,58 @@ mod tests {
         };
         let mut config = Config::default();
         config.repos.insert(repo, RepoSettings::default());
-        config.active.insert(pr, 1_700_000_000);
+        config.active.insert(
+            pr,
+            ActiveSit {
+                deadline: 1_700_000_000,
+                stack: StackMode::BottomUp,
+            },
+        );
         save(&dir, &config).unwrap();
         assert_eq!(load(&dir).unwrap(), config);
         drop(first);
         let next = lock_instance(&dir).unwrap().unwrap();
         drop(next);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_sits_preserve_legacy_and_top_down_shapes() {
+        let dir = crate::test_support::unique_test_dir("app-active-sits");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"active":{"owner/repo#1":123,"owner/repo#2":{"deadline":456,"stack":"top-down"}}}"#,
+        )
+        .unwrap();
+        let config = load(&dir).unwrap();
+        let bottom: PrRef = "owner/repo#1".parse().unwrap();
+        let top: PrRef = "owner/repo#2".parse().unwrap();
+        assert_eq!(
+            config.active[&bottom],
+            ActiveSit {
+                deadline: 123,
+                stack: StackMode::BottomUp
+            }
+        );
+        assert_eq!(
+            config.active[&top],
+            ActiveSit {
+                deadline: 456,
+                stack: StackMode::TopDown
+            }
+        );
+        save(&dir, &config).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved["active"],
+            serde_json::json!({
+                "owner/repo#1": 123,
+                "owner/repo#2": {"deadline": 456, "stack": "top-down"}
+            })
+        );
+        assert_eq!(load(&dir).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
     }
 }

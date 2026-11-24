@@ -1,8 +1,9 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, Config, Defaults, GateState, Outcome, PastSit, PrRef, PrRow, PrState, RepoListItem,
-        RepoName, RepoScope, RepoSettings, SitState, StateFilter, VerdictKind, WatchFilter,
+        self, ActiveSit, Config, Defaults, GateState, Outcome, PastSit, PrRef, PrRow, PrState,
+        RepoListItem, RepoName, RepoScope, RepoSettings, SitState, StackMode, StateFilter,
+        VerdictKind, WatchFilter,
     },
     notifications,
     setup::{self, CheckSpec, CheckState, Fix, Section},
@@ -86,16 +87,17 @@ enum RowAction {
     MarkReady,
     ConvertToDraft,
     Close,
-    BabysitStack,
+    BabysitStack(StackMode),
     CopyLink,
 }
 
 impl RowAction {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::MarkReady,
         Self::ConvertToDraft,
         Self::Close,
-        Self::BabysitStack,
+        Self::BabysitStack(StackMode::BottomUp),
+        Self::BabysitStack(StackMode::TopDown),
         Self::CopyLink,
     ];
 
@@ -107,12 +109,14 @@ impl RowAction {
         stack_watched: bool,
     ) -> Option<&'static str> {
         match self {
-            Self::MarkReady if is_open && is_draft && !merged => Some("Ready for review"),
-            Self::ConvertToDraft if is_open && !is_draft && !merged => Some("Convert to draft"),
-            Self::Close if is_open && !merged => Some("Close pull request"),
-            Self::BabysitStack if stack_watched => Some("Babysit stack"),
+            Self::MarkReady => (is_open && is_draft && !merged).then_some("Ready for review"),
+            Self::ConvertToDraft => (is_open && !is_draft && !merged).then_some("Convert to draft"),
+            Self::Close => (is_open && !merged).then_some("Close pull request"),
+            Self::BabysitStack(mode) => stack_watched.then_some(match mode {
+                StackMode::BottomUp => "Babysit stack bottom up",
+                StackMode::TopDown => "Babysit stack top down",
+            }),
             Self::CopyLink => Some("Copy link"),
-            _ => None,
         }
     }
 }
@@ -586,8 +590,8 @@ impl AppView {
             this.add_inputs(repo, &settings, window, cx);
         }
         this.load_prompt_defaults(window, cx);
-        for (pr, deadline) in this.config.active.clone() {
-            this.resume(pr, deadline);
+        for (pr, sit) in this.config.active.clone() {
+            this.resume(pr, sit);
         }
         this.dismiss_merged_history(window, cx);
         this.update_filter(window, cx);
@@ -1306,7 +1310,7 @@ impl AppView {
             cx.notify();
         });
     }
-    fn resume(&mut self, pr: PrRef, deadline: u64) {
+    fn resume(&mut self, pr: PrRef, sit: ActiveSit) {
         if self.handles.contains_key(&pr) {
             return;
         }
@@ -1319,7 +1323,7 @@ impl AppView {
         let handle = sitter::spawn(
             pr.clone(),
             settings,
-            deadline,
+            sit,
             self.data.clone(),
             self.env.clone(),
             self.registry.clone(),
@@ -1328,7 +1332,7 @@ impl AppView {
         );
         self.handles.insert(pr, handle);
     }
-    fn start(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
+    fn start(&mut self, pr: PrRef, mode: StackMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.removal_tasks.contains_key(&pr)
             || self.states.get(&pr).is_some_and(SitState::is_active)
         {
@@ -1350,7 +1354,11 @@ impl AppView {
             return;
         };
         let previous = self.config.history.remove(&pr);
-        self.config.active.insert(pr.clone(), deadline);
+        let sit = ActiveSit {
+            deadline,
+            stack: mode,
+        };
+        self.config.active.insert(pr.clone(), sit);
         if !self.save() {
             self.config.active.remove(&pr);
             if let Some(past) = previous {
@@ -1359,16 +1367,39 @@ impl AppView {
             cx.notify();
             return;
         }
-        self.resume(pr, deadline);
+        self.resume(pr, sit);
         self.update_filter(window, cx);
         cx.notify();
     }
-    fn start_stack(&mut self, pr: &PrRef, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_stack(
+        &mut self,
+        pr: &PrRef,
+        mode: StackMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Load::Ready(rows) = &self.prs else {
             return;
         };
         let parents = model::stack_parents(rows);
-        let stack: Vec<_> = model::stack_of(pr, &parents)
+        let tree = model::stack_tree(pr, &parents);
+        if let Some(other) = tree
+            .iter()
+            .filter_map(|member| self.config.active.get(member))
+            .find(|sit| sit.stack != mode)
+        {
+            let message = match other.stack {
+                StackMode::BottomUp => "This stack is already babysat bottom up",
+                StackMode::TopDown => "This stack is already babysat top down",
+            };
+            window.push_notification(Notification::error(message), cx);
+            return;
+        }
+        let members = match mode {
+            StackMode::BottomUp => model::stack_of(pr, &parents),
+            StackMode::TopDown => tree,
+        };
+        let stack: Vec<_> = members
             .into_iter()
             .filter(|pr| {
                 rows.iter().any(|row| {
@@ -1384,7 +1415,7 @@ impl AppView {
             {
                 continue;
             }
-            self.start(pr.clone(), window, cx);
+            self.start(pr.clone(), mode, window, cx);
             if self.states.get(&pr).is_some_and(SitState::is_active) {
                 count += 1;
             }
@@ -2264,9 +2295,18 @@ impl AppView {
                     cx,
                 )
                 .disabled(self.removal_tasks.contains_key(&row.pr))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.start(pr.clone(), window, cx)),
-                ),
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let mode = match &this.prs {
+                        Load::Ready(rows) => model::stack_mode_of(
+                            &pr,
+                            &model::stack_parents(rows),
+                            &this.config.active,
+                        )
+                        .unwrap_or_default(),
+                        _ => StackMode::BottomUp,
+                    };
+                    this.start(pr.clone(), mode, window, cx)
+                })),
             )
         };
         let dismiss = matches!(state, Some(SitState::Finished(_))).then(|| {
@@ -2286,7 +2326,7 @@ impl AppView {
         let time_left = active
             .then(|| self.config.active.get(&row.pr))
             .flatten()
-            .map(|deadline| time_left(deadline.saturating_sub(model::unix_now())));
+            .map(|sit| time_left(sit.deadline.saturating_sub(model::unix_now())));
         let is_open = matches!(row.state, PrState::Draft | PrState::Ready | PrState::Queued)
             && matches!(&self.prs, Load::Ready(rows) if rows.iter().any(|item| item.pr == row.pr));
         let is_draft = row.state == PrState::Draft;
@@ -2325,7 +2365,7 @@ impl AppView {
                             "icons/git-pull-request-closed.svg",
                             pr_state_color(PrState::Closed),
                         ),
-                        RowAction::BabysitStack => ("icons/stack-16.svg", muted()),
+                        RowAction::BabysitStack(_) => ("icons/stack-16.svg", muted()),
                         RowAction::CopyLink => ("icons/link.svg", muted()),
                     };
                     let item = PopupMenuItem::element(move |_, _| {
@@ -2356,7 +2396,9 @@ impl AppView {
                                     cx,
                                 ),
                                 RowAction::Close => this.ask_close(pr.clone(), window, cx),
-                                RowAction::BabysitStack => this.start_stack(&pr, window, cx),
+                                RowAction::BabysitStack(mode) => {
+                                    this.start_stack(&pr, mode, window, cx)
+                                }
                                 RowAction::CopyLink => {}
                             });
                         }
@@ -3726,7 +3768,7 @@ impl Render for AppView {
 
 #[cfg(test)]
 mod row_action_tests {
-    use super::RowAction;
+    use super::{RowAction, StackMode};
 
     #[test]
     fn menu_matches_pull_request_state() {
@@ -3746,13 +3788,25 @@ mod row_action_tests {
         );
         assert_eq!(labels(false, false, true), ["Copy link"]);
         assert_eq!(labels(false, false, false), ["Copy link"]);
+        let labels: Vec<_> = RowAction::ALL
+            .into_iter()
+            .filter_map(|action| action.menu_item(true, false, false, true))
+            .collect();
         assert_eq!(
-            RowAction::BabysitStack.menu_item(true, false, false, true),
-            Some("Babysit stack")
+            labels,
+            [
+                "Convert to draft",
+                "Close pull request",
+                "Babysit stack bottom up",
+                "Babysit stack top down",
+                "Copy link"
+            ]
         );
-        assert_eq!(
-            RowAction::BabysitStack.menu_item(true, false, false, false),
-            None
-        );
+        for mode in [StackMode::BottomUp, StackMode::TopDown] {
+            assert_eq!(
+                RowAction::BabysitStack(mode).menu_item(true, false, false, false),
+                None
+            );
+        }
     }
 }

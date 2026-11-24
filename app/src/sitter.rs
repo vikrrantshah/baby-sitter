@@ -1,6 +1,6 @@
 use crate::{
     gh::{self, ChildEnv},
-    model::{self, Outcome, PrRef, RepoName, Resolved, SitState, unix_now},
+    model::{self, ActiveSit, Outcome, PrRef, RepoName, Resolved, SitState, StackMode, unix_now},
 };
 use anyhow::{Context, Result, bail};
 use async_channel::Sender;
@@ -381,6 +381,7 @@ struct Runner {
     data: PathBuf,
     env: ChildEnv,
     deadline: u64,
+    stack: StackMode,
     settings: Resolved,
     registry: Registry,
     locks: RepoLocks,
@@ -713,6 +714,24 @@ impl Runner {
         }
         Some(outcome)
     }
+    fn cli_command(&self, cli: &Path) -> Command {
+        let mut command = self.env.command(cli);
+        command
+            .arg(self.pr.url())
+            .args([
+                "--timeout",
+                &format!("{}s", self.deadline.saturating_sub(unix_now())),
+                "--interval",
+                &format!("{}s", self.settings.interval.as_secs()),
+                "--gates",
+                "--stack",
+                self.stack.arg(),
+            ])
+            .current_dir(worktree_path(&self.data, &self.pr));
+        command.arg("--prompts").arg(self.data.join("prompts.json"));
+        command
+    }
+
     fn execute(&self) -> Result<Outcome> {
         if let Some(reason) = self.interrupted() {
             return Ok(reason.outcome());
@@ -739,18 +758,7 @@ impl Runner {
                     since: Instant::now(),
                 },
             );
-            let mut command = self.env.command(&cli);
-            command
-                .arg(self.pr.url())
-                .args([
-                    "--timeout",
-                    &format!("{}s", self.deadline.saturating_sub(unix_now())),
-                    "--interval",
-                    &format!("{}s", self.settings.interval.as_secs()),
-                    "--gates",
-                ])
-                .current_dir(worktree_path(&self.data, &self.pr));
-            command.arg("--prompts").arg(self.data.join("prompts.json"));
+            let command = self.cli_command(&cli);
             let output = self.run(command, ProcessMode::Sit)?;
             if model::lock_held(output.status.code(), &output.stderr)
                 && output.interrupted.is_none()
@@ -777,7 +785,7 @@ impl Runner {
 pub fn spawn(
     pr: PrRef,
     settings: Resolved,
-    deadline: u64,
+    sit: ActiveSit,
     data: PathBuf,
     env: ChildEnv,
     registry: Registry,
@@ -793,7 +801,8 @@ pub fn spawn(
         pr,
         data,
         env,
-        deadline,
+        deadline: sit.deadline,
+        stack: sit.stack,
         settings,
         registry,
         locks,
@@ -843,6 +852,7 @@ mod tests {
             data: PathBuf::new(),
             env: ChildEnv::new(),
             deadline: unix_now() + 60,
+            stack: StackMode::BottomUp,
             settings: model::RepoSettings::default().resolve(&model::Defaults::default()),
             registry: Arc::new(Mutex::new(BTreeMap::new())),
             locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1035,6 +1045,7 @@ mod tests {
                 data,
                 env: ChildEnv::new(),
                 deadline: unix_now() + 60,
+                stack: StackMode::BottomUp,
                 settings,
                 registry: Arc::new(Mutex::new(BTreeMap::new())),
                 locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1047,6 +1058,24 @@ mod tests {
             },
             rx,
         )
+    }
+
+    #[test]
+    fn runner_passes_saved_stack_mode_to_cli() {
+        let pr = "owner/repo#42".parse().unwrap();
+        let (mut runner, _) = setup_runner(PathBuf::from("/tmp/baby-sitter"), pr, "");
+        for (mode, expected) in [
+            (StackMode::BottomUp, "bottom-up"),
+            (StackMode::TopDown, "top-down"),
+        ] {
+            runner.stack = mode;
+            let command = runner.cli_command(Path::new("/bin/baby-sitter"));
+            let args: Vec<_> = command.get_args().collect();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--stack" && pair[1] == expected)
+            );
+        }
     }
 
     #[test]
@@ -1248,6 +1277,7 @@ mod tests {
             data: dir.clone(),
             env: ChildEnv::new(),
             deadline: unix_now() + 60,
+            stack: StackMode::BottomUp,
             settings: model::RepoSettings::default().resolve(&model::Defaults::default()),
             registry: registry.clone(),
             locks: Arc::new(Mutex::new(BTreeMap::new())),
