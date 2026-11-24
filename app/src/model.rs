@@ -753,17 +753,12 @@ pub fn matches_search(row: &PrRow, query: &str) -> bool {
 
 pub fn watch_counts(
     rows: &[Cow<'_, PrRow>],
-    sits: &BTreeMap<PrRef, SitState>,
     watched: &BTreeSet<PrRef>,
-    state_filter: StateFilter,
 ) -> [(WatchFilter, usize); 3] {
     WatchFilter::ALL.map(|filter| {
         let count = rows
             .iter()
-            .filter(|row| {
-                let sit = sits.get(&row.pr);
-                state_filter.admits(row, sit) && filter.admits(watched.contains(&row.pr))
-            })
+            .filter(|row| filter.admits(watched.contains(&row.pr)))
             .count();
         (filter, count)
     })
@@ -1109,7 +1104,7 @@ mod tests {
             admitted(WatchFilter::Unwatched),
             prs[4..].iter().map(|row| row.pr.clone()).collect()
         );
-        let counts = watch_counts(&rows, &sits, &watched, StateFilter::All);
+        let counts = watch_counts(&rows, &watched);
         assert_eq!(
             counts,
             [
@@ -1484,22 +1479,14 @@ mod tests {
         let history = BTreeMap::new();
         let rows = dashboard_rows(&prs, &history, &sits, &watched, Some(&repo));
         let watched_prs = watched_prs(&rows, &sits, &stack_parents(&prs));
-        let all_states = watch_counts(&rows, &sits, &watched_prs, StateFilter::All);
         assert_eq!(
-            all_states,
+            watch_counts(&rows, &watched_prs),
             [
                 (WatchFilter::All, 3),
                 (WatchFilter::Watched, 2),
                 (WatchFilter::Unwatched, 1)
             ]
         );
-        for state in StateFilter::ALL {
-            assert_eq!(
-                watch_counts(&rows, &sits, &watched_prs, state),
-                all_states,
-                "picking {state:?} must not change the watch counts"
-            );
-        }
     }
     #[test]
     fn dashboard_filters_candidates_by_status_and_repository() {

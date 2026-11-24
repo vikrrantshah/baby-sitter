@@ -2683,7 +2683,7 @@ impl AppView {
             _ => BTreeMap::new(),
         };
         let watched = model::watched_prs(&rows, &self.states, &parents);
-        let watch_counts = model::watch_counts(&rows, &self.states, &watched, self.state_filter);
+        let watch_counts = model::watch_counts(&rows, &watched);
         let searching = !query.trim().is_empty();
         rows.retain(|row| {
             let sit = self.states.get(&row.pr);
