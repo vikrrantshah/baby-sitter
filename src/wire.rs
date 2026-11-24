@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_parent_with_open_then_merged_then_closed_priority() {
+    fn selects_unique_open_or_merged_parent_or_latest_closed_parent() {
         let cases = [
             (
                 serde_json::json!([
@@ -558,11 +558,7 @@ mod tests {
                 serde_json::json!([
                     {"number":12,"state":"MERGED","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
                 ]),
-                Some(Parent {
-                    number: 13,
-                    state: ParentState::Open,
-                    base: "release/next".into(),
-                }),
+                None,
             ),
             (
                 serde_json::json!([]),
@@ -579,7 +575,8 @@ mod tests {
             (
                 serde_json::json!([]),
                 serde_json::json!([
-                    {"number":12,"state":"CLOSED","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
+                    {"number":12,"state":"CLOSED","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}},
+                    {"number":13,"state":"CLOSED","baseRefName":"older","headRepository":{"nameWithOwner":"cli/cli"}}
                 ]),
                 Some(Parent {
                     number: 12,
@@ -596,6 +593,43 @@ mod tests {
             let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
             assert_eq!(snapshot.parent, expected);
         }
+    }
+
+    #[test]
+    fn shared_production_branch_with_two_merged_prs_has_no_parent() {
+        let mut v = fixture();
+        v["data"]["repository"]["pullRequest"]["baseRefName"] = "production".into();
+        v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([
+            {"number":12,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}},
+            {"number":13,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
+        ]);
+        assert_eq!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent, None);
+    }
+
+    #[test]
+    fn shared_production_branch_with_open_and_merged_prs_has_no_parent() {
+        let mut v = fixture();
+        v["data"]["repository"]["pullRequest"]["baseRefName"] = "production".into();
+        v["data"]["repository"]["openParents"]["nodes"] = serde_json::json!([
+            {"number":12,"state":"OPEN","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
+        ]);
+        v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([
+            {"number":13,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
+        ]);
+        assert_eq!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent, None);
+    }
+
+    #[test]
+    fn production_branch_with_one_merged_pr_has_merged_parent() {
+        let mut v = fixture();
+        v["data"]["repository"]["pullRequest"]["baseRefName"] = "production".into();
+        v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([
+            {"number":12,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
+        ]);
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent,
+            Some(Parent { number: 12, state: ParentState::Merged, base: "main".into() })
+        );
     }
 
     #[test]
@@ -647,8 +681,10 @@ mod tests {
             {"number":12,"state":"MERGED","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
         ]);
         v["data"]["repository"]["openParents"]["pageInfo"]["hasNextPage"] = true.into();
-        let error = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap_err();
-        assert!(error.to_string().contains("openParents is truncated"));
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent,
+            None
+        );
 
         v["data"]["repository"]["openParents"]["pageInfo"]["hasNextPage"] = false.into();
         v["data"]["repository"]["pastParents"] = Value::Null;
@@ -691,35 +727,34 @@ mod tests {
     }
 
     #[test]
-    fn truncated_past_parents_require_a_merged_parent_when_no_open_parent_exists() {
+    fn truncated_past_parents_never_identify_a_parent() {
         let mut v = fixture();
         v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([
             {"number":12,"state":"CLOSED","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
         ]);
         v["data"]["repository"]["pastParents"]["pageInfo"]["hasNextPage"] = true.into();
-        let error = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap_err();
-        assert!(error.to_string().contains("pastParents is truncated"));
-
-        v["data"]["repository"]["pastParents"]["nodes"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({
-                "number":13,"state":"MERGED","baseRefName":"release/next","headRepository":{"nameWithOwner":"cli/cli"}
-            }));
         assert_eq!(
-            parse_snapshot(&serde_json::to_vec(&v).unwrap())
-                .unwrap()
-                .parent,
-            Some(Parent {
-                number: 13,
-                state: ParentState::Merged,
-                base: "release/next".into(),
-            })
+            parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent,
+            None
+        );
+
+    }
+
+    #[test]
+    fn truncated_past_parents_with_merged_pr_has_no_parent() {
+        let mut v = fixture();
+        v["data"]["repository"]["pastParents"]["pageInfo"]["hasNextPage"] = true.into();
+        v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([
+            {"number":13,"state":"MERGED","baseRefName":"release/next","headRepository":{"nameWithOwner":"cli/cli"}}
+        ]);
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent,
+            None
         );
     }
 
     #[test]
-    fn finds_open_parent_behind_newer_forks_and_merged_prs() {
+    fn truncated_connections_do_not_identify_an_open_parent() {
         let mut v = fixture();
         let mut open: Vec<_> = (1..=19)
             .map(|number| {
@@ -746,11 +781,7 @@ mod tests {
             parse_snapshot(&serde_json::to_vec(&v).unwrap())
                 .unwrap()
                 .parent,
-            Some(Parent {
-                number: 42,
-                state: ParentState::Open,
-                base: "main".into(),
-            })
+            None
         );
     }
 
