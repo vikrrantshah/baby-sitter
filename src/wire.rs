@@ -11,12 +11,13 @@ pub const SNAPSHOT_QUERY: &str = r#"query($owner:String!,$repo:String!,$n:Int!,$
  nameWithOwner defaultBranchRef{name}
  mergeQueue(branch:$base){configuration{mergeMethod}}
  openParents:pullRequests(headRefName:$base,states:[OPEN],first:20,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage} nodes{number state baseRefName headRepository{nameWithOwner}}}
- pastParents:pullRequests(headRefName:$base,states:[MERGED,CLOSED],first:20,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage} nodes{number state baseRefName headRepository{nameWithOwner}}}
+ pastParents:pullRequests(headRefName:$base,states:[MERGED,CLOSED],first:20,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage} nodes{number state baseRefName mergedAt closedAt headRepository{nameWithOwner}}}
  children:pullRequests(baseRefName:$head,states:[OPEN],first:20){nodes{number}}
  pullRequest(number:$n){
- number id state isDraft isCrossRepository headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision author{__typename login}
+ number id state createdAt isDraft isCrossRepository headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision author{__typename login}
  headRef{compare(headRef:$base){aheadBy}}
  mergeQueueEntry{state position}
+ baseChanges:timelineItems(itemTypes:[BASE_REF_CHANGED_EVENT],last:1){nodes{... on BaseRefChangedEvent{createdAt}}}
  timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],last:1){nodes{__typename ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}
  reviewRequests(first:100){pageInfo{hasNextPage} nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login} ... on Team{slug}}}}
  commits(last:1){nodes{commit{oid committedDate checkSuites(first:100){pageInfo{hasNextPage} nodes{status app{slug}}} statusCheckRollup{state contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name conclusion status databaseId detailsUrl checkSuite{databaseId app{slug} workflowRun{databaseId workflow{name}}}} ... on StatusContext{context state targetUrl}}}}}}}
@@ -85,7 +86,7 @@ fn comment(v: &Value, viewer: &str) -> anyhow::Result<Comment> {
     ))
 }
 macro_rules! parse_enum { ($s:expr, $($name:literal => $value:expr),+ $(,)?) => { match $s { $($name => $value,)+ other => bail!("unknown value {other:?}") } }; }
-fn commit_age(value: &str, now: SystemTime) -> Option<Duration> {
+fn timestamp(value: &str) -> Option<SystemTime> {
     let bytes = value.as_bytes();
     if bytes.len() != 20
         || bytes[4] != b'-'
@@ -129,12 +130,20 @@ fn commit_age(value: &str, now: SystemTime) -> Option<Duration> {
     let days = era * 146_097 + day_of_era - 719_468;
     let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
     let offset = Duration::from_secs(seconds.unsigned_abs());
-    let committed = if seconds < 0 {
-        UNIX_EPOCH.checked_sub(offset)?
+    if seconds < 0 {
+        UNIX_EPOCH.checked_sub(offset)
     } else {
-        UNIX_EPOCH.checked_add(offset)?
-    };
-    Some(now.duration_since(committed).unwrap_or(Duration::ZERO))
+        UNIX_EPOCH.checked_add(offset)
+    }
+}
+fn commit_age(value: &str, now: SystemTime) -> Option<Duration> {
+    Some(
+        now.duration_since(timestamp(value)?)
+            .unwrap_or(Duration::ZERO),
+    )
+}
+fn required_timestamp(v: &Value, key: &str) -> anyhow::Result<SystemTime> {
+    timestamp(string(v, key)?).with_context(|| format!("invalid {key}"))
 }
 pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> {
     let v: Value = serde_json::from_slice(json)?;
@@ -149,6 +158,14 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         bail!("PR not found");
     }
     let base = string(p, "baseRefName")?;
+    let created_at = required_timestamp(p, "createdAt")?;
+    let base_changes = p["baseChanges"]["nodes"]
+        .as_array()
+        .context("missing baseChanges nodes")?;
+    let targeted_since = match base_changes.last() {
+        Some(event) => created_at.max(required_timestamp(event, "createdAt")?),
+        None => created_at,
+    };
     let child_nodes = repository["children"]["nodes"]
         .as_array()
         .context("missing children nodes")?;
@@ -203,10 +220,10 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
                 match (is_open, state) {
                     (true, ParentState::Open) | (false, ParentState::Merged) => {
                         active_count += 1;
-                        parent = Some((number, state, base));
+                        parent = Some((number, state, base, node));
                     }
                     (false, ParentState::Closed) => {
-                        closed_parent.get_or_insert((number, state, base));
+                        closed_parent.get_or_insert((number, state, base, node));
                     }
                     _ => bail!("unexpected {state:?} parent in its connection"),
                 }
@@ -215,13 +232,25 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         if open_truncated || past_truncated || active_count > 1 {
             None
         } else {
-            parent
-                .or(closed_parent)
-                .map(|(number, state, base)| Parent {
-                    number,
-                    state,
-                    base: base.into(),
-                })
+            match parent.or(closed_parent) {
+                Some((number, state, base, node)) => {
+                    let ended_at = match state {
+                        ParentState::Open => None,
+                        ParentState::Merged => Some(required_timestamp(node, "mergedAt")?),
+                        ParentState::Closed => Some(required_timestamp(node, "closedAt")?),
+                    };
+                    if ended_at.is_none_or(|ended_at| ended_at > targeted_since) {
+                        Some(Parent {
+                            number,
+                            state,
+                            base: base.into(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
         }
     };
     let configuration = &repository["mergeQueue"];
@@ -500,6 +529,8 @@ mod tests {
         repository["children"] = serde_json::json!({"nodes":[]});
         let p = &mut repository["pullRequest"];
         p["number"] = 15102.into();
+        p["createdAt"] = "2020-01-01T00:00:00Z".into();
+        p["baseChanges"] = serde_json::json!({"nodes":[]});
         p["isCrossRepository"] = false.into();
         p["recent"] = serde_json::json!({"nodes":[{"commit":{
             "oid": p["headRefOid"], "message":"existing commit"
@@ -565,7 +596,7 @@ mod tests {
                 serde_json::json!([]),
                 serde_json::json!([
                     {"number":12,"state":"CLOSED","baseRefName":"other","headRepository":{"nameWithOwner":"cli/cli"}},
-                    {"number":13,"state":"MERGED","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
+                    {"number":13,"state":"MERGED","baseRefName":"main","mergedAt":"2021-01-01T00:00:00Z","headRepository":{"nameWithOwner":"cli/cli"}}
                 ]),
                 Some(Parent {
                     number: 13,
@@ -576,8 +607,8 @@ mod tests {
             (
                 serde_json::json!([]),
                 serde_json::json!([
-                    {"number":12,"state":"CLOSED","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}},
-                    {"number":13,"state":"CLOSED","baseRefName":"older","headRepository":{"nameWithOwner":"cli/cli"}}
+                    {"number":12,"state":"CLOSED","baseRefName":"main","closedAt":"2021-01-01T00:00:00Z","headRepository":{"nameWithOwner":"cli/cli"}},
+                    {"number":13,"state":"CLOSED","baseRefName":"older","closedAt":"2021-01-01T00:00:00Z","headRepository":{"nameWithOwner":"cli/cli"}}
                 ]),
                 Some(Parent {
                     number: 12,
@@ -593,6 +624,84 @@ mod tests {
             v["data"]["repository"]["pastParents"]["nodes"] = past;
             let snapshot = parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap();
             assert_eq!(snapshot.parent, expected);
+        }
+    }
+
+    #[test]
+    fn past_parent_must_end_after_current_base_was_targeted() {
+        for (state, field, parent_state) in [
+            ("MERGED", "mergedAt", ParentState::Merged),
+            ("CLOSED", "closedAt", ParentState::Closed),
+        ] {
+            for (created, changed, ended, expected) in [
+                ("2021-01-01T00:00:00Z", None, "2020-01-01T00:00:00Z", false),
+                ("2020-01-01T00:00:00Z", None, "2021-01-01T00:00:00Z", true),
+                (
+                    "2020-01-01T00:00:00Z",
+                    Some("2022-01-01T00:00:00Z"),
+                    "2021-01-01T00:00:00Z",
+                    false,
+                ),
+                ("2020-01-01T00:00:00Z", None, "2020-01-01T00:00:00Z", false),
+                (
+                    "2021-01-01T00:00:00Z",
+                    Some("2020-01-01T00:00:00Z"),
+                    "2020-06-01T00:00:00Z",
+                    false,
+                ),
+            ] {
+                let mut v = fixture();
+                let p = &mut v["data"]["repository"]["pullRequest"];
+                p["createdAt"] = created.into();
+                p["baseChanges"]["nodes"] = match changed {
+                    Some(date) => serde_json::json!([{"createdAt":date}]),
+                    None => serde_json::json!([]),
+                };
+                let mut parent = serde_json::json!({
+                    "number":12, "state":state, "baseRefName":"main",
+                    "headRepository":{"nameWithOwner":"cli/cli"}
+                });
+                parent[field] = ended.into();
+                v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([parent]);
+                assert_eq!(
+                    parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                        .unwrap()
+                        .parent,
+                    expected.then(|| Parent {
+                        number: 12,
+                        state: parent_state,
+                        base: "main".into()
+                    }),
+                    "{state}, {created}, {changed:?}, {ended}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_stack_timestamps() {
+        for (state, field) in [("MERGED", "mergedAt"), ("CLOSED", "closedAt")] {
+            let mut v = fixture();
+            v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([{
+                "number":12, "state":state, "baseRefName":"main",
+                "headRepository":{"nameWithOwner":"cli/cli"}
+            }]);
+            assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
+            v["data"]["repository"]["pastParents"]["nodes"][0][field] = "invalid".into();
+            assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
+            v["data"]["repository"]["pastParents"]["nodes"][0][field] =
+                "2021-01-01T00:00:00Z".into();
+            v["data"]["repository"]["pullRequest"]["createdAt"] = Value::Null;
+            assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
+            v["data"]["repository"]["pullRequest"]["createdAt"] = "invalid".into();
+            assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
+            v["data"]["repository"]["pullRequest"]["createdAt"] = "2020-01-01T00:00:00Z".into();
+            v["data"]["repository"]["pullRequest"]["baseChanges"]["nodes"] =
+                serde_json::json!([{}]);
+            assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
+            v["data"]["repository"]["pullRequest"]["baseChanges"]["nodes"][0]["createdAt"] =
+                "invalid".into();
+            assert!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).is_err());
         }
     }
 
@@ -635,7 +744,7 @@ mod tests {
         let mut v = fixture();
         v["data"]["repository"]["pullRequest"]["baseRefName"] = "production".into();
         v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([
-            {"number":12,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
+            {"number":12,"state":"MERGED","headRefName":"production","baseRefName":"main","mergedAt":"2021-01-01T00:00:00Z","headRepository":{"nameWithOwner":"cli/cli"}}
         ]);
         assert_eq!(
             parse_snapshot(&serde_json::to_vec(&v).unwrap())
@@ -667,7 +776,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({
-                "number":12,"state":"CLOSED","baseRefName":"main","headRepository":{"nameWithOwner":"CLI/cli"}
+                "number":12,"state":"CLOSED","baseRefName":"main","closedAt":"2021-01-01T00:00:00Z","headRepository":{"nameWithOwner":"CLI/cli"}
             }));
         assert_eq!(
             parse_snapshot(&serde_json::to_vec(&v).unwrap())
@@ -841,7 +950,7 @@ mod tests {
 
         v["data"]["repository"]["openParents"]["nodes"] = serde_json::json!([]);
         v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([
-            {"number":12,"state":"MERGED","baseRefName":"release/next","headRepository":{"nameWithOwner":"cli/cli"}}
+            {"number":12,"state":"MERGED","baseRefName":"release/next","mergedAt":"2021-01-01T00:00:00Z","headRepository":{"nameWithOwner":"cli/cli"}}
         ]);
         v["data"]["repository"]["pullRequest"]["mergeable"] = "CONFLICTING".into();
         v["data"]["repository"]["pullRequest"]["mergeStateStatus"] = "DIRTY".into();
@@ -856,6 +965,7 @@ mod tests {
             decide(&facts).verdict,
             Verdict::Act(Action::RetargetBase {
                 to: "release/next".into(),
+                parent: 12,
             })
         );
 

@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, fmt, time::Duration};
 const MAX_CI_FIX_ATTEMPTS: u32 = 3;
 const MAX_CONFLICT_ATTEMPTS: u32 = 3;
 
-fn names<I>(mut items: I) -> String
+pub(crate) fn names<I>(mut items: I) -> String
 where
     I: ExactSizeIterator,
     I::Item: fmt::Display,
@@ -43,7 +43,7 @@ pub struct Facts<'a> {
 #[derive(Debug, PartialEq, Eq)]
 enum StackGate<'a> {
     Clear,
-    Retarget { to: &'a str },
+    Retarget { to: &'a str, parent: u64 },
     BelowClosed { number: u64 },
     BelowOpen { number: u64 },
     AboveOpen { numbers: &'a [u64] },
@@ -58,7 +58,12 @@ impl StackGate<'_> {
 fn stack_gate<'a>(f: &Facts<'a>) -> StackGate<'a> {
     if let Some(parent) = &f.snap.parent {
         match parent.state {
-            ParentState::Merged => return StackGate::Retarget { to: &parent.base },
+            ParentState::Merged => {
+                return StackGate::Retarget {
+                    to: &parent.base,
+                    parent: parent.number,
+                };
+            }
             ParentState::Closed => {
                 return StackGate::BelowClosed {
                     number: parent.number,
@@ -124,6 +129,7 @@ pub enum Action {
     },
     RetargetBase {
         to: String,
+        parent: u64,
     },
     UpdateBranch,
     Enqueue {
@@ -167,7 +173,10 @@ impl fmt::Display for Action {
             Self::ResolveConflicts { base, .. } => {
                 write!(f, "Resolving merge conflicts with {base}")
             }
-            Self::RetargetBase { to } => write!(f, "Retargeting the base to {to}"),
+            Self::RetargetBase { to, parent } => write!(
+                f,
+                "Retargeting the base to {to} because #{parent} below merged"
+            ),
             Self::UpdateBranch => f.write_str("Updating the branch with its base"),
             Self::Enqueue { head } => {
                 write!(f, "Adding {} to the merge queue", &head.as_str()[..7])
@@ -541,7 +550,10 @@ fn draft(f: &Facts<'_>) -> Option<Verdict> {
 }
 fn stack_retarget(f: &Facts<'_>) -> Option<Verdict> {
     match stack_gate(f) {
-        StackGate::Retarget { to } => Some(Verdict::Act(Action::RetargetBase { to: to.into() })),
+        StackGate::Retarget { to, parent } => Some(Verdict::Act(Action::RetargetBase {
+            to: to.into(),
+            parent,
+        })),
         _ => None,
     }
 }
@@ -1196,7 +1208,7 @@ mod tests {
                     Some(ParentState::Merged),
                     true,
                     "stack-retarget",
-                    "Retargeting the base to main",
+                    "Retargeting the base to main because #10 below merged",
                     GateState::Waiting,
                     GateState::Pending,
                 ),
@@ -1351,6 +1363,7 @@ mod tests {
                     rule: "stack-retarget",
                     verdict: Verdict::Act(Action::RetargetBase {
                         to: "release/next".into(),
+                        parent: 12,
                     }),
                 }
             );
@@ -1360,7 +1373,7 @@ mod tests {
             );
             assert_eq!(
                 w.decision().verdict.to_string(),
-                "Retargeting the base to release/next"
+                "Retargeting the base to release/next because #12 below merged"
             );
         }
     }

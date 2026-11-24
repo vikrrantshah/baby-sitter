@@ -60,7 +60,7 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Action::RetargetBase { to } => env.gh.retarget_base(&to),
+        Action::RetargetBase { to, .. } => env.gh.retarget_base(&to),
         Action::UpdateBranch => env.gh.update_branch(),
         Action::Enqueue { head } => env.gh.enqueue(pr_id, &head),
         Action::Merge { head, method } => env.gh.merge(method, &head),
@@ -228,11 +228,7 @@ pub(crate) fn resolve_conflicts(
                 ensure!(
                     protected.is_empty(),
                     "Merge conflict in CI configuration: {}; resolve it by hand",
-                    protected
-                        .into_iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    crate::decide::names(protected.into_iter())
                 );
                 let index = git.index_state()?;
                 let fix = resolve(&files).with_context(|| {
