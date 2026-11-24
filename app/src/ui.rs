@@ -2364,18 +2364,7 @@ impl AppView {
                     .font_semibold()
                     .text_color(ink())
                     .child(row.title.clone()),
-            )
-            .when_some(reading.verb, |title, verb| {
-                title.child(
-                    div()
-                        .id(SharedString::from(format!("status-{}", row.pr)))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .child(status_badge(reading.badge))
-                        .tooltip(move |window, cx| Tooltip::new(verb).build(window, cx)),
-                )
-            });
+            );
         let place = format!("{} #{}", row.pr.repo, row.pr.number);
         let copy_url = row.url.clone();
         let copy_pr = row.pr.clone();
@@ -2461,16 +2450,41 @@ impl AppView {
                     ))
                     .when_some(worktree, |line, worktree| line.child(worktree)),
             )
-            .when_some(reading.detail.clone(), |content, detail| {
-                content.child(
-                    div()
-                        .min_w_0()
-                        .text_size(px(13.))
-                        .line_height(relative(1.45))
-                        .text_color(ink())
-                        .child(detail),
-                )
-            });
+            .when(
+                reading.verb.is_some() || reading.detail.is_some(),
+                |content| {
+                    content.child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .when_some(reading.verb, |line, verb| {
+                                line.child(
+                                    div()
+                                        .id(SharedString::from(format!("status-{}", row.pr)))
+                                        .flex_shrink_0()
+                                        .h(px(19.))
+                                        .flex()
+                                        .items_center()
+                                        .child(status_badge(reading.badge))
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(verb).build(window, cx)
+                                        }),
+                                )
+                            })
+                            .when_some(reading.detail.clone(), |line, detail| {
+                                line.child(
+                                    div()
+                                        .min_w_0()
+                                        .text_size(px(13.))
+                                        .line_height(relative(1.45))
+                                        .text_color(ink())
+                                        .child(detail),
+                                )
+                            }),
+                    )
+                },
+            );
         div()
             .px(px(ROW_INSET))
             .flex_shrink_0()
