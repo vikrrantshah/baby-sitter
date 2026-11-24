@@ -2794,7 +2794,7 @@ impl AppView {
                 &self.dashboard_filter,
                 "Filter by repository",
                 "All repositories",
-                Size::Small,
+                Size::Medium,
             ))
             .child(
                 round_button_with(
@@ -2805,8 +2805,8 @@ impl AppView {
                     ink(),
                     cx,
                 )
-                .size(px(28.))
-                .rounded(px(14.))
+                .size(px(32.))
+                .rounded(px(16.))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.refresh(window, cx);
                     cx.notify();
@@ -2821,8 +2821,8 @@ impl AppView {
                     ink(),
                     cx,
                 )
-                .size(px(28.))
-                .rounded(px(14.))
+                .size(px(32.))
+                .rounded(px(16.))
                 .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
             );
         let watch_filter = ButtonGroup::new("watch-filter")
