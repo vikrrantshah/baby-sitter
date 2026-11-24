@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_counts_follow_the_other_filter_and_repository() {
+    fn watch_counts_ignore_the_state_filter_but_follow_the_repository() {
         let mut draft_watched = row("owner/one#1", "2026-01-01");
         draft_watched.state = PrState::Draft;
         let mut draft_unwatched = row("owner/one#2", "2026-01-02");
@@ -1484,14 +1484,22 @@ mod tests {
         let history = BTreeMap::new();
         let rows = dashboard_rows(&prs, &history, &sits, &watched, Some(&repo));
         let watched_prs = watched_prs(&rows, &sits, &stack_parents(&prs));
+        let all_states = watch_counts(&rows, &sits, &watched_prs, StateFilter::All);
         assert_eq!(
-            watch_counts(&rows, &sits, &watched_prs, StateFilter::Drafts),
+            all_states,
             [
-                (WatchFilter::All, 2),
-                (WatchFilter::Watched, 1),
+                (WatchFilter::All, 3),
+                (WatchFilter::Watched, 2),
                 (WatchFilter::Unwatched, 1)
             ]
         );
+        for state in StateFilter::ALL {
+            assert_eq!(
+                watch_counts(&rows, &sits, &watched_prs, state),
+                all_states,
+                "picking {state:?} must not change the watch counts"
+            );
+        }
     }
     #[test]
     fn dashboard_filters_candidates_by_status_and_repository() {
