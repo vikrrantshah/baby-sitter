@@ -576,7 +576,7 @@ pub fn parse_pass(line: &str) -> Option<Pass<'_>> {
 /// A merge requirement's state, as the CLI reports it with `--gates`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GateState {
-    /// Merge only: other gates are still open.
+    /// The merge gate is pending while other gates are still open.
     Pending,
     Met,
     Waiting,

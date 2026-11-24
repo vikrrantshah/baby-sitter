@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PR Babysitter — Flow</title>
+<title>PR Babysitter flow</title>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3; --muted: #8b949e;
@@ -35,7 +35,7 @@
 <body>
 <main>
   <h1>PR Babysitter</h1>
-  <p class="sub">Codex handles unanswered review threads inside the purple box. The binary replies only in threads, resolves fixed threads, and does every git and GitHub write.</p>
+  <p class="sub">Codex handles unanswered review threads. The binary replies only in threads, resolves fixed threads, and does every git and GitHub write.</p>
   <div class="legend">
     <span style="--c: var(--script)">Binary</span>
     <span style="--c: var(--codex)">Codex</span>
@@ -47,52 +47,47 @@
   <div class="layout">
     <div class="diagram"><pre class="mermaid">
 flowchart TD
-  START([Start]):::term --> SNAP
-
-  SNAP["1 · Take a snapshot<br/><small>PR and open PR checkout</small>"]:::script --> T{{"2 · Merged, closed, draft,<br/>conflicting, or CI failed?"}}:::dec
-  T -- merged --> DONE([Exit 0]):::term
-  T -- other --> STOP([Stop, exit 1]):::stop
-  T -- no --> Q{{"3 · Queue status?"}}:::dec
-  Q -- queued --> WAIT["Wait --interval"]:::script --> NEXT
-  Q -- "removed at current head" --> STOP
-  Q -- otherwise --> L{{"4 · Local checkout in sync?"}}:::dec
-  L -- behind --> FF["Fast-forward"]:::script --> NEXT
-  L -- "dirty, ahead, or diverged" --> STOP
-  L -- yes --> RF{{"5 · Fixed threads still open?"}}:::dec
-  RF -- yes --> RES["Resolve them"]:::script --> NEXT
-  RF -- no --> UH{{"6 · Unanswered review threads?"}}:::dec
-
-  UH -- yes --> HC
-  subgraph CODEX ["Codex"]
-    direction TB
-    HC["Edit code, draft replies<br/><small>fixed, declined, or needs_human</small>"]:::codex
-  end
-  HC --> PUSH["Commit and push"]:::script --> REPLY["Reply in threads with markers"]:::script
-  REPLY --> RR["Request re-review"]:::script --> NEXT
-  style CODEX fill:#1d1430,stroke:#a371f7,stroke-width:2px,color:#d2b8ff
-
-  UH -- no --> BE{{"7 · Direct merge behind base?"}}:::dec
-  BE -- yes --> UP["Update branch"]:::script --> NEXT
-  BE -- no --> G{{"8 · Anything blocks the merge?<br/><small>CI pending, merge state, open threads,<br/>review requests, review decision</small>"}}:::dec
-  G -- yes --> WAIT
-  G -- no --> MERGE["Merge or enqueue the snapshot's head SHA"]:::script --> NEXT
-  NEXT(("Next pass")):::script -.-> SNAP
-
+  START([Start]) --> SNAP["Take a snapshot<br/>PR and local checkout"]
+  SNAP --> PRE{{"Merged, closed,<br/>or local checkout out of sync?"}}
+  PRE -- merged --> DONE([Exit 0])
+  PRE -- "closed, dirty, ahead, or diverged" --> STOP([Stop, exit 1])
+  PRE -- "checkout behind" --> FF["Fast-forward"] --> NEXT
+  PRE -- no --> C{{"1 · Comments<br/>fixed threads open or threads unanswered?"}}
+  C -- yes --> CA["Resolve fixed threads, or have Codex<br/>edit code and reply, then push"] --> NEXT
+  C -- no --> B{{"2 · Branch<br/>mergeability unknown, conflicts, or behind base?"}}
+  B -- unknown --> WAIT["Wait --interval"] --> NEXT
+  B -- conflicts --> BC["Merge the base, have Codex resolve,<br/>commit and push"] --> NEXT
+  B -- "behind, direct merge" --> BU["Update branch"] --> NEXT
+  B -- no --> K{{"3 · Checks<br/>CI failed, cancelled, pending, or not started?"}}
+  K -- "cancelled only" --> KR["Rerun the runs"] --> NEXT
+  K -- failed --> KF["Have Codex fix the code<br/>without changing the PR's goal or CI files"] --> NEXT
+  K -- "pending or starting" --> WAIT
+  K -- "fix limit or needs a person" --> STOP
+  K -- no --> M{{"4 · Merge<br/>queued, draft, reviews, or merge state pending?"}}
+  M -- yes --> WAIT
+  M -- "removed from queue" --> STOP
+  M -- no --> MERGE["Merge or enqueue the snapshot's head SHA"] --> NEXT
+  NEXT(("Next pass")) -.-> SNAP
   classDef script fill:#16263b,stroke:#4a90d9,color:#e6f0ff,stroke-width:1.5px
   classDef codex  fill:#2a1a45,stroke:#a371f7,color:#f3eaff,stroke-width:2px
   classDef dec    fill:#2e2614,stroke:#d29922,color:#fff3d6,stroke-width:1.5px
   classDef term   fill:#14301f,stroke:#3fb950,color:#e6ffed,stroke-width:2px
   classDef stop   fill:#3a1618,stroke:#f85149,color:#ffe2e0,stroke-width:2px
+  class SNAP,FF,WAIT,BU,KR,MERGE,NEXT script
+  class CA,BC,KF codex
+  class PRE,C,B,K,M dec
+  class START,DONE term
+  class STOP stop
     </pre></div>
 
     <div class="card">
       <h2>Known limits</h2>
       <ol>
-        <li><b>Failing CI and conflicts.</b> The binary stops and names the cause. It does not try to fix them.</li>
+        <li><b>Failing CI and conflicts.</b> Codex attempts code fixes and conflict resolutions. The run stops when a problem needs a person or the fix limit is reached.</li>
         <li><b>Declined and needs_human threads.</b> They stay open, and the merge waits until a person replies or resolves them.</li>
         <li><b>Lost re-review request.</b> If a run crashes after it posts replies, the request is not retried. The merge still waits on the review decision.</li>
-        <li><b>Large PRs.</b> More than 100 threads, comments in a thread, reviews, or review requests stops the run.</li>
-        <li><b>Queued feedback.</b> New review feedback waits until the PR leaves the queue. A push would remove the PR from the queue.</li>
+        <li><b>Large PRs.</b> More than 100 threads, comments in a thread, reviews, review requests, or checks stops the run.</li>
+        <li><b>Queued feedback.</b> The run handles new review feedback while the PR is queued. A push removes the PR from the queue.</li>
       </ol>
     </div>
   </div>

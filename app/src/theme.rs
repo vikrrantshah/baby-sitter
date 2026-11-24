@@ -1,4 +1,4 @@
-//! Graphite: a neutral dark grey with no blue tint and a teal accent.
+//! Graphite is a neutral dark grey theme with no blue tint and a teal accent.
 use gpui_kit::{
     App, Hsla,
     component::{Theme, ThemeConfig},

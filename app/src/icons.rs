@@ -1,7 +1,7 @@
-//! Filled icons. GPUI Kit ships the outline Lucide set, and both this app and
-//! gpui-component request icons by their Lucide path. This source answers those
-//! paths with Phosphor fill icons and GitHub's Octicons mark (both MIT, licenses
-//! in `assets/icons/`) and falls back to the Lucide catalog for anything not listed.
+//! GPUI Kit ships the outline Lucide set. This app and gpui-component request icons
+//! by their Lucide paths. This source maps those paths to Phosphor fill icons and
+//! GitHub's Octicons mark, both MIT licensed in `assets/icons/`. It falls back to the
+//! Lucide catalog for paths not listed here.
 
 use gpui_kit::*;
 use std::borrow::Cow;
@@ -74,8 +74,7 @@ mod tests {
     use super::FILLED;
     use gpui_kit::{AssetSource, assets};
 
-    /// Each overridden path must exist in the Lucide catalog; a typo would leave
-    /// that icon in outline with no error.
+    /// A typo in an overridden path would leave the icon in outline with no error.
     #[test]
     fn every_filled_path_replaces_a_catalog_icon() {
         for (path, _) in FILLED {

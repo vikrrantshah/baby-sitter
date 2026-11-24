@@ -706,7 +706,7 @@ impl Runner {
         };
         if let Err(error) = remove_worktree(&self.env, &self.data, &self.locks, &self.pr) {
             if let Outcome::Stopped(message) = &mut outcome {
-                message.push_str(&format!("; could not remove worktree: {error:#}"));
+                message.push_str(&format!(". Could not remove the worktree: {error:#}"));
             } else {
                 eprintln!("Could not remove worktree after interrupted setup: {error:#}");
             }
@@ -822,7 +822,7 @@ pub fn spawn(
 
 fn notify(pr: &PrRef, outcome: &Outcome) {
     let (status, body) = match outcome {
-        Outcome::Merged => ("Merged", "Pull request merged"),
+        Outcome::Merged => ("Merged", "The pull request merged"),
         Outcome::TimedOut => ("Timed out", "Babysitting timed out"),
         Outcome::Stopped(reason) => ("Needs you", reason.lines().next().unwrap_or("")),
         Outcome::Failed(reason) => ("Needs you", reason.lines().next_back().unwrap_or("")),

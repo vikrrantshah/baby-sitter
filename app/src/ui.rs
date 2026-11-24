@@ -1842,7 +1842,7 @@ impl AppView {
         let mut content = div().px(px(ROW_INSET)).py(px(28.)).w_full().max_w(px(800.))
             .flex().flex_col().gap(px(24.))
             .child(div().text_size(px(13.)).line_height(relative(1.4)).text_color(muted())
-                .child("Codex gets these instructions, followed by the review threads, failing checks, or conflicted files. The safety checks in Baby Sitter apply whatever the instructions say: it never commits CI configuration changes and checks conflict resolutions before pushing."))
+                .child("Codex gets these instructions, followed by the review threads, failing checks, or conflicted files. Baby Sitter applies its safety checks regardless of the instructions. It never commits CI configuration changes and checks conflict resolutions before pushing."))
             .child(div().text_size(px(12.)).text_color(muted())
                 .child("Changes apply to running babysits at their next Codex call."));
         match &self.prompt_editors {
@@ -2025,7 +2025,7 @@ impl AppView {
                                             div()
                                                 .text_size(px(13.))
                                                 .text_color(muted())
-                                                .child("Used by repositories that do not set their own value."),
+                                                .child("Repositories use these values unless they set their own."),
                                         ),
                                 )
                                 .child(duration_fields(&self.app_inputs)),
@@ -2067,7 +2067,7 @@ impl AppView {
                                 .child(duration_field(
                                     Icon::empty().path("icons/timer.svg"),
                                     "Clear after",
-                                    "How long a merged PR stays listed before it is cleared, for example 1h. 0s clears it at once.",
+                                    "A merged PR stays listed for this long before Baby Sitter clears it. For example, 1h waits one hour. 0s clears it at once.",
                                     &self.clear_merged_input,
                                     &self.clear_merged_error,
                                     !self.config.app.auto_dismiss_merged,
@@ -2123,7 +2123,7 @@ impl AppView {
                         div()
                             .text_size(px(13.))
                             .text_color(muted())
-                            .child("Applies to babysits you start from now on."),
+                            .child("These settings apply to babysits you start from now on."),
                     ),
             );
         let body = div().size_full().child(
@@ -2142,7 +2142,7 @@ impl AppView {
                         .child(duration_fields(inputs).child(duration_field(
                             Icon::empty().path("icons/square-terminal.svg"),
                             "Setup command",
-                            "Runs in a new worktree right after it is created, before the babysit starts. Leave empty to skip.",
+                            "Baby Sitter runs this command after creating a new worktree and before the babysit starts. Leave it empty to skip this step.",
                             inputs
                                 .setup_command
                                 .as_ref()
@@ -2590,7 +2590,7 @@ impl AppView {
                         PrFilter::Merged => message(
                             "No merged babysits",
                             Some(
-                                "Babysat PRs show here after they merge, until you dismiss them."
+                                "Babysat PRs appear here after they merge and stay until you dismiss them."
                                     .into(),
                             ),
                         ),
@@ -2929,10 +2929,10 @@ impl AppView {
         let (first, _) = failures.next()?;
         let more = failures.count();
         let text = if more == 0 {
-            format!("Baby Sitter isn't ready: {} needs attention.", first.label)
+            format!("Baby Sitter isn't ready. {} needs attention.", first.label)
         } else {
             format!(
-                "Baby Sitter isn't ready: {} and {more} more need attention.",
+                "Baby Sitter isn't ready. {} and {more} more need attention.",
                 first.label
             )
         };
@@ -2949,7 +2949,7 @@ impl AppView {
                 .child(div().flex_1().min_w_0().text_ellipsis().child(text))
                 .child(
                     Button::new("open-status")
-                        .label("Open Status")
+                        .label("Open status")
                         .ghost()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.page = Page::Settings(SettingsPage::Status);
@@ -3212,7 +3212,7 @@ fn duration_fields(inputs: &RepoInputs) -> Div {
         .child(duration_field(
             Icon::empty().path("icons/timer.svg"),
             "Timeout",
-            "How long to wait for the merge, for example 2h.",
+            "Wait this long for the merge, for example 2h.",
             &inputs.timeout,
             &inputs.timeout_error,
             false,
@@ -3220,7 +3220,7 @@ fn duration_fields(inputs: &RepoInputs) -> Div {
         .child(duration_field(
             Icon::new(IconName::GitPullRequestDraft),
             "Draft timeout",
-            "How long to babysit a draft pull request.",
+            "Babysit a draft pull request for this long.",
             &inputs.draft_timeout,
             &inputs.draft_timeout_error,
             false,
@@ -3228,7 +3228,7 @@ fn duration_fields(inputs: &RepoInputs) -> Div {
         .child(duration_field(
             Icon::new(IconName::RefreshCw),
             "Interval",
-            "How long to wait between checks, for example 30s.",
+            "Wait this long between checks, for example 30s.",
             &inputs.interval,
             &inputs.interval_error,
             false,
@@ -3243,7 +3243,7 @@ fn copy_pr_link(pr: &PrRef, url: &str, window: &mut Window, cx: &mut App) {
     );
 }
 
-/// A round icon-only button: tinted with `tint` at rest, filled further with `hover` under the pointer.
+/// A round icon-only button tinted with `tint` at rest and filled further with `hover` under the pointer.
 fn round_button(
     id: SharedString,
     icon: IconName,
@@ -3278,7 +3278,7 @@ fn round_button_with(
         .tooltip(label)
         .child(child)
 }
-/// The refresh icon, turning while a repository or pull request load is in flight.
+/// The refresh icon turns while a repository or pull request load is in flight.
 fn refresh_icon(spinning: bool) -> AnyElement {
     let icon = Icon::new(IconName::RefreshCw).size(px(14.));
     if spinning {
@@ -3369,7 +3369,7 @@ fn time_left(seconds: u64) -> String {
         format!("{} left", format_minutes(seconds))
     }
 }
-/// One choice in a header picker: an organization or repository with its owner's
+/// A header picker choice is an organization or repository with its owner's
 /// profile picture, or the "All …" choice with an icon.
 #[derive(Clone)]
 struct PickerChoice<V> {
@@ -3495,7 +3495,7 @@ fn state_style(state: GateState) -> (Hsla, &'static str) {
         GateState::Skipped => (muted().opacity(0.45), "skipped"),
     }
 }
-/// A filled circle with a check, dash, or cross; a hollow ring when not started.
+/// A filled circle has a check, dash, or cross. A hollow ring means not started.
 fn status_badge(state: GateState) -> Div {
     let (color, _) = state_style(state);
     let badge = div()
@@ -3520,7 +3520,7 @@ fn status_badge(state: GateState) -> Div {
     };
     badge.child(Icon::new(icon).size(px(14.)).text_color(color))
 }
-/// The caretaker and the child: a lit disc holding a smaller light one.
+/// The caretaker and the child are a lit disc holding a smaller light one.
 fn pair_mark() -> Div {
     div()
         .relative()

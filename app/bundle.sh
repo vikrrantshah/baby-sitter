@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds target/release/Baby Sitter.app: both binaries, the bundle Info.plist and
-# an icon rendered from app/assets/icon.svg. Prints the bundle path.
+# Builds target/release/Baby Sitter.app with both binaries, the bundle Info.plist,
+# and an icon rendered from app/assets/icon.svg. Prints the bundle path.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -25,7 +25,7 @@ done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 rm -rf "$(dirname "$iconset")"
 
-# Ad-hoc signatures: the inner binaries first, then the bundle that seals them.
+# Sign the inner binaries first, then the bundle that seals them.
 codesign --force --sign - "$app/Contents/MacOS/baby-sitter"
 codesign --force --sign - "$app"
 

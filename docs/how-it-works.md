@@ -12,7 +12,7 @@ If a snapshot request to GitHub fails, the pass waits and tries again. The run s
 
 The phases are Comments, Branch, Checks, and Merge. A phase starts only when every earlier phase is complete. Every pass checks the phases again from the top, so the run always works on the earliest phase that needs work.
 
-When an earlier phase stops being complete, every later phase goes back to pending and the run returns to the earlier phase. A new review comment while the PR waits in a merge queue sends the run back to Comments. A base branch that moves while CI runs sends it back to Branch. The `--gates` line and the four icons in the app show this state: done phases are green, the current phase is amber or red, and later phases are grey.
+When an earlier phase stops being complete, every later phase goes back to pending and the run returns to the earlier phase. A new review comment while the PR waits in a merge queue sends the run back to Comments. A base branch that moves while CI runs sends it back to Branch. The `--gates` line and the four icons in the app show this state. Done phases are green, the current phase is amber or red, and later phases are grey.
 
 ```mermaid
 flowchart TD
@@ -41,7 +41,7 @@ flowchart TD
 
 ## Rules decide each pass
 
-The rules live in `RULES` in `src/decide.rs`, grouped as preconditions and then the four phases. Order is precedence. The first rule that matches decides the pass. The binary merges or enqueues only when no rule matches.
+The rules live in `RULES` in `src/decide.rs`, grouped as preconditions and then the four phases. The first rule that matches decides the pass. The binary merges or enqueues only when no rule matches.
 
 | Stage | Rules | Result when a rule matches |
 |---|---|---|
@@ -57,7 +57,7 @@ The rules live in `RULES` in `src/decide.rs`, grouped as preconditions and then 
 
 The binary handles unresolved review threads from people and bots. It replies only inside those threads and never posts a top-level PR comment.
 
-Codex gets every unanswered thread in one batch. It edits files and returns one result for each thread: `fixed`, `declined`, or `needs_human`, with the reply text. If Codex fails, times out, or returns a result that does not match the batch, the run stops before it writes anything.
+Codex gets every unanswered thread in one batch. It edits files and returns one result for each thread, with the reply text. The result is `fixed`, `declined`, or `needs_human`. If Codex fails, times out, or returns a result that does not match the batch, the run stops before it writes anything.
 
 Every reply ends with a hidden marker:
 
@@ -69,7 +69,7 @@ Every reply ends with a hidden marker:
 
 The binary resolves only `fixed` threads. Declined threads and threads that need a person stay open, and the merge waits until someone replies or resolves them.
 
-## Merge conflicts are resolved by merging, not rebasing
+## Merge conflicts use a merge, not a rebase
 
 A conflicting PR gets the same treatment as failing CI. The `conflict` rule runs only on a clean checkout that matches the PR head.
 
@@ -89,12 +89,12 @@ Codex gets the failed Actions job logs and the URLs of failing external checks. 
 
 The binary checks for CI configuration changes in the working tree before committing and in the commit before pushing. It leaves an unsafe change uncommitted, or an unsafe commit local, for you to inspect. Fix commits carry the `Baby-Sitter: fix-ci` trailer, and the run stops if CI still fails after three fix commits among the PR's last 20 commits.
 
-## Each Codex prompt has a fixed frame
+## Each Codex prompt has fixed parts
 
-Codex gets one of three prompts: `review` for unanswered threads, `ci` for failing checks, and `conflicts` for merge conflicts. Each prompt is built in three parts, in this order:
+Codex gets one of three prompts. The `review` prompt covers unanswered threads, `ci` covers failing checks, and `conflicts` covers merge conflicts. Each prompt has three parts, in this order:
 
 1. The instructions. `baby-sitter --print-default-prompts` prints the defaults. `--prompts <file>` or **Settings > Prompts** in the app replaces them.
-2. The data: the `ITEM` blocks for review threads, the failing checks and their logs, or the base branch and the conflicted files.
+2. The `ITEM` blocks for review threads, the failing checks and their logs, or the base branch and the conflicted files.
 3. A fixed rule that Codex must not run `git` or `gh` and must not install packages. Custom instructions cannot remove it. It is an instruction to Codex, not a runtime block.
 
 The binary checks the `--prompts` file at startup and stops with the cause when the file is invalid. A missing file means the defaults. The binary reads the file again before each Codex call, so a running babysit picks up a change at its next call. The app always passes `<data dir>/prompts.json` and deletes the file when no custom prompt is saved and turned on.

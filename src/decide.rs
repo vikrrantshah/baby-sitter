@@ -718,11 +718,11 @@ fn merge_state(f: &Facts<'_>) -> Option<Verdict> {
             match state {
                 MergeState::Behind => "Branch is behind its base",
                 MergeState::Blocked => {
-                    "Waiting: GitHub blocks the merge without naming a missing review, check, or thread"
+                    "Waiting because GitHub blocks the merge without naming a missing review, check, or thread"
                 }
                 MergeState::Dirty => "PR has merge conflicts with its base branch",
                 MergeState::Unknown => "Waiting for GitHub to work out the merge state",
-                MergeState::Unstable => "Waiting: some checks are failing or still running",
+                MergeState::Unstable => "Waiting because some checks are failing or still running",
                 MergeState::Clean | MergeState::HasHooks | MergeState::Draft => unreachable!(),
             }
             .into(),
@@ -770,9 +770,12 @@ fn review_decision(f: &Facts<'_>) -> Option<Verdict> {
             }
             requested.reverse();
             if requested.is_empty() {
-                "Waiting: changes were requested".to_owned()
+                "Waiting because changes were requested".to_owned()
             } else {
-                format!("Waiting: {} requested changes", names(requested.iter()))
+                format!(
+                    "Waiting because {} requested changes",
+                    names(requested.iter())
+                )
             }
         }
         Some(ReviewDecision::ReviewRequired) => "Waiting for an approving review".to_owned(),
@@ -867,7 +870,7 @@ mod tests {
             w.decision(),
             Decision {
                 rule: "review-decision",
-                verdict: Verdict::Wait("Waiting: windeko requested changes. Review requested from mohsen89z and windeko".into()),
+                verdict: Verdict::Wait("Waiting because windeko requested changes. Review requested from mohsen89z and windeko".into()),
             }
         );
         assert_eq!(w.gates().get(Gate::Merge), GateState::Waiting);
@@ -888,7 +891,7 @@ mod tests {
         ];
         assert_eq!(
             w.decision().verdict,
-            Verdict::Wait("Waiting: bob and alice requested changes".into())
+            Verdict::Wait("Waiting because bob and alice requested changes".into())
         );
     }
 
@@ -903,7 +906,7 @@ mod tests {
         w.snap.review_requests = vec![Reviewer::User(Login("x".into()))];
         assert_eq!(
             w.decision().verdict,
-            Verdict::Wait("Waiting: changes were requested. Review requested from x".into())
+            Verdict::Wait("Waiting because changes were requested. Review requested from x".into())
         );
         w.snap.review_decision = Some(ReviewDecision::ReviewRequired);
         assert_eq!(
@@ -925,7 +928,7 @@ mod tests {
             w.decision(),
             Decision {
                 rule: "merge-state",
-                verdict: Verdict::Wait("Waiting: GitHub blocks the merge without naming a missing review, check, or thread".into()),
+                verdict: Verdict::Wait("Waiting because GitHub blocks the merge without naming a missing review, check, or thread".into()),
             }
         );
         assert_eq!(w.gates().get(Gate::Merge), GateState::Waiting);

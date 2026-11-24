@@ -174,7 +174,7 @@ fn check_gh(env: &ChildEnv) -> CheckState {
             CheckState::Ok(format!("Version {version}"))
         }
         Some([_, _, _]) => CheckState::Failed(format!(
-            "Version {version}; Baby Sitter needs 2.97.0 or later"
+            "Version {version}. Baby Sitter needs 2.97.0 or later"
         )),
         _ => CheckState::Failed("Could not parse GitHub CLI version".into()),
     }
@@ -189,7 +189,7 @@ fn check_gh_auth(env: &ChildEnv) -> CheckState {
             );
             match parse_gh_auth(&text) {
                 Some((login, Some(false))) if output.status.success() => {
-                    CheckState::Failed(format!("Signed in as {login}; token lacks repo scope"))
+                    CheckState::Failed(format!("Signed in as {login}. The token lacks repo scope"))
                 }
                 Some((login, _)) if output.status.success() => {
                     CheckState::Ok(format!("Signed in as {login}"))
@@ -250,27 +250,27 @@ fn notifications_state(access: NotificationAccess) -> CheckState {
         }
         NotificationAccess::NotDetermined => {
             return CheckState::Missing {
-                detail: "Not requested yet".into(),
+                detail: "Notification access has not been requested yet".into(),
                 fix: Fix::AllowNotifications,
             };
         }
-        NotificationAccess::Denied => "Turned off in System Settings",
+        NotificationAccess::Denied => "Notifications are off in System Settings",
         NotificationAccess::Allowed {
             banners: true,
             notification_center: true,
-        } => return CheckState::Ok("Banners and Notification Center".into()),
+        } => return CheckState::Ok("Banners and Notification Center are on".into()),
         NotificationAccess::Allowed {
             banners: false,
             notification_center: true,
-        } => "Allowed, but banners are off",
+        } => "Notifications are allowed, but banners are off",
         NotificationAccess::Allowed {
             banners: true,
             notification_center: false,
-        } => "Allowed, but hidden from Notification Center",
+        } => "Notifications are allowed, but hidden from Notification Center",
         NotificationAccess::Allowed {
             banners: false,
             notification_center: false,
-        } => "Allowed, but banners and Notification Center are off",
+        } => "Notifications are allowed, but banners and Notification Center are off",
     };
     CheckState::Missing {
         detail: detail.into(),
@@ -285,8 +285,7 @@ fn check_notifications(_: &ChildEnv) -> CheckState {
     }
 }
 
-/// The notifications check alone. It asks macOS in-process and starts no tools,
-/// so the Status page can repeat it often.
+/// Checks notifications without starting tools, so the Status page can repeat the check often.
 pub fn recheck_notifications() -> CheckState {
     check_notifications(&ChildEnv::new())
 }
@@ -334,37 +333,37 @@ mod tests {
                     banners: true,
                     notification_center: true,
                 },
-                CheckState::Ok("Banners and Notification Center".into()),
+                CheckState::Ok("Banners and Notification Center are on".into()),
             ),
             (
                 NotificationAccess::Allowed {
                     banners: false,
                     notification_center: true,
                 },
-                settings("Allowed, but banners are off"),
+                settings("Notifications are allowed, but banners are off"),
             ),
             (
                 NotificationAccess::Allowed {
                     banners: true,
                     notification_center: false,
                 },
-                settings("Allowed, but hidden from Notification Center"),
+                settings("Notifications are allowed, but hidden from Notification Center"),
             ),
             (
                 NotificationAccess::Allowed {
                     banners: false,
                     notification_center: false,
                 },
-                settings("Allowed, but banners and Notification Center are off"),
+                settings("Notifications are allowed, but banners and Notification Center are off"),
             ),
             (
                 NotificationAccess::Denied,
-                settings("Turned off in System Settings"),
+                settings("Notifications are off in System Settings"),
             ),
             (
                 NotificationAccess::NotDetermined,
                 CheckState::Missing {
-                    detail: "Not requested yet".into(),
+                    detail: "Notification access has not been requested yet".into(),
                     fix: Fix::AllowNotifications,
                 },
             ),

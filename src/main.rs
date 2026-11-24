@@ -19,9 +19,9 @@ use std::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "baby-sitter", about = "Drive a GitHub PR to merged")]
+#[command(name = "baby-sitter", about = "Help a GitHub PR reach a merged state")]
 struct Cli {
-    /// PR number or URL. Default: the PR for the current branch.
+    /// PR number or URL. Defaults to the PR for the current branch.
     pr: Option<String>,
     /// Print the current decision without applying it.
     #[arg(long)]
