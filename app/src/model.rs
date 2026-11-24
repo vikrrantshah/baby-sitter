@@ -769,24 +769,6 @@ pub fn watch_counts(
     })
 }
 
-pub fn state_counts(
-    rows: &[Cow<'_, PrRow>],
-    sits: &BTreeMap<PrRef, SitState>,
-    watched: &BTreeSet<PrRef>,
-    watch_filter: WatchFilter,
-) -> [(StateFilter, usize); 4] {
-    StateFilter::ALL.map(|filter| {
-        let count = rows
-            .iter()
-            .filter(|row| {
-                let sit = sits.get(&row.pr);
-                watch_filter.admits(watched.contains(&row.pr)) && filter.admits(row, sit)
-            })
-            .count();
-        (filter, count)
-    })
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
     Merged,
@@ -1508,15 +1490,6 @@ mod tests {
                 (WatchFilter::All, 2),
                 (WatchFilter::Watched, 1),
                 (WatchFilter::Unwatched, 1)
-            ]
-        );
-        assert_eq!(
-            state_counts(&rows, &sits, &watched_prs, WatchFilter::Watched),
-            [
-                (StateFilter::All, 2),
-                (StateFilter::Open, 1),
-                (StateFilter::Drafts, 1),
-                (StateFilter::Merged, 0)
             ]
         );
     }

@@ -24,6 +24,7 @@ actions!(
         HideOthers,
         ShowAll,
         Refresh,
+        Find,
         Minimize,
         Zoom
     ]
@@ -91,6 +92,7 @@ fn run() -> anyhow::Result<()> {
                 KeyBinding::new("cmd-h", Hide, None),
                 KeyBinding::new("alt-cmd-h", HideOthers, None),
                 KeyBinding::new("cmd-r", Refresh, None),
+                KeyBinding::new("cmd-f", Find, None),
                 KeyBinding::new("cmd-m", Minimize, None),
             ]);
             cx.set_menus([
@@ -117,6 +119,8 @@ fn run() -> anyhow::Result<()> {
                         MenuItem::action("Copy", component::input::Copy),
                         MenuItem::action("Paste", component::input::Paste),
                         MenuItem::action("Select All", component::input::SelectAll),
+                        MenuItem::separator(),
+                        MenuItem::action("Find…", Find),
                     ],
                     disabled: false,
                 },
@@ -154,21 +158,35 @@ fn run() -> anyhow::Result<()> {
             cx.on_action(move |_: &OpenSettings, cx| {
                 let _ = settings_view.update(cx, |view, cx| view.open_settings(cx));
             });
-            cx.on_action(move |_: &Refresh, cx| {
+            // A key action arrives while its window is mid-update, so `window.update` fails
+            // until that update ends. `defer` runs the window work after it.
+            let with_view = move |cx: &mut App,
+                                  f: fn(
+                &mut ui::AppView,
+                &mut Window,
+                &mut Context<ui::AppView>,
+            )| {
                 let view = view.clone();
-                let _ = window.update(cx, |_, window, cx| {
-                    let _ = view.update(cx, |view, cx| {
-                        view.refresh(window, cx);
-                        cx.notify();
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        let _ = view.update(cx, |view, cx| f(view, window, cx));
                     });
                 });
+            };
+            let find = with_view.clone();
+            cx.on_action(move |_: &Find, cx| find(cx, ui::AppView::focus_search));
+            let refresh = with_view.clone();
+            cx.on_action(move |_: &Refresh, cx| {
+                refresh(cx, |view, window, cx| {
+                    view.refresh(window, cx);
+                    cx.notify();
+                })
             });
+            let minimize = with_view.clone();
             cx.on_action(move |_: &Minimize, cx| {
-                let _ = window.update(cx, |_, window, _| window.minimize_window());
+                minimize(cx, |_, window, _| window.minimize_window())
             });
-            cx.on_action(move |_: &Zoom, cx| {
-                let _ = window.update(cx, |_, window, _| window.zoom_window());
-            });
+            cx.on_action(move |_: &Zoom, cx| with_view(cx, |_, window, _| window.zoom_window()));
             notifications::init();
             cx.activate(true);
         });

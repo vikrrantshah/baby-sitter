@@ -306,6 +306,11 @@ impl AppView {
         self.page = Page::Settings(SettingsPage::App);
         cx.notify();
     }
+    pub(crate) fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = Page::PullRequests;
+        window.focus(&self.search.focus_handle(cx), cx);
+        cx.notify();
+    }
 
     pub fn new(
         data: PathBuf,
@@ -2679,7 +2684,6 @@ impl AppView {
         };
         let watched = model::watched_prs(&rows, &self.states, &parents);
         let watch_counts = model::watch_counts(&rows, &self.states, &watched, self.state_filter);
-        let state_counts = model::state_counts(&rows, &self.states, &watched, self.watch_filter);
         let searching = !query.trim().is_empty();
         rows.retain(|row| {
             let sit = self.states.get(&row.pr);
@@ -2864,8 +2868,7 @@ impl AppView {
                 StateFilter::visible(self.config.app.hides_merged_filter())
                     .iter()
                     .copied()
-                    .zip(state_counts)
-                    .map(|(filter, (_, count))| {
+                    .map(|filter| {
                         let (id, label) = match filter {
                             StateFilter::All => ("state-filter-all", "All"),
                             StateFilter::Open => ("state-filter-open", "Open"),
@@ -2875,13 +2878,9 @@ impl AppView {
                         let selected = self.state_filter == filter;
                         Button::new(id).selected(selected).child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
                                 .text_color(if selected { accent() } else { muted() })
                                 .when(selected, |d| d.font_semibold())
-                                .child(label)
-                                .when(count > 0, |d| d.child(count.to_string())),
+                                .child(label),
                         )
                     }),
             )
