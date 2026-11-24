@@ -49,19 +49,28 @@ The rules live in `RULES` in `src/decide.rs`, grouped as preconditions and then 
 | 1 · Comments | `resolve-fixed`, `unhandled-items` | Resolve threads whose newest marker says `fixed`. Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
 | 2 · Branch | `stack-retarget`, `mergeability-unknown`, `conflict`, `behind-base` | Move a stacked PR onto its merged parent's base with `gh pr edit --base`. Wait while GitHub computes mergeability. Merge the base and have Codex resolve conflicts. Run `gh pr update-branch` for direct merges. A merge queue updates the branch itself. |
 | 3 · Checks | `ci-failed`, `rerun-cancelled`, `fix-ci`, `ci-pending`, `ci-starting` | Wait for pending checks before fixing. Rerun Actions runs when every failure is a cancellation. Otherwise send the failures to Codex, then commit and push a code fix. |
-| 4 · Merge | `stacked`, `in-queue`, `dequeued`, `review-decision`, `review-requests`, `unresolved-threads`, `draft`, `merge-state` | Wait while the PR below is open, and stop if it was closed without merging. Wait while queued, while reviews block the merge, or while the PR is a draft. The wait message names the reviewers who requested changes and the pending review requests. Stop if the queue removed the current head for a reason other than a merge. |
+| 4 · Merge | `stacked`, `stack-above`, `in-queue`, `dequeued`, `review-decision`, `review-requests`, `unresolved-threads`, `draft`, `merge-state` | Bottom up, wait while the PR below is open. Top down, wait while any open PR is based on this PR's branch. In both modes, stop if the PR below was closed without merging. Wait while queued, while reviews block the merge, or while the PR is a draft. The wait message names the reviewers who requested changes and the pending review requests. Stop if the queue removed the current head for a reason other than a merge. |
 
 `--dry-run` prints every rule's verdict for the current snapshot.
 
-## A stack lands from the bottom
+## Stacks land bottom up or top down
 
-GitHub has no stack object. A PR is stacked when its base branch is the head branch of another PR in the same repository, its parent. Each snapshot looks up that parent with `pullRequests(headRefName: <base>)` and prefers an open parent, then a merged one, then a closed one.
+GitHub has no stack object. A PR is stacked when its base branch is the head branch of another PR in the same repository, its parent. Each snapshot looks up that parent with `pullRequests(headRefName: <base>)` and prefers an open parent, then a merged one, then a closed one. It also lists the open PRs based on this PR's own branch, its children, with `pullRequests(baseRefName: <head>)`. A PR whose head is in a fork has no children, because a same-named branch in the base repository is a different branch.
+
+`--stack bottom-up`, the default, lands each PR on its parent's base in turn.
 
 - While the parent is open, `stacked` holds the PR in the Merge phase. Without it, the merge route would be direct, because the parent's branch has no merge queue, and the PR would merge into the parent's branch.
 - When the parent has merged, `stack-retarget` runs `gh pr edit --base <parent's base>`. GitHub does the same itself when the repository deletes branches on merge, so the rule only acts when GitHub has not. The next pass sees the new base and continues with the usual Branch, Checks, and Merge phases.
-- When the parent was closed without merging, `stacked` stops the run, because merging into an abandoned branch lands nothing.
 
-A PR whose base is not another PR's branch, such as a release branch, merges into that base as usual.
+`--stack top-down` folds the stack into its bottom PR, which lands once.
+
+- While any child is open, `stack-above` holds the PR in the Merge phase with "Waiting for #N above to merge". This holds the bottom PR too. Merging a PR while a child is still open would leave the child's work on a branch nobody merges.
+- With no open child, the PR merges into its parent's branch through the usual direct route. That merge moves the parent's head, so the parent's CI runs again on the combined change.
+- The bottom PR then has no open child and lands on the default branch through the usual route, merge queue included.
+
+In both modes, `stacked` stops the run when the parent was closed without merging, because merging into an abandoned branch lands nothing. A merged parent is retargeted in both modes. A PR whose base is not another PR's branch, such as a release branch, merges into that base as usual.
+
+`stack-retarget`, `stacked` and `stack-above` all read one value, `stack_gate`, so at most one of them fires per pass and the `[gates]` line agrees with the decision.
 
 ## Review threads get replies in place
 

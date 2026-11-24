@@ -95,9 +95,12 @@ A phase starts only when every earlier phase is done. If an earlier phase slips,
 
 ## Stacked pull requests
 
-A PR is stacked when its base branch is another PR's branch, the PR below it. Baby Sitter never merges a stacked PR into the PR below. Its babysit handles comments, branch updates, and CI as usual, then waits with "Waiting for #N below to merge". When the PR below merges, Baby Sitter moves the stacked PR onto that PR's base, if GitHub has not already done so, merges the new base in, waits for CI, and merges. A stack lands one PR at a time, from the bottom.
+A PR is stacked when its base branch is another PR's branch, the PR below it. A stack lands in one of two ways.
 
-In the app, a stacked row sits under the PR below it, and a vertical line joins the play buttons of PRs in the same stack. **Babysit stack** in the row's More actions menu starts every open PR in the stack.
+- **Bottom up**, the default. Baby Sitter never merges a stacked PR into the PR below. Its babysit handles comments, branch updates, and CI as usual, then waits with "Waiting for #N below to merge". When the PR below merges, Baby Sitter moves the stacked PR onto that PR's base, if GitHub has not already done so, merges the new base in, waits for CI, and merges. Each PR lands on its own, one at a time.
+- **Top down.** Each PR waits with "Waiting for #N above to merge" while a PR is stacked on it. The top PR merges into the PR below it, then that PR merges into the one below it, and so on. The bottom PR then carries the whole stack and lands once, through the default branch's usual checks and merge queue. The PRs above the bottom merge into branches, so the default branch's review and CI rules apply only to the bottom PR.
+
+In the app, a stacked row sits under the PR below it, and a vertical line joins the play buttons of PRs in the same stack. **Babysit stack bottom up** and **Babysit stack top down** in the row's More actions menu start every open PR in the stack in that mode. Top down also starts PRs on side branches of the stack, because each PR waits for every PR stacked on it. A stack runs in one mode at a time. Play on a PR whose stack is already running top down joins it top down.
 
 ## What it never does
 
