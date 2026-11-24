@@ -550,6 +550,30 @@ pub fn order_stacks<'a>(
     ordered
 }
 
+/// Which neighbouring rows a row's stack line reaches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StackRail {
+    pub up: bool,
+    pub down: bool,
+}
+
+/// Joins neighbouring rows that belong to the same stack, keyed by the PR at its bottom.
+pub fn stack_rails(rows: &[Cow<'_, PrRow>], parents: &BTreeMap<PrRef, PrRef>) -> Vec<StackRail> {
+    let stacked =
+        |pr: &PrRef| parents.contains_key(pr) || parents.values().any(|parent| parent == pr);
+    let keys: Vec<_> = rows
+        .iter()
+        .map(|row| stacked(&row.pr).then(|| stack_of(&row.pr, parents).swap_remove(0)))
+        .collect();
+    let joined = |a: usize, b: usize| keys[a].is_some() && keys[a] == keys[b];
+    (0..rows.len())
+        .map(|i| StackRail {
+            up: i > 0 && joined(i, i - 1),
+            down: i + 1 < rows.len() && joined(i, i + 1),
+        })
+        .collect()
+}
+
 pub fn dashboard_rows<'a>(
     prs: &'a [PrRow],
     history: &'a BTreeMap<PrRef, PastSit>,
@@ -1015,6 +1039,48 @@ mod tests {
         assert_eq!(
             filtered.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
             [6381, 6386, 7000]
+        );
+    }
+
+    #[test]
+    fn stack_rails_join_neighbours_in_the_same_stack_only() {
+        let rows = stack_rows();
+        let parents = stack_parents(&rows);
+        let ordered = order_stacks(rows.iter().map(Cow::Borrowed).collect(), &parents);
+        let rails = stack_rails(&ordered, &parents);
+        let chain: Vec<_> = rows[..4].iter().map(|row| &row.pr).collect();
+        for (row, rail) in ordered.iter().zip(&rails) {
+            let expected = match chain.iter().position(|pr| **pr == row.pr) {
+                Some(0) => StackRail {
+                    up: false,
+                    down: true,
+                },
+                Some(3) => StackRail {
+                    up: true,
+                    down: false,
+                },
+                Some(_) => StackRail {
+                    up: true,
+                    down: true,
+                },
+                None => StackRail::default(),
+            };
+            assert_eq!(*rail, expected, "{}", row.pr);
+        }
+        let filtered = vec![Cow::Borrowed(&rows[1]), Cow::Borrowed(&rows[3])];
+        assert_eq!(
+            stack_rails(&filtered, &parents),
+            [
+                StackRail {
+                    up: false,
+                    down: true
+                },
+                StackRail {
+                    up: true,
+                    down: false
+                }
+            ],
+            "a filtered-out middle PR still leaves its neighbours joined"
         );
     }
 

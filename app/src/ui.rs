@@ -2223,6 +2223,7 @@ impl AppView {
         &self,
         row: &PrRow,
         last: bool,
+        rail: model::StackRail,
         parents: &BTreeMap<PrRef, PrRef>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2553,11 +2554,26 @@ impl AppView {
                     )
                 },
             );
+        let rail_line = |segment: Div| {
+            segment
+                .absolute()
+                .left(px(ROW_INSET + 16.))
+                .w(px(2.))
+                .rounded_full()
+                .bg(muted().opacity(0.45))
+        };
         div()
+            .relative()
             .px(px(ROW_INSET))
             .flex_shrink_0()
             .py(px(18.))
             .when(!last, |item| item.border_b_1().border_color(divider()))
+            .when(rail.up, |item| {
+                item.child(rail_line(div()).top_0().h(px(18.)))
+            })
+            .when(rail.down, |item| {
+                item.child(rail_line(div()).top(px(52.)).bottom_0())
+            })
             .flex()
             .items_start()
             .gap(px(20.))
@@ -2700,9 +2716,15 @@ impl AppView {
                         .overflow_y_scroll()
                         .flex()
                         .flex_col()
-                        .children(rows.iter().enumerate().map(|(index, row)| {
-                            self.pr_row(row, index + 1 == rows.len(), &parents, cx)
-                        })),
+                        .children({
+                            let rails = model::stack_rails(&rows, &parents);
+                            rows.iter()
+                                .zip(rails)
+                                .enumerate()
+                                .map(|(index, (row, rail))| {
+                                    self.pr_row(row, index + 1 == rows.len(), rail, &parents, cx)
+                                })
+                        }),
                 )
             }
         };
