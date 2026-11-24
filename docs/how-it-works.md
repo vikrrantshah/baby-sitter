@@ -47,11 +47,21 @@ The rules live in `RULES` in `src/decide.rs`, grouped as preconditions and then 
 |---|---|---|
 | Preconditions | `merged`, `closed`, `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Exit 0 for `merged`. Fast-forward a checkout that is behind. Stop for the others. |
 | 1 · Comments | `resolve-fixed`, `unhandled-items` | Resolve threads whose newest marker says `fixed`. Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
-| 2 · Branch | `mergeability-unknown`, `conflict`, `behind-base` | Wait while GitHub computes mergeability. Merge the base and have Codex resolve conflicts. Run `gh pr update-branch` for direct merges. A merge queue updates the branch itself. |
+| 2 · Branch | `stack-retarget`, `mergeability-unknown`, `conflict`, `behind-base` | Move a stacked PR onto its merged parent's base with `gh pr edit --base`. Wait while GitHub computes mergeability. Merge the base and have Codex resolve conflicts. Run `gh pr update-branch` for direct merges. A merge queue updates the branch itself. |
 | 3 · Checks | `ci-failed`, `rerun-cancelled`, `fix-ci`, `ci-pending`, `ci-starting` | Wait for pending checks before fixing. Rerun Actions runs when every failure is a cancellation. Otherwise send the failures to Codex, then commit and push a code fix. |
-| 4 · Merge | `in-queue`, `dequeued`, `review-decision`, `review-requests`, `unresolved-threads`, `draft`, `merge-state` | Wait while queued, while reviews block the merge, or while the PR is a draft. The wait message names the reviewers who requested changes and the pending review requests. Stop if the queue removed the current head for a reason other than a merge. |
+| 4 · Merge | `stacked`, `in-queue`, `dequeued`, `review-decision`, `review-requests`, `unresolved-threads`, `draft`, `merge-state` | Wait while the PR below is open, and stop if it was closed without merging. Wait while queued, while reviews block the merge, or while the PR is a draft. The wait message names the reviewers who requested changes and the pending review requests. Stop if the queue removed the current head for a reason other than a merge. |
 
 `--dry-run` prints every rule's verdict for the current snapshot.
+
+## A stack lands from the bottom
+
+GitHub has no stack object. A PR is stacked when its base branch is the head branch of another PR in the same repository, its parent. Each snapshot looks up that parent with `pullRequests(headRefName: <base>)` and prefers an open parent, then a merged one, then a closed one.
+
+- While the parent is open, `stacked` holds the PR in the Merge phase. Without it, the merge route would be direct, because the parent's branch has no merge queue, and the PR would merge into the parent's branch.
+- When the parent has merged, `stack-retarget` runs `gh pr edit --base <parent's base>`. GitHub does the same itself when the repository deletes branches on merge, so the rule only acts when GitHub has not. The next pass sees the new base and continues with the usual Branch, Checks, and Merge phases.
+- When the parent was closed without merging, `stacked` stops the run, because merging into an abandoned branch lands nothing.
+
+A PR whose base is not another PR's branch, such as a release branch, merges into that base as usual.
 
 ## Review threads get replies in place
 

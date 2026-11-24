@@ -127,6 +127,22 @@ impl Gh {
         proc::run(&mut cmd, None, self.deadline)?;
         Ok(())
     }
+    pub fn retarget_base(&self, to: &str) -> anyhow::Result<()> {
+        proc::run(
+            Command::new("gh").args([
+                "pr",
+                "edit",
+                &self.number(),
+                "-R",
+                &self.repo(),
+                "--base",
+                to,
+            ]),
+            None,
+            self.deadline,
+        )?;
+        Ok(())
+    }
     pub fn update_branch(&self) -> anyhow::Result<()> {
         proc::run(
             Command::new("gh").args(["pr", "update-branch", &self.number(), "-R", &self.repo()]),

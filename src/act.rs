@@ -60,6 +60,7 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Action::RetargetBase { to } => env.gh.retarget_base(&to),
         Action::UpdateBranch => env.gh.update_branch(),
         Action::Enqueue { head } => env.gh.enqueue(pr_id, &head),
         Action::Merge { head, method } => env.gh.merge(method, &head),

@@ -72,6 +72,18 @@ pub enum Lifecycle {
     Merged,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParentState {
+    Open,
+    Merged,
+    Closed,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Parent {
+    pub number: u64,
+    pub state: ParentState,
+    pub base: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mergeable {
     Yes,
     Conflicting,
@@ -195,6 +207,7 @@ pub struct Snapshot {
     pub draft: bool,
     pub head: Head,
     pub base: String,
+    pub parent: Option<Parent>,
     pub head_age: Option<Duration>,
     pub mergeable: Mergeable,
     pub merge_state: MergeState,

@@ -80,6 +80,9 @@ pub enum Action {
         head: Head,
         base: String,
     },
+    RetargetBase {
+        to: String,
+    },
     UpdateBranch,
     Enqueue {
         head: Sha,
@@ -122,6 +125,7 @@ impl fmt::Display for Action {
             Self::ResolveConflicts { base, .. } => {
                 write!(f, "Resolving merge conflicts with {base}")
             }
+            Self::RetargetBase { to } => write!(f, "Retargeting the base to {to}"),
             Self::UpdateBranch => f.write_str("Updating the branch with its base"),
             Self::Enqueue { head } => {
                 write!(f, "Adding {} to the merge queue", &head.as_str()[..7])
@@ -221,6 +225,11 @@ const RULES: &[Rule] = &[
         eval: unhandled_items,
     },
     Rule {
+        name: "stack-retarget",
+        stage: Stage::Phase(Gate::Branch),
+        eval: stack_retarget,
+    },
+    Rule {
         name: "mergeability-unknown",
         stage: Stage::Phase(Gate::Branch),
         eval: mergeability_unknown,
@@ -259,6 +268,11 @@ const RULES: &[Rule] = &[
         name: "ci-starting",
         stage: Stage::Phase(Gate::Checks),
         eval: ci_starting,
+    },
+    Rule {
+        name: "stacked",
+        stage: Stage::Phase(Gate::Merge),
+        eval: stacked,
     },
     Rule {
         name: "in-queue",
@@ -390,8 +404,14 @@ pub fn gates(f: &Facts<'_>) -> Gates {
             let mut state = GateState::Met;
             for rule in RULES.iter().filter(|r| r.stage == Stage::Phase(phase)) {
                 if let Some(verdict) = (rule.eval)(f) {
+                    let retarget = matches!(&verdict, Verdict::Act(Action::RetargetBase { .. }));
+                    let stack_wait = phase == Gate::Merge
+                        && f.snap
+                            .parent
+                            .as_ref()
+                            .is_some_and(|p| p.state == ParentState::Open);
                     state = state.max(GateState::from_verdict(verdict));
-                    if state == GateState::Blocked {
+                    if state == GateState::Blocked || retarget || stack_wait {
                         break;
                     }
                 }
@@ -476,6 +496,14 @@ fn draft(f: &Facts<'_>) -> Option<Verdict> {
         )
     })
 }
+fn stack_retarget(f: &Facts<'_>) -> Option<Verdict> {
+    let parent = f.snap.parent.as_ref()?;
+    (parent.state == ParentState::Merged).then(|| {
+        Verdict::Act(Action::RetargetBase {
+            to: parent.base.clone(),
+        })
+    })
+}
 fn mergeability_unknown(f: &Facts<'_>) -> Option<Verdict> {
     (f.snap.mergeable == Mergeable::Unknown)
         .then(|| Verdict::Wait("Waiting for GitHub to check mergeability".into()))
@@ -533,6 +561,20 @@ fn ci_failed(f: &Facts<'_>) -> Option<Verdict> {
             )))
         }
         _ => None,
+    }
+}
+fn stacked(f: &Facts<'_>) -> Option<Verdict> {
+    let parent = f.snap.parent.as_ref()?;
+    match parent.state {
+        ParentState::Open => Some(Verdict::Wait(format!(
+            "Waiting for #{} below to merge",
+            parent.number
+        ))),
+        ParentState::Closed => Some(Verdict::Stop(format!(
+            "The PR below, #{}, was closed without merging",
+            parent.number
+        ))),
+        ParentState::Merged => None,
     }
 }
 fn in_queue(f: &Facts<'_>) -> Option<Verdict> {
@@ -993,6 +1035,7 @@ mod tests {
                         sha: sha.clone(),
                     },
                     base: "main".into(),
+                    parent: None,
                     head_age: None,
                     mergeable: Mergeable::Yes,
                     merge_state: MergeState::Clean,
@@ -1027,6 +1070,155 @@ mod tests {
                 method: MergeMethod::Squash,
             })
         }
+    }
+    #[test]
+    fn open_parent_prevents_both_direct_merge_and_enqueue() {
+        for route in [
+            MergeRoute::Direct,
+            MergeRoute::Queue {
+                method: MergeMethod::Squash,
+            },
+        ] {
+            let mut w = World::new();
+            w.snap.base = "feature/parent".into();
+            w.snap.route = route;
+            w.snap.parent = Some(Parent {
+                number: 12,
+                state: ParentState::Open,
+                base: "main".into(),
+            });
+            assert_eq!(
+                w.decision(),
+                Decision {
+                    rule: "stacked",
+                    verdict: Verdict::Wait("Waiting for #12 below to merge".into()),
+                }
+            );
+            assert_eq!(
+                w.gates().to_string(),
+                "reviews=met checks=met branch=met merge=waiting"
+            );
+            let facts = Facts {
+                snap: &w.snap,
+                local: Some(&w.local),
+                method: MergeMethod::Squash,
+            };
+            let explanation = explain(&facts);
+            let stacked = explanation
+                .lines()
+                .find(|line| line.contains("stacked"))
+                .unwrap();
+            assert!(stacked.starts_with("->"));
+            assert!(stacked.contains("wait: Waiting for #12 below to merge"));
+            let fallback = if route == MergeRoute::Direct {
+                "merge"
+            } else {
+                "enqueue"
+            };
+            assert!(explanation.contains(&format!("{fallback} (not reached)")));
+            w.snap.queue = QueueStatus::Removed {
+                reason: "checks failed".into(),
+                before_commit: Some(w.snap.head.sha.clone()),
+                removed_ago: None,
+            };
+            assert_eq!(w.decision().rule, "stacked");
+            assert_eq!(
+                w.gates().to_string(),
+                "reviews=met checks=met branch=met merge=waiting"
+            );
+        }
+    }
+
+    #[test]
+    fn open_parent_wait_takes_precedence_over_pending_reviews() {
+        let mut w = World::new();
+        w.snap.parent = Some(Parent {
+            number: 12,
+            state: ParentState::Open,
+            base: "main".into(),
+        });
+        w.snap.review_decision = Some(ReviewDecision::ReviewRequired);
+        w.snap.merge_state = MergeState::Blocked;
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "stacked",
+                verdict: Verdict::Wait("Waiting for #12 below to merge".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn merged_parent_retargets_before_mergeability_or_conflicts() {
+        for (mergeable, merge_state) in [
+            (Mergeable::Unknown, MergeState::Unknown),
+            (Mergeable::Conflicting, MergeState::Dirty),
+        ] {
+            let mut w = World::new();
+            w.snap.base = "feature/parent".into();
+            w.snap.conflict_attempts = 3;
+            w.snap.mergeable = mergeable;
+            w.snap.merge_state = merge_state;
+            w.snap.parent = Some(Parent {
+                number: 12,
+                state: ParentState::Merged,
+                base: "release/next".into(),
+            });
+            assert_eq!(
+                w.decision(),
+                Decision {
+                    rule: "stack-retarget",
+                    verdict: Verdict::Act(Action::RetargetBase {
+                        to: "release/next".into(),
+                    }),
+                }
+            );
+            assert_eq!(
+                w.gates().to_string(),
+                "reviews=met checks=pending branch=waiting merge=pending"
+            );
+            assert_eq!(
+                w.decision().verdict.to_string(),
+                "Retargeting the base to release/next"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_parent_stops_in_the_merge_phase() {
+        let mut w = World::new();
+        w.snap.parent = Some(Parent {
+            number: 12,
+            state: ParentState::Closed,
+            base: "main".into(),
+        });
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "stacked",
+                verdict: Verdict::Stop("The PR below, #12, was closed without merging".into()),
+            }
+        );
+        assert_eq!(
+            w.gates().to_string(),
+            "reviews=met checks=met branch=met merge=blocked"
+        );
+    }
+
+    #[test]
+    fn non_default_base_without_parent_merges_normally() {
+        let mut w = World::new();
+        w.snap.base = "release/next".into();
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "merge",
+                verdict: Verdict::Act(Action::Merge {
+                    head: w.snap.head.sha.clone(),
+                    method: MergeMethod::Squash,
+                }),
+            }
+        );
     }
     #[test]
     fn fresh_head_without_checks_waits_for_ci_and_reports_the_gate() {
