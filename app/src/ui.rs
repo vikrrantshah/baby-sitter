@@ -2294,7 +2294,6 @@ impl AppView {
         let shows_merged = merged || row.state == PrState::Merged;
         let stack_watched = self.config.repos.contains_key(&row.pr.repo)
             && (parents.contains_key(&row.pr) || parents.values().any(|parent| parent == &row.pr));
-        let parent_number = parents.get(&row.pr).map(|parent| parent.number);
         let menu_pr = row.pr.clone();
         let menu_url = row.url.clone();
         let view = cx.entity().downgrade();
@@ -2480,23 +2479,6 @@ impl AppView {
                             })
                             .child(place),
                     )
-                    .when_some(parent_number, |line, number| {
-                        let tooltip = format!("Stacked on #{number}. It merges after #{number}.");
-                        line.child(
-                            div()
-                                .id(SharedString::from(format!("stack-{}", row.pr)))
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .text_size(px(13.))
-                                .text_color(muted())
-                                .child(Icon::empty().path("icons/stack-16.svg").size(px(16.)))
-                                .child(format!("on #{number}"))
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(tooltip.clone()).build(window, cx)
-                                }),
-                        )
-                    })
                     .child(gate_icons(
                         &row.pr,
                         &{
