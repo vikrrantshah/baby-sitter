@@ -179,7 +179,9 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
         let past_nodes = past["nodes"]
             .as_array()
             .context("missing pastParents nodes")?;
-        let mut parents: [Option<(u64, ParentState, &str)>; 3] = [None; 3];
+        let mut parent = None;
+        let mut closed_parent = None;
+        let mut active_count = 0;
         for (is_open, parent_nodes) in [(true, open_nodes), (false, past_nodes)] {
             for node in parent_nodes {
                 let head_repository = node
@@ -198,30 +200,29 @@ pub fn parse_snapshot(json: &[u8], now: SystemTime) -> anyhow::Result<Snapshot> 
                 let state = parse_enum!(string(node, "state")?,
                     "OPEN" => ParentState::Open, "MERGED" => ParentState::Merged, "CLOSED" => ParentState::Closed);
                 let base = string(node, "baseRefName")?;
-                let priority = match (is_open, state) {
-                    (true, ParentState::Open) => 0,
-                    (false, ParentState::Merged) => 1,
-                    (false, ParentState::Closed) => 2,
+                match (is_open, state) {
+                    (true, ParentState::Open) | (false, ParentState::Merged) => {
+                        active_count += 1;
+                        parent = Some((number, state, base));
+                    }
+                    (false, ParentState::Closed) => {
+                        closed_parent.get_or_insert((number, state, base));
+                    }
                     _ => bail!("unexpected {state:?} parent in its connection"),
-                };
-                parents[priority].get_or_insert((number, state, base));
+                }
             }
         }
-        if parents[0].is_none() && open_truncated {
-            bail!("openParents is truncated (hasNextPage); refusing partial snapshot");
+        if open_truncated || past_truncated || active_count > 1 {
+            None
+        } else {
+            parent
+                .or(closed_parent)
+                .map(|(number, state, base)| Parent {
+                    number,
+                    state,
+                    base: base.into(),
+                })
         }
-        if parents[0].is_none() && parents[1].is_none() && past_truncated {
-            bail!("pastParents is truncated (hasNextPage); refusing partial snapshot");
-        }
-        parents
-            .into_iter()
-            .flatten()
-            .next()
-            .map(|(number, state, base)| Parent {
-                number,
-                state,
-                base: base.into(),
-            })
     };
     let configuration = &repository["mergeQueue"];
     let route = if configuration.is_null() {
@@ -603,7 +604,12 @@ mod tests {
             {"number":12,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}},
             {"number":13,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
         ]);
-        assert_eq!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent, None);
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .parent,
+            None
+        );
     }
 
     #[test]
@@ -616,7 +622,12 @@ mod tests {
         v["data"]["repository"]["pastParents"]["nodes"] = serde_json::json!([
             {"number":13,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
         ]);
-        assert_eq!(parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent, None);
+        assert_eq!(
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .parent,
+            None
+        );
     }
 
     #[test]
@@ -627,8 +638,14 @@ mod tests {
             {"number":12,"state":"MERGED","headRefName":"production","baseRefName":"main","headRepository":{"nameWithOwner":"cli/cli"}}
         ]);
         assert_eq!(
-            parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent,
-            Some(Parent { number: 12, state: ParentState::Merged, base: "main".into() })
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .parent,
+            Some(Parent {
+                number: 12,
+                state: ParentState::Merged,
+                base: "main".into()
+            })
         );
     }
 
@@ -682,7 +699,9 @@ mod tests {
         ]);
         v["data"]["repository"]["openParents"]["pageInfo"]["hasNextPage"] = true.into();
         assert_eq!(
-            parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent,
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .parent,
             None
         );
 
@@ -734,10 +753,11 @@ mod tests {
         ]);
         v["data"]["repository"]["pastParents"]["pageInfo"]["hasNextPage"] = true.into();
         assert_eq!(
-            parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent,
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .parent,
             None
         );
-
     }
 
     #[test]
@@ -748,7 +768,9 @@ mod tests {
             {"number":13,"state":"MERGED","baseRefName":"release/next","headRepository":{"nameWithOwner":"cli/cli"}}
         ]);
         assert_eq!(
-            parse_snapshot(&serde_json::to_vec(&v).unwrap()).unwrap().parent,
+            parse_snapshot(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .parent,
             None
         );
     }
