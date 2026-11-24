@@ -58,6 +58,11 @@ impl AssetSource for FilledAssets {
                 "../assets/icons/git-merge-queue-16.svg"
             ))));
         }
+        if path == "icons/stack-16.svg" {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/stack-16.svg"
+            ))));
+        }
         match FILLED.iter().find(|(lucide, _)| *lucide == path) {
             Some((_, svg)) => Ok(Some(Cow::Borrowed(svg))),
             None => assets::AllAssets.load(path),

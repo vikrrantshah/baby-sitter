@@ -1,8 +1,8 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, Config, Defaults, GateState, Outcome, PastSit, PrFilter, PrRef, PrRow, PrState,
-        RepoListItem, RepoName, RepoScope, RepoSettings, SitState, VerdictKind,
+        self, Config, Defaults, GateState, Outcome, PastSit, PrRef, PrRow, PrState, RepoListItem,
+        RepoName, RepoScope, RepoSettings, SitState, StateFilter, VerdictKind, WatchFilter,
     },
     notifications,
     setup::{self, CheckSpec, CheckState, Fix, Section},
@@ -86,22 +86,31 @@ enum RowAction {
     MarkReady,
     ConvertToDraft,
     Close,
+    BabysitStack,
     CopyLink,
 }
 
 impl RowAction {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::MarkReady,
         Self::ConvertToDraft,
         Self::Close,
+        Self::BabysitStack,
         Self::CopyLink,
     ];
 
-    fn menu_item(self, is_open: bool, is_draft: bool, merged: bool) -> Option<&'static str> {
+    fn menu_item(
+        self,
+        is_open: bool,
+        is_draft: bool,
+        merged: bool,
+        stack_watched: bool,
+    ) -> Option<&'static str> {
         match self {
             Self::MarkReady if is_open && is_draft && !merged => Some("Ready for review"),
             Self::ConvertToDraft if is_open && !is_draft && !merged => Some("Convert to draft"),
             Self::Close if is_open && !merged => Some("Close pull request"),
+            Self::BabysitStack if stack_watched => Some("Babysit stack"),
             Self::CopyLink => Some("Copy link"),
             _ => None,
         }
@@ -246,8 +255,8 @@ pub struct AppView {
     /// Owner login to its downloaded profile picture.
     avatars: BTreeMap<String, PathBuf>,
     scope: RepoScope,
-    pr_filter: PrFilter,
-    drafts_only: bool,
+    watch_filter: WatchFilter,
+    state_filter: StateFilter,
     dashboard_filter: Entity<SelectState<Vec<PickerChoice<RepoName>>>>,
     selected_filter: Option<RepoName>,
     app_inputs: RepoInputs,
@@ -533,8 +542,8 @@ impl AppView {
             org_filter: None,
             avatars: BTreeMap::new(),
             scope: RepoScope::All,
-            pr_filter: PrFilter::default(),
-            drafts_only: false,
+            watch_filter: WatchFilter::default(),
+            state_filter: StateFilter::default(),
             dashboard_filter,
             selected_filter: None,
             app_inputs,
@@ -941,9 +950,9 @@ impl AppView {
                     self.config.app.clear_merged_after = duration;
                     if self.save() {
                         if self.config.app.hides_merged_filter()
-                            && self.pr_filter == PrFilter::Merged
+                            && self.state_filter == StateFilter::Merged
                         {
-                            self.pr_filter = PrFilter::All;
+                            self.state_filter = StateFilter::All;
                         }
                         self.dismiss_merged_history(window, cx);
                     } else {
@@ -1271,7 +1280,7 @@ impl AppView {
             &self.config.history,
             &self.states,
             &self.config.repos,
-            PrFilter::All,
+            WatchFilter::All,
             None,
         )
         .into_iter()
@@ -1354,6 +1363,37 @@ impl AppView {
         self.update_filter(window, cx);
         cx.notify();
     }
+    fn start_stack(&mut self, pr: &PrRef, window: &mut Window, cx: &mut Context<Self>) {
+        let Load::Ready(rows) = &self.prs else {
+            return;
+        };
+        let parents = model::stack_parents(rows);
+        let stack: Vec<_> = model::stack_of(pr, &parents)
+            .into_iter()
+            .filter(|pr| {
+                rows.iter().any(|row| {
+                    row.pr == *pr
+                        && matches!(row.state, PrState::Draft | PrState::Ready | PrState::Queued)
+                })
+            })
+            .collect();
+        let mut count = 0;
+        for pr in stack {
+            if !self.config.repos.contains_key(&pr.repo)
+                || self.states.get(&pr).is_some_and(SitState::is_active)
+            {
+                continue;
+            }
+            self.start(pr.clone(), window, cx);
+            if self.states.get(&pr).is_some_and(SitState::is_active) {
+                count += 1;
+            }
+        }
+        window.push_notification(
+            Notification::success(format!("Started {count} babysits in the stack")),
+            cx,
+        );
+    }
     fn remove_worktree(&mut self, pr: PrRef, window: &mut Window, cx: &mut Context<Self>) {
         if self.removal_tasks.contains_key(&pr) {
             return;
@@ -1432,8 +1472,8 @@ impl AppView {
         if !self.save() {
             self.config.app.auto_dismiss_merged = previous;
         } else if checked {
-            if self.config.app.hides_merged_filter() && self.pr_filter == PrFilter::Merged {
-                self.pr_filter = PrFilter::All;
+            if self.config.app.hides_merged_filter() && self.state_filter == StateFilter::Merged {
+                self.state_filter = StateFilter::All;
             }
             self.dismiss_merged_history(window, cx);
         }
@@ -2164,7 +2204,7 @@ impl AppView {
             &self.config.history,
             &self.states,
             &self.config.repos,
-            PrFilter::All,
+            WatchFilter::All,
             self.selected_filter.as_ref(),
         )
         .into_iter()
@@ -2179,7 +2219,13 @@ impl AppView {
         .filter(|row| !self.closed_prs.contains_key(&row.pr))
         .collect()
     }
-    fn pr_row(&self, row: &PrRow, last: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn pr_row(
+        &self,
+        row: &PrRow,
+        last: bool,
+        parents: &BTreeMap<PrRef, PrRef>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let state = self.states.get(&row.pr);
         let reading = self.reading(&row.pr);
         let active = state.is_some_and(SitState::is_active);
@@ -2245,6 +2291,9 @@ impl AppView {
         let is_draft = row.state == PrState::Draft;
         let merged = reading.merged;
         let shows_merged = merged || row.state == PrState::Merged;
+        let stack_watched = self.config.repos.contains_key(&row.pr.repo)
+            && (parents.contains_key(&row.pr) || parents.values().any(|parent| parent == &row.pr));
+        let parent_number = parents.get(&row.pr).map(|parent| parent.number);
         let menu_pr = row.pr.clone();
         let menu_url = row.url.clone();
         let view = cx.entity().downgrade();
@@ -2260,7 +2309,7 @@ impl AppView {
         .dropdown_menu(move |mut menu, _, _| {
             menu = menu.min_w(px(200.));
             for action in RowAction::ALL {
-                if let Some(label) = action.menu_item(is_open, is_draft, merged) {
+                if let Some(label) = action.menu_item(is_open, is_draft, merged, stack_watched) {
                     let pr = menu_pr.clone();
                     let url = menu_url.clone();
                     let view = view.clone();
@@ -2276,6 +2325,7 @@ impl AppView {
                             "icons/git-pull-request-closed.svg",
                             pr_state_color(PrState::Closed),
                         ),
+                        RowAction::BabysitStack => ("icons/stack-16.svg", muted()),
                         RowAction::CopyLink => ("icons/link.svg", muted()),
                     };
                     let item = PopupMenuItem::element(move |_, _| {
@@ -2306,6 +2356,7 @@ impl AppView {
                                     cx,
                                 ),
                                 RowAction::Close => this.ask_close(pr.clone(), window, cx),
+                                RowAction::BabysitStack => this.start_stack(&pr, window, cx),
                                 RowAction::CopyLink => {}
                             });
                         }
@@ -2428,6 +2479,23 @@ impl AppView {
                             })
                             .child(place),
                     )
+                    .when_some(parent_number, |line, number| {
+                        let tooltip = format!("Stacked on #{number}. It merges after #{number}.");
+                        line.child(
+                            div()
+                                .id(SharedString::from(format!("stack-{}", row.pr)))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_size(px(13.))
+                                .text_color(muted())
+                                .child(Icon::empty().path("icons/stack-16.svg").size(px(16.)))
+                                .child(format!("on #{number}"))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tooltip.clone()).build(window, cx)
+                                }),
+                        )
+                    })
                     .child(gate_icons(
                         &row.pr,
                         &{
@@ -2556,14 +2624,17 @@ impl AppView {
     }
     fn render_dashboard(&self, cx: &mut Context<Self>) -> (Div, Div) {
         let mut rows = self.dashboard_rows();
-        if self.drafts_only {
-            model::only_drafts(&mut rows);
-        }
-        let counts = model::pr_counts(&rows, &self.states);
+        let watch_counts = model::watch_counts(&rows, &self.states, self.state_filter);
+        let state_counts = model::state_counts(&rows, &self.states, self.watch_filter);
         rows.retain(|row| {
-            self.pr_filter
-                .admits(model::pr_status(self.states.get(&row.pr)))
+            let sit = self.states.get(&row.pr);
+            self.watch_filter.admits(sit) && self.state_filter.admits(row, sit)
         });
+        let parents = match &self.prs {
+            Load::Ready(prs) => model::stack_parents(prs),
+            _ => BTreeMap::new(),
+        };
+        let rows = model::order_stacks(rows, &parents);
         let list = match &self.prs {
             Load::Loading if rows.is_empty() => message("Loading pull requests…", None),
             Load::Error(error) if rows.is_empty() => {
@@ -2571,9 +2642,13 @@ impl AppView {
                     .child(Self::retry_prs_button(cx))
             }
             _ if rows.is_empty() => {
-                if self.drafts_only {
+                if self.state_filter == StateFilter::Drafts {
                     message("No draft pull requests", None)
-                } else if self.pr_filter == PrFilter::All && self.config.repos.is_empty() {
+                } else if self.state_filter == StateFilter::Merged {
+                    message("No merged pull requests", None)
+                } else if self.state_filter == StateFilter::Open {
+                    message("No open pull requests", None)
+                } else if self.watch_filter == WatchFilter::All && self.config.repos.is_empty() {
                     message(
                         "No watched repositories",
                         Some("Watch a repository to see its pull requests.".into()),
@@ -2593,22 +2668,15 @@ impl AppView {
                         Some("Choose All repositories to see the rest.".into()),
                     )
                 } else {
-                    match self.pr_filter {
-                        PrFilter::Watched => message(
+                    match self.watch_filter {
+                        WatchFilter::Watched => message(
                             "Nothing is being babysat",
                             Some("Press play on a pull request to start.".into()),
                         ),
-                        PrFilter::Unwatched => {
+                        WatchFilter::Unwatched => {
                             message("Every listed pull request is being babysat", None)
                         }
-                        PrFilter::Merged => message(
-                            "No merged babysits",
-                            Some(
-                                "Babysat PRs appear here after they merge and stay until you dismiss them."
-                                    .into(),
-                            ),
-                        ),
-                        PrFilter::All => message("No open pull requests", None),
+                        WatchFilter::All => message("No open pull requests", None),
                     }
                 }
             }
@@ -2632,11 +2700,9 @@ impl AppView {
                         .overflow_y_scroll()
                         .flex()
                         .flex_col()
-                        .children(
-                            rows.iter()
-                                .enumerate()
-                                .map(|(index, row)| self.pr_row(row, index + 1 == rows.len(), cx)),
-                        ),
+                        .children(rows.iter().enumerate().map(|(index, row)| {
+                            self.pr_row(row, index + 1 == rows.len(), &parents, cx)
+                        })),
                 )
             }
         };
@@ -2694,22 +2760,52 @@ impl AppView {
                         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
                     ),
             );
-        let filter = ButtonGroup::new("pr-filter")
+        let watch_filter = ButtonGroup::new("watch-filter")
+            .with_size(Size::Medium)
+            .outline()
+            .children(watch_counts.into_iter().map(|(filter, count)| {
+                let (id, label) = match filter {
+                    WatchFilter::All => ("watch-filter-all", "All"),
+                    WatchFilter::Watched => ("watch-filter-watched", "Watched"),
+                    WatchFilter::Unwatched => ("watch-filter-unwatched", "Unwatched"),
+                };
+                let selected = self.watch_filter == filter;
+                Button::new(id).selected(selected).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_color(if selected { accent() } else { muted() })
+                        .when(selected, |d| d.font_semibold())
+                        .child(label)
+                        .when(count > 0, |d| d.child(count.to_string())),
+                )
+            }))
+            .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                if let Some(filter) = selected
+                    .first()
+                    .and_then(|index| WatchFilter::ALL.get(*index))
+                {
+                    this.watch_filter = *filter;
+                    cx.notify();
+                }
+            }));
+        let state_filter = ButtonGroup::new("state-filter")
             .with_size(Size::Medium)
             .outline()
             .children(
-                PrFilter::visible(self.config.app.hides_merged_filter())
+                StateFilter::visible(self.config.app.hides_merged_filter())
                     .iter()
                     .copied()
-                    .zip(counts)
+                    .zip(state_counts)
                     .map(|(filter, (_, count))| {
                         let (id, label) = match filter {
-                            PrFilter::All => ("pr-filter-all", "All"),
-                            PrFilter::Watched => ("pr-filter-watched", "Watched"),
-                            PrFilter::Unwatched => ("pr-filter-unwatched", "Unwatched"),
-                            PrFilter::Merged => ("pr-filter-merged", "Merged"),
+                            StateFilter::All => ("state-filter-all", "All"),
+                            StateFilter::Open => ("state-filter-open", "Open"),
+                            StateFilter::Drafts => ("state-filter-drafts", "Drafts"),
+                            StateFilter::Merged => ("state-filter-merged", "Merged"),
                         };
-                        let selected = self.pr_filter == filter;
+                        let selected = self.state_filter == filter;
                         Button::new(id).selected(selected).child(
                             div()
                                 .flex()
@@ -2724,9 +2820,9 @@ impl AppView {
             )
             .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
                 if let Some(filter) = selected.first().and_then(|index| {
-                    PrFilter::visible(this.config.app.hides_merged_filter()).get(*index)
+                    StateFilter::visible(this.config.app.hides_merged_filter()).get(*index)
                 }) {
-                    this.pr_filter = *filter;
+                    this.state_filter = *filter;
                     cx.notify();
                 }
             }));
@@ -2745,34 +2841,8 @@ impl AppView {
                 "All repositories",
                 Size::Medium,
             ))
-            .child(filter)
-            .child(
-                div()
-                    .flex()
-                    .self_stretch()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .id("drafts-only-label")
-                            .cursor_pointer()
-                            .text_color(muted())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.drafts_only = !this.drafts_only;
-                                cx.notify();
-                            }))
-                            .child("Drafts only"),
-                    )
-                    .child(
-                        Switch::new("drafts-only")
-                            .accessibility_label("Drafts only")
-                            .checked(self.drafts_only)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.drafts_only = *checked;
-                                cx.notify();
-                            })),
-                    ),
-            );
+            .child(watch_filter)
+            .child(state_filter);
         let body = div()
             .size_full()
             .flex()
@@ -3659,7 +3729,7 @@ mod row_action_tests {
         let labels = |open, draft, merged| {
             RowAction::ALL
                 .into_iter()
-                .filter_map(|action| action.menu_item(open, draft, merged))
+                .filter_map(|action| action.menu_item(open, draft, merged, false))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -3672,5 +3742,13 @@ mod row_action_tests {
         );
         assert_eq!(labels(false, false, true), ["Copy link"]);
         assert_eq!(labels(false, false, false), ["Copy link"]);
+        assert_eq!(
+            RowAction::BabysitStack.menu_item(true, false, false, true),
+            Some("Babysit stack")
+        );
+        assert_eq!(
+            RowAction::BabysitStack.menu_item(true, false, false, false),
+            None
+        );
     }
 }

@@ -101,11 +101,11 @@ mod tests {
     fn graphql_search_parses_all_pull_request_states() {
         let fixture = r#"[
           {"data":{"search":{"nodes":[
-            {"number":1,"title":"draft","url":"https://example.com/1","isDraft":true,"isInMergeQueue":false,"state":"OPEN","updatedAt":"1","repository":{"nameWithOwner":"owner/repo"}},
-            {"number":2,"title":"ready","url":"https://example.com/2","isDraft":false,"isInMergeQueue":false,"state":"OPEN","updatedAt":"2","repository":{"nameWithOwner":"owner/repo"}},
-            {"number":3,"title":"queued","url":"https://example.com/3","isDraft":true,"isInMergeQueue":true,"state":"OPEN","updatedAt":"3","repository":{"nameWithOwner":"owner/repo"}},
-            {"number":4,"title":"merged","url":"https://example.com/4","isDraft":true,"isInMergeQueue":true,"state":"MERGED","updatedAt":"4","repository":{"nameWithOwner":"owner/repo"}},
-            {"number":5,"title":"closed","url":"https://example.com/5","isDraft":true,"isInMergeQueue":true,"state":"CLOSED","updatedAt":"5","repository":{"nameWithOwner":"owner/repo"}}
+            {"number":1,"title":"draft","url":"https://example.com/1","baseRefName":"main","headRefName":"branch-1","isDraft":true,"isInMergeQueue":false,"state":"OPEN","updatedAt":"1","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":2,"title":"ready","url":"https://example.com/2","baseRefName":"branch-1","headRefName":"branch-2","isDraft":false,"isInMergeQueue":false,"state":"OPEN","updatedAt":"2","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":3,"title":"queued","url":"https://example.com/3","baseRefName":"main","headRefName":"branch-3","isDraft":true,"isInMergeQueue":true,"state":"OPEN","updatedAt":"3","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":4,"title":"merged","url":"https://example.com/4","baseRefName":"main","headRefName":"branch-4","isDraft":true,"isInMergeQueue":true,"state":"MERGED","updatedAt":"4","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":5,"title":"closed","url":"https://example.com/5","baseRefName":"main","headRefName":"branch-5","isDraft":true,"isInMergeQueue":true,"state":"CLOSED","updatedAt":"5","repository":{"nameWithOwner":"owner/repo"}}
           ]}}}
         ]"#;
         let rows = parse_pr_search(fixture.as_bytes()).unwrap();
@@ -119,6 +119,7 @@ mod tests {
                 PrState::Closed
             ]
         );
+        assert_eq!((&*rows[1].base, &*rows[1].head), ("branch-1", "branch-2"));
     }
 }
 
@@ -215,7 +216,7 @@ const PR_SEARCH_QUERY: &str = r#"query($endCursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
-        number title url isDraft isInMergeQueue state updatedAt
+        number title url baseRefName headRefName isDraft isInMergeQueue state updatedAt
         repository { nameWithOwner }
       }
     }
@@ -246,6 +247,10 @@ struct SearchPr {
     title: String,
     repository: SearchRepo,
     url: String,
+    #[serde(rename = "baseRefName")]
+    base: String,
+    #[serde(rename = "headRefName")]
+    head: String,
     #[serde(rename = "isDraft")]
     is_draft: bool,
     #[serde(rename = "isInMergeQueue")]
@@ -274,6 +279,8 @@ fn parse_pr_search(bytes: &[u8]) -> Result<Vec<PrRow>> {
             },
             title: row.title,
             url: row.url,
+            base: row.base,
+            head: row.head,
             state: match row.state {
                 SearchPrState::Merged => PrState::Merged,
                 SearchPrState::Closed => PrState::Closed,
