@@ -2671,7 +2671,7 @@ impl AppView {
                 cx.notify();
             }))
     }
-    fn render_dashboard(&self, cx: &mut Context<Self>) -> (Div, Div) {
+    fn render_dashboard(&self, fullscreen: bool, cx: &mut Context<Self>) -> (Div, Div) {
         let mut rows = self.dashboard_rows();
         let query = self.search.read(cx).value().to_string();
         rows.retain(|row| model::matches_search(row, &query));
@@ -2768,7 +2768,7 @@ impl AppView {
         let header = div()
             .flex_shrink_0()
             .h(px(50.))
-            .pl(px(86.))
+            .pl(px(if fullscreen { ROW_INSET } else { 86. }))
             .pr(px(ROW_INSET))
             .flex()
             .items_center()
@@ -3735,7 +3735,7 @@ impl Render for AppView {
             self.page = Page::Settings(SettingsPage::Repositories);
         }
         let (header, body) = match &self.page {
-            Page::PullRequests => self.render_dashboard(cx),
+            Page::PullRequests => self.render_dashboard(window.is_fullscreen(), cx),
             Page::Settings(SettingsPage::Repositories) => self.render_repos(cx),
             Page::Settings(SettingsPage::App) => self.render_app_settings(cx),
             Page::Settings(SettingsPage::Prompts) => self.render_prompts(cx),
