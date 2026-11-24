@@ -234,7 +234,7 @@ struct Reading {
 }
 
 const SIDEBAR_WIDTH: f32 = 232.;
-const ROW_INSET: f32 = 32.;
+const ROW_INSET: f32 = 20.;
 const REPO_ROW_HEIGHT: f32 = 56.;
 const SETTINGS_LABEL_WIDTH: f32 = 120.;
 const SETTINGS_COLUMN_GAP: f32 = 24.;
@@ -2894,6 +2894,7 @@ impl AppView {
         let filters = div()
             .flex_shrink_0()
             .px(px(ROW_INSET))
+            .pt(px(12.))
             .pb(px(16.))
             .border_b_1()
             .border_color(divider())
