@@ -250,7 +250,7 @@ fn notifications_state(access: NotificationAccess) -> CheckState {
         }
         NotificationAccess::NotDetermined => {
             return CheckState::Missing {
-                detail: "Notification access has not been requested yet".into(),
+                detail: "Baby Sitter has not requested notification access yet".into(),
                 fix: Fix::AllowNotifications,
             };
         }
@@ -266,7 +266,7 @@ fn notifications_state(access: NotificationAccess) -> CheckState {
         NotificationAccess::Allowed {
             banners: true,
             notification_center: false,
-        } => "Notifications are allowed, but hidden from Notification Center",
+        } => "Notifications are allowed, but Notification Center does not show them",
         NotificationAccess::Allowed {
             banners: false,
             notification_center: false,
@@ -347,7 +347,7 @@ mod tests {
                     banners: true,
                     notification_center: false,
                 },
-                settings("Notifications are allowed, but hidden from Notification Center"),
+                settings("Notifications are allowed, but Notification Center does not show them"),
             ),
             (
                 NotificationAccess::Allowed {
@@ -363,7 +363,7 @@ mod tests {
             (
                 NotificationAccess::NotDetermined,
                 CheckState::Missing {
-                    detail: "Notification access has not been requested yet".into(),
+                    detail: "Baby Sitter has not requested notification access yet".into(),
                     fix: Fix::AllowNotifications,
                 },
             ),

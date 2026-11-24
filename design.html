@@ -55,8 +55,8 @@ flowchart TD
   PRE -- no --> C{{"1 · Comments<br/>fixed threads open or threads unanswered?"}}
   C -- yes --> CA["Resolve fixed threads, or have Codex<br/>edit code and reply, then push"] --> NEXT
   C -- no --> B{{"2 · Branch<br/>mergeability unknown, conflicts, or behind base?"}}
-  B -- unknown --> WAIT["Wait --interval"] --> NEXT
-  B -- conflicts --> BC["Merge the base, have Codex resolve,<br/>commit and push"] --> NEXT
+  B -- unknown --> WAIT["Wait for --interval"] --> NEXT
+  B -- conflicts --> BC["Merge the base, have Codex resolve conflicts,<br/>commit and push"] --> NEXT
   B -- "behind, direct merge" --> BU["Update branch"] --> NEXT
   B -- no --> K{{"3 · Checks<br/>CI failed, cancelled, pending, or not started?"}}
   K -- "cancelled only" --> KR["Rerun the runs"] --> NEXT
@@ -83,9 +83,9 @@ flowchart TD
     <div class="card">
       <h2>Known limits</h2>
       <ol>
-        <li><b>Failing CI and conflicts.</b> Codex attempts code fixes and conflict resolutions. The run stops when a problem needs a person or the fix limit is reached.</li>
+        <li><b>Failing CI and conflicts.</b> Codex attempts code fixes and conflict resolutions. The run stops when a problem needs a person or reaches the fix limit.</li>
         <li><b>Declined and needs_human threads.</b> They stay open, and the merge waits until a person replies or resolves them.</li>
-        <li><b>Lost re-review request.</b> If a run crashes after it posts replies, the request is not retried. The merge still waits on the review decision.</li>
+        <li><b>Lost re-review request.</b> If a run crashes after it posts replies, the binary does not request the re-review again. The merge still waits on the review decision.</li>
         <li><b>Large PRs.</b> More than 100 threads, comments in a thread, reviews, review requests, or checks stops the run.</li>
         <li><b>Queued feedback.</b> The run handles new review feedback while the PR is queued. A push removes the PR from the queue.</li>
       </ol>

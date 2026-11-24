@@ -19,20 +19,20 @@ use std::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "baby-sitter", about = "Help a GitHub PR reach a merged state")]
+#[command(name = "baby-sitter", about = "Help merge a GitHub PR")]
 struct Cli {
-    /// PR number or URL. Defaults to the PR for the current branch.
+    /// PR number or URL. Uses the PR for the current branch by default.
     pr: Option<String>,
     /// Print the current decision without applying it.
     #[arg(long)]
     dry_run: bool,
-    /// Method to use when merging.
+    /// Method to use to merge the PR.
     #[arg(long, value_enum, default_value_t = MergeMethod::Squash)]
     merge_method: MergeMethod,
     /// Order in which stacked PRs merge.
     #[arg(long, value_enum, default_value_t = StackMode::BottomUp)]
     stack: StackMode,
-    /// Whole-run deadline, for example 90s, 10m, or 2h.
+    /// Deadline for the entire run, for example 90s, 10m, or 2h.
     #[arg(long, default_value = "2h", value_parser = parse_duration)]
     timeout: Duration,
     /// Time between snapshots while waiting.

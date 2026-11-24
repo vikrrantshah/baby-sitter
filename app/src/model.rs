@@ -647,7 +647,7 @@ pub fn order_stacks<'a>(
     ordered
 }
 
-/// Which neighbouring rows a row's stack line reaches.
+/// Records which neighbouring rows a row's stack line reaches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackRail {
     pub up: bool,
@@ -812,7 +812,7 @@ pub enum VerdictKind {
     Wait,
     Act,
 }
-/// One `[rule] verdict` line the CLI prints per pass.
+/// Holds one `[rule] verdict` line the CLI prints per pass.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Pass<'a> {
     pub kind: VerdictKind,

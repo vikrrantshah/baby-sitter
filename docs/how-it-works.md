@@ -24,8 +24,8 @@ flowchart TD
   PRE -- no --> C{{"1 · Comments<br/>fixed threads open or threads unanswered?"}}
   C -- yes --> CA["Resolve fixed threads, or have Codex<br/>edit code and reply, then push"] --> NEXT
   C -- no --> B{{"2 · Branch<br/>mergeability unknown, conflicts, or behind base?"}}
-  B -- unknown --> WAIT["Wait --interval"] --> NEXT
-  B -- conflicts --> BC["Merge the base, have Codex resolve,<br/>commit and push"] --> NEXT
+  B -- unknown --> WAIT["Wait for --interval"] --> NEXT
+  B -- conflicts --> BC["Merge the base, have Codex resolve conflicts,<br/>commit and push"] --> NEXT
   B -- "behind, direct merge" --> BU["Update branch"] --> NEXT
   B -- no --> K{{"3 · Checks<br/>CI failed, cancelled, pending, or not started?"}}
   K -- "cancelled only" --> KR["Rerun the runs"] --> NEXT
@@ -55,22 +55,22 @@ The rules live in `RULES` in `src/decide.rs`, grouped as preconditions and then 
 
 ## Stacks land bottom up or top down
 
-GitHub has no stack object. A PR is stacked when its base branch is the head branch of another PR in the same repository, its parent. Each snapshot looks up that parent with `pullRequests(headRefName: <base>)` and prefers an open parent, then a merged one, then a closed one. It also lists the open PRs based on this PR's own branch, its children, with `pullRequests(baseRefName: <head>)`. A PR whose head is in a fork has no children, because a same-named branch in the base repository is a different branch.
+GitHub has no stack object. A PR is stacked when its base branch is the head branch of another PR in the same repository. That other PR is its parent. Each snapshot looks up the parent with `pullRequests(headRefName: <base>)`. It prefers an open parent, then a merged one, then a closed one. The snapshot also lists the open PRs based on this PR's own branch with `pullRequests(baseRefName: <head>)`. These are its children. A PR whose head is in a fork has no children, because a same-named branch in the base repository is a different branch.
 
 `--stack bottom-up`, the default, lands each PR on its parent's base in turn.
 
 - While the parent is open, `stacked` holds the PR in the Merge phase. Without it, the merge route would be direct, because the parent's branch has no merge queue, and the PR would merge into the parent's branch.
-- When the parent has merged, `stack-retarget` runs `gh pr edit --base <parent's base>`. GitHub does the same itself when the repository deletes branches on merge, so the rule only acts when GitHub has not. The next pass sees the new base and continues with the usual Branch, Checks, and Merge phases.
+- When the parent has merged, `stack-retarget` runs `gh pr edit --base <parent's base>`. GitHub does the same when the repository deletes branches on merge, so the rule acts only when GitHub has not. The next pass sees the new base and continues with the usual Branch, Checks, and Merge phases.
 
-`--stack top-down` folds the stack into its bottom PR, which lands once.
+`--stack top-down` merges the stack into its bottom PR, which lands once.
 
-- While any child is open, `stack-above` holds the PR in the Merge phase with "Waiting for #N above to merge". This holds the bottom PR too. Merging a PR while a child is still open would leave the child's work on a branch nobody merges.
+- While any child is open, `stack-above` holds the PR in the Merge phase with a message such as "Waiting for #12 above to merge". This holds the bottom PR too. Merging a PR while a child is still open would leave the child's work on a branch nobody merges.
 - With no open child, the PR merges into its parent's branch through the usual direct route. That merge moves the parent's head, so the parent's CI runs again on the combined change.
 - The bottom PR then has no open child and lands on the default branch through the usual route, merge queue included.
 
-In both modes, `stacked` stops the run when the parent was closed without merging, because merging into an abandoned branch lands nothing. A merged parent is retargeted in both modes. A PR whose base is not another PR's branch, such as a release branch, merges into that base as usual.
+In both modes, `stacked` stops the run when the parent was closed without merging, because merging into an abandoned branch lands nothing. Both modes retarget a PR when its parent has merged. A PR whose base is not another PR's branch, such as a release branch, merges into that base as usual.
 
-`stack-retarget`, `stacked` and `stack-above` all read one value, `stack_gate`, so at most one of them fires per pass and the `[gates]` line agrees with the decision.
+`stack-retarget`, `stacked`, and `stack-above` all read one value, `stack_gate`. At most one of them fires per pass, and the `[gates]` line agrees with the decision.
 
 ## Review threads get replies in place
 
@@ -137,7 +137,7 @@ The binary merges only when all of these are true:
 
 The merge passes `--match-head-commit` with the snapshot's SHA. If someone pushes in between, GitHub rejects the merge and the next pass starts over.
 
-With a merge queue, the binary enqueues the snapshot's head SHA and the queue's merge method applies. While the PR is queued, the run keeps checking the earlier phases. Handling a new review comment pushes a commit, which removes the PR from the queue, and the new head is enqueued once the earlier phases are green again. If the queue removes the current head without merging it, the run stops with the queue's reason.
+With a merge queue, the binary enqueues the snapshot's head SHA and the queue's merge method applies. While the PR is queued, the run keeps checking the earlier phases. Handling a new review comment pushes a commit, which removes the PR from the queue. The binary enqueues the new head once the earlier phases are green again. If the queue removes the current head without merging it, the run stops with the queue's reason.
 
 ## A crashed run restarts where it left off
 
@@ -155,13 +155,13 @@ A lock file at `$(git rev-parse --git-dir)/baby-sitter/pr-<n>.lock` stops a seco
 
 The app keeps its configuration, one clone per repository, and one worktree per PR in `~/Library/Application Support/baby-sitter`. It runs `baby-sitter --gates` in the PR's worktree and reads the phase icons and status from its output. Child processes get the `PATH` from your login shell, so version-managed tools such as `nvm` work when the app opens from Finder.
 
-When a babysit starts, the app runs the repository's **Setup command**, if one is set and has not finished in that PR's worktree yet, as `/bin/sh -c "<command>"` in the worktree with the same `PATH`. It runs after the app releases the repository lock, so a long install does not hold up other babysits in the same repository. A stop or the deadline ends it like any other babysit step. After it succeeds, the app records the command under `setup/` in its data folder, outside the worktree, so later starts skip it until the command changes or the worktree is removed. A setup cut short by a quit or crash runs again on the next start. If it fails, the babysit stops with the command's last error line and the app removes the new worktree, so the next start creates the worktree and runs the setup again. The setup command is the only package install: the binary does not install dependencies itself.
+When a babysit starts, the app runs the repository's **Setup command** in the PR's worktree if one is set and has not finished there yet. It runs the command as `/bin/sh -c "<command>"` with the same `PATH`. The app releases the repository lock before running the command, so a long install does not hold up other babysits in the same repository. A stop or the deadline ends it like any other babysit step. After it succeeds, the app records the command under `setup/` in its data folder, outside the worktree. Later starts skip it until the command changes or the app removes the worktree. A setup cut short by a quit or crash runs again on the next start. If it fails, the babysit stops with the command's last error line and the app removes the new worktree. The next start creates the worktree and runs the setup again. The setup command is the only package install. The binary does not install dependencies itself.
 
 Stopping a babysit sends `SIGTERM` to its process group and sends `SIGKILL` to whatever is still running 10 seconds later. Quitting the app stops every babysit, and the next launch restarts them with their original deadlines.
 
 After a merge, the app removes the worktree. After any other outcome, it keeps the worktree until you dismiss the row. Dismiss moves the worktree into a trash folder at once and deletes it in the background, so a large `node_modules` never blocks a restart. The app clears leftover trash at launch.
 
-**Settings > Status** runs these checks at launch, when you select **Check again**, and when the window comes back to the front while the page is open, with the same `PATH` babysits use. Each command has a 10-second limit. While the page is open, the notifications check also repeats every second, because macOS does not announce changes to notification settings. Turning notifications on or off in System Settings updates the row within a second.
+**Settings > Status** runs these checks at launch, when you select **Check again**, and when the window comes back to the front while the page is open. The checks use the same `PATH` as babysits. Each command has a 10-second limit. While the page is open, the notifications check also repeats every second, because macOS does not announce changes to notification settings. Turning notifications on or off in System Settings updates the row within a second.
 
 | Check | Required | Passes when |
 |---|---|---|

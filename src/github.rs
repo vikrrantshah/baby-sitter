@@ -236,7 +236,7 @@ fn check_snapshot_refs(response: &serde_json::Value, base: &str, head: &str) -> 
     Ok(())
 }
 
-/// Actions logs carry ANSI color codes; they waste prompt space and can drive a terminal.
+/// Actions logs carry ANSI color codes that waste prompt space and can control a terminal.
 fn strip_terminal_escapes(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();

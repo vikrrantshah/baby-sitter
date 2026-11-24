@@ -164,7 +164,7 @@ fn output(mut command: Command) -> Result<Vec<u8>> {
 }
 
 /// Downloads the owner's GitHub profile picture once into `dir/avatars`.
-/// GPUI here has no HTTP client for remote images, so the UI loads the file.
+/// GPUI has no HTTP client for remote images here, so the UI loads the file.
 pub fn avatar(env: &ChildEnv, dir: &Path, owner: &str) -> Option<PathBuf> {
     let path = dir.join("avatars").join(format!("{owner}.png"));
     if path.is_file() {

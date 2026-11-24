@@ -578,7 +578,7 @@ impl Runner {
         }
         if head.is_cross_repository {
             return Ok(Preparation::Finished(Outcome::Failed(
-                "fork PRs are not supported".into(),
+                "Baby Sitter does not support fork PRs".into(),
             )));
         }
         self.prepare_worktree(&head.head_ref_name)?;
@@ -652,8 +652,8 @@ impl Runner {
         }
         Ok(())
     }
-    /// Runs the repository's setup command unless this worktree already finished the same
-    /// command, so a setup cut short by a quit or crash runs again on the next start.
+    /// Runs the repository's setup command unless it already finished in this worktree.
+    /// If a quit or crash interrupts setup, the next start runs it again.
     fn setup(&self) -> Option<Outcome> {
         let setup = self.settings.setup_command.as_deref()?;
         let marker = setup_marker(&self.data, &self.pr);

@@ -35,21 +35,21 @@ The bundle contains both binaries. For development, `cargo build --workspace && 
 
 ## Babysit pull requests with the app
 
-1. Open **Settings** with Cmd+, and select **Status**. Every required check should be green. A red check names the command that fixes it, such as `gh auth login` or `codex login`. While a required check fails, the Pull requests page shows a banner that links here. Under **Permissions**, allow notifications so you hear when a babysit merges or needs you. Baby Sitter needs no other macOS permission.
+1. Open **Settings** with Cmd+, and select **Status**. Every required check should be green. A red check names the command that fixes it, such as `gh auth login` or `codex login`. While a required check fails, the Pull requests page shows a banner that links to **Status**. Under **Permissions**, allow notifications so you hear when a babysit merges or needs you. Baby Sitter needs no other macOS permission.
 2. Select **Repositories** and turn on the repositories you want to babysit.
 3. On **Pull requests**, press play on a PR. Its row shows the four phases and what the babysitter is doing now.
 4. Wait for the notification. A babysit ends when the PR merges, when its timeout passes, or when it needs you, and the row then shows the reason.
 5. Dismiss a finished row to delete its worktree.
 
-The search box finds PRs by number or title. Digits, with or without a leading `#`, match PR numbers that start with them, and any text matches titles regardless of case. The repository picker next to the refresh button limits the list to one repository. Two filter groups narrow the list further. The first shows All, Watched, or Unwatched PRs. Watched covers running babysits and PRs whose babysit ended with a merge. The second shows All, Open, Drafts, or Merged PRs, where Open means ready for review or queued. Each button's count follows the search and the other group's selection.
+The search box finds PRs by number or title. Digits, with or without a leading `#`, match PR numbers that start with them. Every search also matches titles, ignoring case. The repository picker next to the refresh button limits the list to one repository. Two filter groups narrow the list further. The first shows All, Watched, or Unwatched PRs. Watched covers running babysits and PRs whose babysit ended with a merge. The second shows All, Open, Drafts, or Merged PRs. Open means ready for review or queued. Each button's count follows the search and the other group's selection.
 
 Each row also has a **More actions** menu to mark a draft ready for review, convert a PR to draft, close it, or copy its link.
 
 **Settings > App** holds the defaults for every repository. The timeout and draft timeout are both `2h`, and the interval between checks is `30s`. To override a value for one repository, use the gear next to that repository. **Auto-dismiss merged PRs** clears merged rows and their worktrees after the **Clear after** delay.
 
-A repository's gear also sets its **Setup command**, such as `pnpm install`. Baby Sitter runs it in a PR's worktree before the babysit starts, once per worktree. A finished setup is not repeated unless you change the command. It is the only package install, so set it for any repository whose checks need dependencies. If the command fails, the babysit stops with its error and the worktree is removed, so the next start runs the setup again.
+A repository's gear also sets its **Setup command**, such as `pnpm install`. Baby Sitter runs it once in each PR worktree before the babysit starts. A finished setup does not run again unless you change the command. It is the only package install, so set it for any repository whose checks need dependencies. If the command fails, the babysit stops with its error and the app removes the worktree. The next start runs the setup again.
 
-**Settings > Prompts** lets you replace the instructions Codex gets for review threads, failing CI, and merge conflicts. Turn on **Custom review prompt**, **Custom CI fix prompt**, or **Custom conflict prompt**, edit the text, and select **Save**. Until you save, the default prompt applies. Turning a toggle off restores the default and keeps your text for later. Running babysits use the change at their next Codex call. Your text replaces only the instructions. Baby Sitter still adds the threads, checks, or conflicted files, and its safety checks apply whatever the text says.
+**Settings > Prompts** lets you replace the instructions Codex gets for review threads, failing CI, and merge conflicts. Turn on **Custom review prompt**, **Custom CI fix prompt**, or **Custom conflict prompt**, edit the text, and select **Save**. Until you save, the default prompt applies. Turning a toggle off restores the default and keeps your text for later. Running babysits use the change at their next Codex call. Your text replaces only the instructions. Baby Sitter still adds the threads, checks, or conflicted files, and its safety checks apply regardless of the text.
 
 Quitting the app stops every babysit. The next launch restarts them with their original deadlines.
 
@@ -97,8 +97,8 @@ A phase starts only when every earlier phase is done. If an earlier phase slips,
 
 A PR is stacked when its base branch is another PR's branch, the PR below it. A stack lands in one of two ways.
 
-- **Bottom up**, the default. Baby Sitter never merges a stacked PR into the PR below. Its babysit handles comments, branch updates, and CI as usual, then waits with "Waiting for #N below to merge". When the PR below merges, Baby Sitter moves the stacked PR onto that PR's base, if GitHub has not already done so, merges the new base in, waits for CI, and merges. Each PR lands on its own, one at a time.
-- **Top down.** Each PR waits with "Waiting for #N above to merge" while a PR is stacked on it. The top PR merges into the PR below it, then that PR merges into the one below it, and so on. The bottom PR then carries the whole stack and lands once, through the default branch's usual checks and merge queue. The PRs above the bottom merge into branches, so the default branch's review and CI rules apply only to the bottom PR.
+- **Bottom up**, the default. Baby Sitter never merges a stacked PR into the PR below. Its babysit handles comments, branch updates, and CI as usual, then waits with a message such as "Waiting for #12 below to merge". When the PR below merges, Baby Sitter moves the stacked PR onto that PR's base if GitHub has not already done so. It then merges the new base in, waits for CI, and merges. Each PR lands on its own, one at a time.
+- **Top down.** Each PR waits with a message such as "Waiting for #12 above to merge" while a PR is stacked on it. The top PR merges into the PR below it, then that PR merges into the one below it, and so on. The bottom PR then carries the whole stack and lands once, through the default branch's usual checks and merge queue. The PRs above the bottom merge into branches, so the default branch's review and CI rules apply only to the bottom PR.
 
 In the app, a stacked row sits under the PR below it, and a vertical line joins the play buttons of PRs in the same stack. **Babysit stack bottom up** and **Babysit stack top down** in the row's More actions menu start every open PR in the stack in that mode. Top down also starts PRs on side branches of the stack, because each PR waits for every PR stacked on it. A stack runs in one mode at a time. Play on a PR whose stack is already running top down joins it top down.
 
@@ -114,5 +114,5 @@ In the app, a stacked row sits under the PR below it, and a vertical line joins 
 
 - CI failures caused by secrets, infrastructure, or flaky tests need a person. The binary pushes any code fix it can, then stops and names the remaining cause.
 - A PR with more than 100 review threads, comments in one thread, reviews, review requests, or checks stops the run. The binary does not act on a partial view.
-- A re-review request that a crash loses is not sent again.
-- PRs from forks are not supported.
+- Baby Sitter does not resend a re-review request that a crash lost.
+- Baby Sitter does not support PRs from forks.

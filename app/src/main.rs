@@ -202,7 +202,7 @@ pub(crate) mod test_support {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    /// Temporary directory path no other test uses, even within the same nanosecond.
+    /// Returns a temporary directory path no other test uses, even within the same nanosecond.
     pub(crate) fn unique_test_dir(prefix: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         std::env::temp_dir().join(format!(

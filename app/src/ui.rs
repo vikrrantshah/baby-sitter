@@ -1655,7 +1655,7 @@ impl AppView {
             .tooltip(if selected {
                 "Settings"
             } else {
-                "Turn on to configure"
+                "Turn on the repository to configure it"
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.page = Page::Settings(SettingsPage::Repo(settings_repo.clone()));
@@ -1924,7 +1924,7 @@ impl AppView {
             .child(div().text_size(px(13.)).line_height(relative(1.4)).text_color(muted())
                 .child("Codex gets these instructions, followed by the review threads, failing checks, or conflicted files. Baby Sitter applies its safety checks regardless of the instructions. It never commits CI configuration changes and checks conflict resolutions before pushing."))
             .child(div().text_size(px(12.)).text_color(muted())
-                .child("Changes apply to running babysits at their next Codex call."));
+                .child("Changes apply to running babysits the next time they call Codex."));
         match &self.prompt_editors {
             Load::Loading => content = content.child("Loading prompts…"),
             Load::Error(error) => {
@@ -2723,11 +2723,11 @@ impl AppView {
                 } else {
                     match self.watch_filter {
                         WatchFilter::Watched => message(
-                            "Nothing is being babysat",
+                            "Baby Sitter is not babysitting any pull requests",
                             Some("Press play on a pull request to start.".into()),
                         ),
                         WatchFilter::Unwatched => {
-                            message("Every listed pull request is being babysat", None)
+                            message("Baby Sitter is babysitting every listed pull request", None)
                         }
                         WatchFilter::All => message("No open pull requests", None),
                     }
@@ -3114,7 +3114,7 @@ impl AppView {
         let header = self
             .settings_header(
                 "Status",
-                Some("What Baby Sitter needs on this Mac. Checks use the same PATH as babysits."),
+                Some("Baby Sitter needs these tools, sign-ins, and permissions on this Mac. The checks use the same PATH as babysits."),
                 cx,
             )
             .child(
@@ -3394,7 +3394,6 @@ fn copy_pr_link(pr: &PrRef, url: &str, window: &mut Window, cx: &mut App) {
     );
 }
 
-/// A round icon-only button tinted with `tint` at rest and filled further with `hover` under the pointer.
 fn round_button(
     id: SharedString,
     icon: IconName,
@@ -3429,7 +3428,6 @@ fn round_button_with(
         .tooltip(label)
         .child(child)
 }
-/// The refresh icon turns while a repository or pull request load is in flight.
 fn refresh_icon(spinning: bool) -> AnyElement {
     let icon = Icon::new(IconName::RefreshCw).size(px(14.));
     if spinning {
@@ -3443,7 +3441,6 @@ fn refresh_icon(spinning: bool) -> AnyElement {
         icon.into_any_element()
     }
 }
-/// A borderless round button showing only an icon, for secondary row actions.
 fn icon_button(id: SharedString, icon: IconName, label: &'static str, size: Pixels) -> Button {
     Button::new(id)
         .ghost()
@@ -3484,7 +3481,6 @@ fn header(title: &'static str, detail: Option<&'static str>) -> Div {
                 }),
         )
 }
-/// A filter picker with a fixed width for the page header or dashboard filters.
 fn header_picker<D>(
     state: &Entity<SelectState<D>>,
     label: &'static str,
@@ -3671,7 +3667,7 @@ fn status_badge(state: GateState) -> Div {
     };
     badge.child(Icon::new(icon).size(px(14.)).text_color(color))
 }
-/// The caretaker and the child are a lit disc holding a smaller light one.
+/// Draws the caretaker and child mark, a large accent disc overlapped by a smaller one.
 fn pair_mark() -> Div {
     div()
         .relative()

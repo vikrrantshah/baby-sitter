@@ -332,7 +332,7 @@ pub enum Relation {
     /// The local head is ahead of the PR head GitHub reports, but the remote branch
     /// already has it. GitHub's PR view lags a push for a few seconds.
     Pushed,
-    /// Ahead of the PR head only by commits baby-sitter made and failed to push.
+    /// The local head is ahead of the PR head only by commits baby-sitter made and failed to push.
     Unpushed,
     Diverged,
 }
