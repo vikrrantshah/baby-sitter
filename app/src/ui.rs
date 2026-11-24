@@ -2900,16 +2900,16 @@ impl AppView {
             .flex()
             .items_center()
             .gap(px(12.))
+            .child(watch_filter)
+            .child(state_filter)
             .child(
-                div().w(px(240.)).flex_shrink_0().child(
+                div().ml_auto().w(px(240.)).flex_shrink_0().child(
                     Input::new(&self.search)
                         .with_size(Size::Medium)
                         .cleanable(true)
                         .prefix(Icon::new(IconName::Search).text_color(muted())),
                 ),
-            )
-            .child(watch_filter)
-            .child(state_filter);
+            );
         let body = div()
             .size_full()
             .flex()
