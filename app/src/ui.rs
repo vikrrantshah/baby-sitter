@@ -2680,10 +2680,12 @@ impl AppView {
         let watched = model::watched_prs(&rows, &self.states, &parents);
         let watch_counts = model::watch_counts(&rows, &self.states, &watched, self.state_filter);
         let state_counts = model::state_counts(&rows, &self.states, &watched, self.watch_filter);
+        let searching = !query.trim().is_empty();
         rows.retain(|row| {
             let sit = self.states.get(&row.pr);
-            self.watch_filter.admits(watched.contains(&row.pr))
-                && self.state_filter.admits(row, sit)
+            searching
+                || (self.watch_filter.admits(watched.contains(&row.pr))
+                    && self.state_filter.admits(row, sit))
         });
         let rows = model::order_stacks(rows, &parents);
         let list = match &self.prs {
@@ -2693,7 +2695,7 @@ impl AppView {
                     .child(Self::retry_prs_button(cx))
             }
             _ if rows.is_empty() => {
-                if !query.trim().is_empty() {
+                if searching {
                     message("No pull requests match the search", None)
                 } else if self.state_filter == StateFilter::Drafts {
                     message("No draft pull requests", None)
@@ -2901,8 +2903,16 @@ impl AppView {
             .flex()
             .items_center()
             .gap(px(12.))
-            .child(watch_filter)
-            .child(state_filter)
+            .child(
+                div()
+                    .when(searching, |group| group.opacity(0.45))
+                    .child(watch_filter),
+            )
+            .child(
+                div()
+                    .when(searching, |group| group.opacity(0.45))
+                    .child(state_filter),
+            )
             .child(
                 div().ml_auto().w(px(240.)).flex_shrink_0().child(
                     Input::new(&self.search)
