@@ -1729,30 +1729,34 @@ impl AppView {
     ) -> Div {
         div()
             .flex_shrink_0()
-            .pt(px(20.))
             .child(
-                div().px(px(ROW_INSET)).flex().items_start().child(
-                    Button::new("back-home")
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .child(
-                                    div()
-                                        .relative()
-                                        .top(px(-1.))
-                                        .child(Icon::new(IconName::ChevronLeft).size(px(14.))),
-                                )
-                                .child("Home"),
-                        )
-                        .ghost()
-                        .ml(px(-8.))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page = Page::PullRequests;
-                            cx.notify();
-                        })),
-                ),
+                div()
+                    .h(px(50.))
+                    .px(px(ROW_INSET))
+                    .flex()
+                    .items_center()
+                    .child(
+                        Button::new("back-home")
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .top(px(-1.))
+                                            .child(Icon::new(IconName::ChevronLeft).size(px(14.))),
+                                    )
+                                    .child("Home"),
+                            )
+                            .ghost()
+                            .ml(px(-8.))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.page = Page::PullRequests;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(header(title, detail).pt(px(16.)))
     }
