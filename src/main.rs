@@ -87,8 +87,32 @@ fn after_failure(consecutive_failures: u32) -> FailureStep {
     }
 }
 
-fn github_server_error(_error: &anyhow::Error) -> bool {
-    false
+/// Errors that a later pass outlives: GitHub's own server failures, and a merge that
+/// an earlier failed request already started. A later pass decides the action again from
+/// a fresh snapshot, so retrying cannot repeat a step that already landed.
+fn github_transient_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("Something went wrong while executing your query")
+        || message.contains("Merge already in progress")
+        || ["HTTP 50", "status code: 50"]
+            .iter()
+            .any(|status| message.contains(status))
+}
+
+/// Reports a failed GitHub request as a wait. GitHub's own server errors are retried
+/// until the deadline, because an outage can outlast any fixed number of attempts.
+fn failed_request(label: &str, failures: u32, error: &anyhow::Error) -> FailureStep {
+    let cause = format!("{error:#}");
+    let cause = cause.lines().next().unwrap_or("");
+    if github_transient_error(error) {
+        eprintln!("[{label}] wait: GitHub is failing, retrying (attempt {failures}): {cause}");
+        FailureStep::Retry(failures)
+    } else {
+        eprintln!(
+            "[{label}] wait: GitHub request failed ({failures} of {MAX_OBSERVE_FAILURES}): {cause}"
+        );
+        after_failure(failures)
+    }
 }
 
 fn main() -> ExitCode {
@@ -130,6 +154,7 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
         deadline,
     )?;
     let mut consecutive_failures = 0;
+    let mut action_failures = 0;
     loop {
         if Instant::now() >= deadline {
             return Err(proc::TimedOut.into());
@@ -144,21 +169,12 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
                     return Err(error);
                 }
                 consecutive_failures += 1;
-                let cause = format!("{error:#}");
-                eprintln!(
-                    "[snapshot] wait: GitHub request failed ({} of {}): {}",
-                    consecutive_failures,
-                    MAX_OBSERVE_FAILURES,
-                    cause.lines().next().unwrap_or("")
-                );
-                match after_failure(consecutive_failures) {
-                    FailureStep::GiveUp => return Err(error),
-                    FailureStep::Retry(_) => {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        std::thread::sleep(cli.interval.min(remaining));
-                        continue;
-                    }
+                if failed_request("snapshot", consecutive_failures, &error) == FailureStep::GiveUp {
+                    return Err(error);
                 }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(cli.interval.min(remaining));
+                continue;
             }
         };
         let facts = observation.facts(cli.merge_method, cli.stack);
@@ -192,7 +208,16 @@ fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 std::thread::sleep(cli.interval.min(remaining));
             }
-            Verdict::Act(action) => act::execute(&env, action, &observation.snap.pr_id)?,
+            Verdict::Act(action) => match act::execute(&env, action, &observation.snap.pr_id) {
+                Ok(()) => action_failures = 0,
+                Err(error) if github_transient_error(&error) => {
+                    action_failures += 1;
+                    failed_request(decision.rule, action_failures, &error);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(cli.interval.min(remaining));
+                }
+                Err(error) => return Err(error),
+            },
         }
     }
 }
@@ -286,14 +311,19 @@ mod tests {
     }
 
     #[test]
-    fn github_server_errors_are_retried_and_others_are_not() {
+    fn github_server_errors_retry_until_the_deadline_and_others_give_up() {
         for message in [
             "GraphQL: Something went wrong while executing your query on 2026-11-25T16:07:51Z. Please include `E826:77AA:ACB409F:FED0FB1:6B0707D6` when reporting this issue. (gh pr update-branch)",
             "HTTP 502: Bad Gateway (https://api.github.com/graphql) (gh api graphql)",
             "HTTP 503: Service Unavailable (gh pr merge)",
+            "non-200 OK status code: 502 Bad Gateway body: \"<html>502 Bad Gateway</html>\" (gh pr merge)",
+            "GraphQL: Merge already in progress (mergePullRequest) (gh pr merge)",
         ] {
-            assert!(
-                github_server_error(&anyhow::anyhow!(message.to_owned())),
+            let error = anyhow::anyhow!(message.to_owned());
+            assert!(github_transient_error(&error), "{message}");
+            assert_eq!(
+                failed_request("merge", 10, &error),
+                FailureStep::Retry(10),
                 "{message}"
             );
         }
@@ -302,8 +332,11 @@ mod tests {
             "HTTP 422: Validation Failed (gh pr edit)",
             "another baby-sitter holds the PR lock",
         ] {
-            assert!(
-                !github_server_error(&anyhow::anyhow!(message.to_owned())),
+            let error = anyhow::anyhow!(message.to_owned());
+            assert!(!github_transient_error(&error), "{message}");
+            assert_eq!(
+                failed_request("snapshot", 3, &error),
+                FailureStep::GiveUp,
                 "{message}"
             );
         }
