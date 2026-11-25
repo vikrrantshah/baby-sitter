@@ -831,11 +831,26 @@ fn merge_state(f: &Facts<'_>) -> Option<Verdict> {
     }
 }
 fn unresolved_threads(f: &Facts<'_>) -> Option<Verdict> {
-    let n = f.snap.threads.iter().filter(|t| !t.resolved).count();
-    (n > 0).then(|| {
+    let open: Vec<_> = f.snap.threads.iter().filter(|t| !t.resolved).collect();
+    (!open.is_empty()).then(|| {
+        let mut openers = Vec::new();
+        for thread in &open {
+            if let Actor::Human(login) | Actor::Bot(login) = &thread.comments()[0].actor {
+                let name = format!("@{}", login.0);
+                if !openers.contains(&name) {
+                    openers.push(name);
+                }
+            }
+        }
+        let from = if openers.is_empty() {
+            String::new()
+        } else {
+            format!(" from {}", names(openers.iter()))
+        };
         Verdict::Wait(format!(
-            "Waiting on {n} unresolved review thread{}",
-            plural(n)
+            "Waiting for a person to resolve {} review thread{}{from}",
+            open.len(),
+            plural(open.len())
         ))
     })
 }
@@ -1502,6 +1517,27 @@ mod tests {
     }
     fn tid() -> ThreadId {
         ThreadId("t".into())
+    }
+    #[test]
+    fn thread_wait_names_the_reviewer_a_person_must_answer() {
+        let mut w = World::new();
+        w.snap.threads = vec![thread(vec![
+            comment(
+                1,
+                Actor::Human(Login("windeko".into())),
+                "Hold this until #6776 deploys.",
+            ),
+            marked(2, tid(), Outcome::NeedsHuman, 1),
+        ])];
+        assert_eq!(
+            w.decision(),
+            Decision {
+                rule: "unresolved-threads",
+                verdict: Verdict::Wait(
+                    "Waiting for a person to resolve 1 review thread from @windeko".into()
+                ),
+            }
+        );
     }
     #[test]
     fn merged_pr_needs_no_local_checkout() {
