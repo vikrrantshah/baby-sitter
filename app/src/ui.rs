@@ -2695,20 +2695,21 @@ impl AppView {
     }
     fn render_dashboard(&self, fullscreen: bool, cx: &mut Context<Self>) -> (Div, Div) {
         let mut rows = self.dashboard_rows();
-        let query = self.search.read(cx).value().to_string();
-        rows.retain(|row| model::matches_search(row, &query));
         let parents = match &self.prs {
             Load::Ready(prs) => model::stack_parents(prs),
             _ => BTreeMap::new(),
         };
         let watched = model::watched_prs(&rows, &self.states, &parents);
         let watch_counts = model::watch_counts(&rows, &watched);
+        let query = self.search.read(cx).value().to_string();
         let searching = !query.trim().is_empty();
         rows.retain(|row| {
-            let sit = self.states.get(&row.pr);
-            searching
-                || (self.watch_filter.admits(watched.contains(&row.pr))
-                    && self.state_filter.admits(row, sit))
+            if searching {
+                model::matches_search(row, &query)
+            } else {
+                self.watch_filter.admits(watched.contains(&row.pr))
+                    && self.state_filter.admits(row, self.states.get(&row.pr))
+            }
         });
         let rows = model::order_stacks(rows, &parents);
         let list = match &self.prs {
