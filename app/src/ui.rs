@@ -283,6 +283,7 @@ pub struct AppView {
     _subscriptions: Vec<Subscription>,
     _events: Task<()>,
     _clock: Task<()>,
+    _auto_refresh: Task<()>,
     _permission_watch: Task<()>,
     pulse_epoch: Instant,
     repo_task: Option<Task<()>>,
@@ -468,6 +469,23 @@ impl AppView {
                 }
             }
         });
+        let auto_refresh = cx.spawn_in(window, async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(60))
+                    .await;
+                if view
+                    .update_in(cx, |this, window, cx| {
+                        if !this.loading_prs {
+                            this.load_prs(window, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         // macOS does not announce notification-setting changes, so the Status page polls them.
         let permission_watch = cx.spawn_in(window, async move |view, cx| {
             loop {
@@ -585,6 +603,7 @@ impl AppView {
             },
             _events: events,
             _clock: clock,
+            _auto_refresh: auto_refresh,
             _permission_watch: permission_watch,
             pulse_epoch: Instant::now(),
             repo_task: None,

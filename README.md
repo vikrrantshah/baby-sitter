@@ -43,6 +43,8 @@ The bundle contains both binaries. For development, `cargo build --workspace && 
 
 The search box finds PRs by number or title. Digits, with or without a leading `#`, match PR numbers that start with them. Every search also matches titles, ignoring case. While you search, the two filter groups dim and stop applying, so a match shows whatever its babysit or state. The repository picker next to the refresh button limits the list to one repository, during a search too. Two filter groups narrow the list further. The first shows All, Watched, or Unwatched PRs, each with a count of the PRs in the chosen repository that match the search. Watched covers running babysits, PRs whose babysit ended with a merge, and every other PR in the same stack as one of those. The second shows All, Open, Drafts, or Merged PRs. Open means ready for review or queued.
 
+The pull request list reloads every minute, so new PRs appear without pressing refresh.
+
 Each row also has a **More actions** menu to mark a draft ready for review, convert a PR to draft, close it, or copy its link.
 
 **Settings > App** holds the defaults for every repository. The timeout and draft timeout are both `2h`, and the interval between checks is `30s`. To override a value for one repository, use the gear next to that repository. **Auto-dismiss merged PRs** clears merged rows and their worktrees after the **Clear after** delay.
