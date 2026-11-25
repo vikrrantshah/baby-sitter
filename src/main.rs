@@ -87,6 +87,10 @@ fn after_failure(consecutive_failures: u32) -> FailureStep {
     }
 }
 
+fn github_server_error(_error: &anyhow::Error) -> bool {
+    false
+}
+
 fn main() -> ExitCode {
     run_cli(Cli::parse())
 }
@@ -279,6 +283,30 @@ mod tests {
         assert_eq!(after_failure(2), FailureStep::Retry(2));
         assert_eq!(after_failure(3), FailureStep::GiveUp);
         assert_eq!(after_failure(4), FailureStep::GiveUp);
+    }
+
+    #[test]
+    fn github_server_errors_are_retried_and_others_are_not() {
+        for message in [
+            "GraphQL: Something went wrong while executing your query on 2026-11-25T16:07:51Z. Please include `E826:77AA:ACB409F:FED0FB1:6B0707D6` when reporting this issue. (gh pr update-branch)",
+            "HTTP 502: Bad Gateway (https://api.github.com/graphql) (gh api graphql)",
+            "HTTP 503: Service Unavailable (gh pr merge)",
+        ] {
+            assert!(
+                github_server_error(&anyhow::anyhow!(message.to_owned())),
+                "{message}"
+            );
+        }
+        for message in [
+            "GraphQL: Pull request is not mergeable (gh pr merge)",
+            "HTTP 422: Validation Failed (gh pr edit)",
+            "another baby-sitter holds the PR lock",
+        ] {
+            assert!(
+                !github_server_error(&anyhow::anyhow!(message.to_owned())),
+                "{message}"
+            );
+        }
     }
 }
 #[cfg(test)]
