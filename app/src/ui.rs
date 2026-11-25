@@ -1758,7 +1758,7 @@ impl AppView {
                             })),
                     ),
             )
-            .child(header(title, detail).pt(px(16.)))
+            .child(header(title, detail).pt(px(2.)))
     }
 
     fn render_repos(&self, cx: &mut Context<Self>) -> (Div, Div) {
@@ -2192,28 +2192,31 @@ impl AppView {
             .expect("watched repositories have settings inputs");
         let header = div()
             .flex_shrink_0()
-            .px(px(ROW_INSET))
-            .pt(px(20.))
-            .pb(px(20.))
             .border_b_1()
             .border_color(divider())
-            .flex()
-            .flex_col()
-            .items_start()
-            .gap(px(10.))
             .child(
-                Button::new("back-to-repositories")
-                    .icon(IconName::ChevronLeft)
-                    .label("Repositories")
-                    .ghost()
-                    .ml(px(-8.))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.page = Page::Settings(SettingsPage::Repositories);
-                        cx.notify();
-                    })),
+                div()
+                    .h(px(50.))
+                    .px(px(ROW_INSET))
+                    .flex()
+                    .items_center()
+                    .child(
+                        Button::new("back-to-repositories")
+                            .icon(IconName::ChevronLeft)
+                            .label("Repositories")
+                            .ghost()
+                            .ml(px(-8.))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.page = Page::Settings(SettingsPage::Repositories);
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 drag_area()
+                    .px(px(ROW_INSET))
+                    .pt(px(2.))
+                    .pb(px(20.))
                     .w_full()
                     .flex()
                     .flex_col()
@@ -2952,7 +2955,7 @@ impl AppView {
             .child(div().flex_1().min_h_0().child(list));
         (header, body)
     }
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+    fn render_sidebar(&self, fullscreen: bool, cx: &mut Context<Self>) -> Div {
         div()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
@@ -2962,10 +2965,11 @@ impl AppView {
             .bg(panel())
             .border_r_1()
             .border_color(divider())
-            .child(drag_area().h(px(52.)))
+            .child(drag_area().h(px(if fullscreen { 0. } else { 52. })))
             .child(
                 div()
                     .id("settings-home")
+                    .when(fullscreen, |row| row.h(px(50.)))
                     .px(px(20.))
                     .flex()
                     .items_center()
@@ -3782,7 +3786,7 @@ impl Render for AppView {
             .bg(surface())
             .text_color(ink())
             .when(matches!(self.page, Page::Settings(_)), |d| {
-                d.child(self.render_sidebar(cx))
+                d.child(self.render_sidebar(window.is_fullscreen(), cx))
             })
             .child(
                 div()
