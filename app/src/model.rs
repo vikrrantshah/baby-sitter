@@ -748,6 +748,61 @@ pub fn stack_rails(rows: &[Cow<'_, PrRow>], parents: &BTreeMap<PrRef, PrRef>) ->
         .collect()
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackGroup {
+    pub rows: std::ops::Range<usize>,
+    pub mode: StackMode,
+    pub watched: usize,
+    pub deadline: u64,
+    pub next: PrRef,
+}
+
+pub fn stack_groups(
+    rows: &[Cow<'_, PrRow>],
+    parents: &BTreeMap<PrRef, PrRef>,
+    active: &BTreeMap<PrRef, ActiveSit>,
+) -> Vec<StackGroup> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let key = stack_of(&rows[start].pr, parents).swap_remove(0);
+        let mut end = start + 1;
+        while end < rows.len() && stack_of(&rows[end].pr, parents)[0] == key {
+            end += 1;
+        }
+        let members = &rows[start..end];
+        let mut sits = members.iter().filter_map(|row| active.get(&row.pr));
+        if let Some(first) = sits.next() {
+            let mode = first.stack;
+            let (watched, deadline) = sits.fold((1, first.deadline), |(count, deadline), sit| {
+                (count + 1, deadline.max(sit.deadline))
+            });
+            if members.len() >= 2 && (watched >= 2 || mode == StackMode::TopDown) {
+                let unmerged = |row: &&Cow<'_, PrRow>| row.state != PrState::Merged;
+                let next = match mode {
+                    StackMode::BottomUp => members.iter().find(unmerged),
+                    StackMode::TopDown => members.iter().rev().filter(unmerged).find(|row| {
+                        !members
+                            .iter()
+                            .any(|child| parents.get(&child.pr) == Some(&row.pr))
+                    }),
+                };
+                if let Some(next) = next {
+                    groups.push(StackGroup {
+                        rows: start..end,
+                        mode,
+                        watched,
+                        deadline,
+                        next: next.pr.clone(),
+                    });
+                }
+            }
+        }
+        start = end;
+    }
+    groups
+}
+
 pub fn dashboard_rows<'a>(
     prs: &'a [PrRow],
     history: &'a BTreeMap<PrRef, PastSit>,
@@ -1005,6 +1060,77 @@ pub fn classify(code: Option<i32>, stderr: &str, cancel_requested: bool) -> Outc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stack_groups_show_mode_next_and_latest_deadline() {
+        let rows = stack_rows();
+        let parents = stack_parents(&rows);
+        let ordered: Vec<_> = rows[..4].iter().map(Cow::Borrowed).collect();
+        let mut active = BTreeMap::new();
+        for (index, row) in rows[..3].iter().enumerate() {
+            active.insert(
+                row.pr.clone(),
+                ActiveSit {
+                    deadline: [20, 50, 30][index],
+                    stack: StackMode::BottomUp,
+                },
+            );
+        }
+        let groups = stack_groups(&ordered, &parents, &active);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rows, 0..4);
+        assert_eq!(groups[0].watched, 3);
+        assert_eq!(groups[0].deadline, 50);
+        assert_eq!(groups[0].mode, StackMode::BottomUp);
+        assert_eq!(groups[0].next, rows[0].pr);
+        active.clear();
+        active.insert(
+            rows[1].pr.clone(),
+            ActiveSit {
+                deadline: 10,
+                stack: StackMode::TopDown,
+            },
+        );
+        let groups = stack_groups(&ordered, &parents, &active);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].watched, 1);
+        assert_eq!(groups[0].next, rows[3].pr);
+        active.get_mut(&rows[1].pr).unwrap().stack = StackMode::BottomUp;
+        assert!(stack_groups(&ordered, &parents, &active).is_empty());
+        assert!(stack_groups(&ordered[..1], &parents, &active).is_empty());
+    }
+
+    #[test]
+    fn adjacent_stack_groups_have_separate_ranges() {
+        let rows: Vec<_> = (1..=5).map(|n| row(&format!("owner/repo#{n}"))).collect();
+        let parents = BTreeMap::from([
+            (rows[1].pr.clone(), rows[0].pr.clone()),
+            (rows[3].pr.clone(), rows[2].pr.clone()),
+        ]);
+        let active: BTreeMap<_, _> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.pr.clone(),
+                    ActiveSit {
+                        deadline: 10,
+                        stack: StackMode::TopDown,
+                    },
+                )
+            })
+            .collect();
+        let ordered: Vec<_> = rows.iter().map(Cow::Borrowed).collect();
+        let groups = stack_groups(&ordered, &parents, &active);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.rows.clone())
+                .collect::<Vec<_>>(),
+            [0..2, 2..4]
+        );
+        assert_eq!(groups[0].next, rows[1].pr);
+        assert_eq!(groups[1].next, rows[3].pr);
+    }
+
     #[test]
     fn github_urls_for_repository_and_pull_request() {
         let repo: super::RepoName = "owner/name".parse().unwrap();

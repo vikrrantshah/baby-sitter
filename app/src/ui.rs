@@ -1616,6 +1616,43 @@ impl AppView {
         })
         .detach();
     }
+    fn ask_cancel_stack(
+        &mut self,
+        members: Vec<PrRef>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let acting = members.iter().any(|pr| {
+            matches!(
+                self.states.get(pr),
+                Some(SitState::Running { last_line: Some(line), .. })
+                    if model::parse_pass(line).is_some_and(|pass| pass.kind == VerdictKind::Act)
+            )
+        });
+        if !acting {
+            for pr in members {
+                self.cancel(pr, cx);
+            }
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Stop babysitting this stack?",
+            Some("A change is in progress and may be half applied. Inspect the worktree before restarting."),
+            &["Stop babysitting", "Keep running"],
+            cx,
+        );
+        cx.spawn(async move |view, cx| {
+            if answer.await.ok() == Some(0) {
+                let _ = view.update(cx, |this, cx| {
+                    for pr in members {
+                        this.cancel(pr, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
     fn reading(&self, pr: &PrRef) -> Reading {
         use GateState::{Blocked, Met, Pending, Waiting};
         let state = self.states.get(pr);
@@ -2597,13 +2634,17 @@ impl AppView {
         last: bool,
         rail: model::StackRail,
         parents: &BTreeMap<PrRef, PrRef>,
+        group: Option<(&model::StackGroup, bool)>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let state = self.states.get(&row.pr);
         let reading = self.reading(&row.pr);
         let active = state.is_some_and(SitState::is_active);
+        let next = group.is_some_and(|(group, _)| group.next == row.pr);
         let pr = row.pr.clone();
-        let action = if active {
+        let action = if active && group.is_some() {
+            None
+        } else if active {
             let cancelling = matches!(state, Some(SitState::Cancelling));
             Some(
                 round_button(
@@ -2664,7 +2705,7 @@ impl AppView {
                 this.dismiss(pr.clone(), window, cx);
             }))
         });
-        let time_left = active
+        let time_left = (active && group.is_none())
             .then(|| self.config.active.get(&row.pr))
             .flatten()
             .map(|sit| time_left(sit.deadline.saturating_sub(model::unix_now())));
@@ -2880,6 +2921,18 @@ impl AppView {
                         },
                         active.then(|| self.pulse()),
                     ))
+                    .when(next, |line| {
+                        line.child(
+                            div()
+                                .px(px(7.))
+                                .py(px(2.))
+                                .rounded_full()
+                                .bg(accent().opacity(0.15))
+                                .text_color(accent())
+                                .text_size(px(12.))
+                                .child("Next to merge"),
+                        )
+                    })
                     .when_some(worktree, |line, worktree| line.child(worktree)),
             )
             .when(
@@ -2924,6 +2977,27 @@ impl AppView {
                 .w(px(3.))
                 .rounded_full()
                 .bg(accent().opacity(0.7))
+                .when_some(
+                    group.filter(|(_, running)| *running),
+                    |segment, (group, _)| {
+                        let phase = (self.pulse_epoch.elapsed().as_millis() % 2400) as f32 / 2400.;
+                        let phase = if group.mode == StackMode::TopDown {
+                            1. - phase
+                        } else {
+                            phase
+                        };
+                        segment.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top(relative(phase * 0.8))
+                                .w_full()
+                                .h(relative(0.2))
+                                .rounded_full()
+                                .bg(accent()),
+                        )
+                    },
+                )
         };
         div()
             .relative()
@@ -2940,26 +3014,33 @@ impl AppView {
             .flex()
             .items_start()
             .gap(px(20.))
-            .child(match action {
-                Some(action) => action.into_any_element(),
-                None if shows_merged => {
-                    let color = pr_state_color(PrState::Merged);
-                    div()
-                        .id(SharedString::from(format!("merged-{}", row.pr)))
-                        .flex_shrink_0()
-                        .size(px(34.))
-                        .rounded_full()
-                        .bg(color.opacity(0.18))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(color)
-                        .child(Icon::empty().path("icons/git-merge.svg").size(px(16.)))
-                        .tooltip(|window, cx| Tooltip::new("Merged").build(window, cx))
-                        .into_any_element()
-                }
-                None => div().size(px(34.)).into_any_element(),
-            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .size(px(34.))
+                    .rounded_full()
+                    .when(next, |node| node.border_2().border_color(accent()))
+                    .child(match action {
+                        Some(action) => action.into_any_element(),
+                        None if shows_merged => {
+                            let color = pr_state_color(PrState::Merged);
+                            div()
+                                .id(SharedString::from(format!("merged-{}", row.pr)))
+                                .flex_shrink_0()
+                                .size(px(34.))
+                                .rounded_full()
+                                .bg(color.opacity(0.18))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(color)
+                                .child(Icon::empty().path("icons/git-merge.svg").size(px(16.)))
+                                .tooltip(|window, cx| Tooltip::new("Merged").build(window, cx))
+                                .into_any_element()
+                        }
+                        None => div().size(px(34.)).into_any_element(),
+                    }),
+            )
             .child(content)
             .child(
                 div()
@@ -3089,12 +3170,106 @@ impl AppView {
                         .flex_col()
                         .children({
                             let rails = model::stack_rails(&rows, &parents);
-                            rows.iter()
-                                .zip(rails)
-                                .enumerate()
-                                .map(|(index, (row, rail))| {
-                                    self.pr_row(row, index + 1 == rows.len(), rail, &parents, cx)
-                                })
+                            let groups = model::stack_groups(&rows, &parents, &self.config.active);
+                            let mut elements = Vec::new();
+                            let mut index = 0;
+                            for group in &groups {
+                                while index < group.rows.start {
+                                    elements.push(self.pr_row(
+                                        &rows[index],
+                                        index + 1 == rows.len(),
+                                        rails[index],
+                                        &parents,
+                                        None,
+                                        cx,
+                                    ));
+                                    index += 1;
+                                }
+                                let members: Vec<_> = model::stack_tree(&rows[index].pr, &parents)
+                                    .into_iter()
+                                    .filter(|pr| self.config.active.contains_key(pr))
+                                    .collect();
+                                let running = members
+                                    .iter()
+                                    .any(|pr| self.states.get(pr).is_some_and(SitState::is_active));
+                                let count = group.rows.len();
+                                let mode = match group.mode {
+                                    StackMode::BottomUp => "bottom up",
+                                    StackMode::TopDown => "top down",
+                                };
+                                let label = if group.watched < count {
+                                    format!(
+                                        "Stack of {count} · {mode} · watching {} of {count}",
+                                        group.watched
+                                    )
+                                } else {
+                                    format!("Stack of {count} · {mode}")
+                                };
+                                let stop = Button::new(SharedString::from(format!(
+                                    "stop-stack-{}",
+                                    rows[index].pr
+                                )))
+                                .custom(
+                                    ButtonCustomVariant::new(cx)
+                                        .color(muted())
+                                        .foreground(danger())
+                                        .hover(danger().opacity(0.3))
+                                        .active(danger().opacity(0.45)),
+                                )
+                                .label("Stop")
+                                .tooltip("Stop babysitting the stack")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.ask_cancel_stack(members.clone(), window, cx)
+                                }));
+                                let header = div()
+                                    .h(px(40.))
+                                    .px(px(12.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .bg(accent().opacity(0.12))
+                                    .text_color(accent())
+                                    .child(Icon::empty().path("icons/stack-16.svg").size(px(16.)))
+                                    .child(div().flex_1().font_semibold().child(label))
+                                    .child(div().text_size(px(12.)).text_color(muted()).child(
+                                        time_left(group.deadline.saturating_sub(model::unix_now())),
+                                    ))
+                                    .child(stop);
+                                let mut card = div()
+                                    .mx(px(ROW_INSET))
+                                    .my(px(6.))
+                                    .rounded(px(10.))
+                                    .border_1()
+                                    .border_color(accent())
+                                    .overflow_hidden()
+                                    .flex()
+                                    .flex_col()
+                                    .child(header);
+                                while index < group.rows.end {
+                                    card = card.child(self.pr_row(
+                                        &rows[index],
+                                        index + 1 == group.rows.end,
+                                        rails[index],
+                                        &parents,
+                                        Some((group, running)),
+                                        cx,
+                                    ));
+                                    index += 1;
+                                }
+                                elements.push(card.into_any_element());
+                            }
+                            while index < rows.len() {
+                                elements.push(self.pr_row(
+                                    &rows[index],
+                                    index + 1 == rows.len(),
+                                    rails[index],
+                                    &parents,
+                                    None,
+                                    cx,
+                                ));
+                                index += 1;
+                            }
+                            elements
                         }),
                 )
             }
@@ -4081,15 +4256,28 @@ fn message(title: &'static str, detail: Option<String>) -> Div {
 }
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.page == Page::PullRequests
-            && self.states.iter().any(|(pr, state)| {
-                state.is_active()
-                    && self
-                        .gates
-                        .get(pr)
-                        .is_some_and(|gates| gates.contains(&GateState::Waiting))
-            })
-        {
+        let running = |pr: &PrRef| self.states.get(pr).is_some_and(SitState::is_active);
+        let waiting_gate = self.states.iter().any(|(pr, state)| {
+            state.is_active()
+                && self
+                    .gates
+                    .get(pr)
+                    .is_some_and(|gates| gates.contains(&GateState::Waiting))
+        });
+        let stack_flowing = match &self.prs {
+            Load::Ready(prs) => {
+                let parents = model::stack_parents(prs);
+                let mut bottoms = BTreeSet::new();
+                self.config.active.iter().any(|(pr, sit)| {
+                    running(pr)
+                        && ((sit.stack == StackMode::TopDown
+                            && model::stack_tree(pr, &parents).len() > 1)
+                            || !bottoms.insert(model::stack_of(pr, &parents).swap_remove(0)))
+                })
+            }
+            _ => false,
+        };
+        if self.page == Page::PullRequests && (waiting_gate || stack_flowing) {
             window.request_animation_frame();
         }
         if matches!(
