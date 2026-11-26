@@ -2148,8 +2148,10 @@ impl AppView {
         let view = cx.entity().downgrade();
         let is_repo = matches!(target, DurationTarget::Repo(_));
         let picker = Button::new("coding-agent")
-            .label(label)
+            .child(div().flex_1().text_left().child(label))
+            .dropdown_caret(true)
             .outline()
+            .w_full()
             .dropdown_menu(move |mut menu, _, _| {
                 let choices = std::iter::once(None)
                     .filter(|_| is_repo)
@@ -2203,15 +2205,15 @@ impl AppView {
         div()
             .flex()
             .flex_col()
-            .gap(px(12.))
-            .child(
+            .gap(px(20.))
+            .child(settings_field(
+                Icon::empty().path("icons/bot.svg"),
+                "Agent harness",
+                picker,
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child("Coding agent")
-                    .child(picker),
-            )
+                    .text_color(muted())
+                    .child("Answers review threads, fixes CI, and resolves conflicts."),
+            ))
             .child(duration_field(
                 Icon::empty().path("icons/square-terminal.svg"),
                 "Model",
@@ -3491,6 +3493,12 @@ fn duration_field(
         Some(error) => div().text_color(danger()).child(error.clone()),
         None => div().text_color(muted()).child(hint),
     };
+    settings_field(icon, label, Input::new(input).disabled(disabled), note)
+}
+
+/// A settings row: an icon and label in the label column, the control in the input column,
+/// and a note under the control.
+fn settings_field(icon: Icon, label: &'static str, control: impl IntoElement, note: Div) -> Div {
     div()
         .w_full()
         .flex()
@@ -3520,7 +3528,7 @@ fn duration_field(
                         .flex_1()
                         .min_w_0()
                         .max_w(px(SETTINGS_INPUT_WIDTH))
-                        .child(Input::new(input).disabled(disabled)),
+                        .child(control),
                 ),
         )
         .child(
