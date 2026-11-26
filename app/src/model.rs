@@ -13,6 +13,12 @@ pub struct RepoName {
     pub name: String,
 }
 
+impl RepoName {
+    pub fn url(&self) -> String {
+        format!("https://github.com/{self}")
+    }
+}
+
 impl fmt::Display for RepoName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.owner, self.name)
@@ -59,7 +65,7 @@ pub struct PrRef {
 
 impl PrRef {
     pub fn url(&self) -> String {
-        format!("https://github.com/{}/pull/{}", self.repo, self.number)
+        format!("{}/pull/{}", self.repo.url(), self.number)
     }
 }
 impl fmt::Display for PrRef {
@@ -999,6 +1005,14 @@ pub fn classify(code: Option<i32>, stderr: &str, cancel_requested: bool) -> Outc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn github_urls_for_repository_and_pull_request() {
+        let repo: super::RepoName = "owner/name".parse().unwrap();
+        let pr: super::PrRef = "owner/name#7".parse().unwrap();
+        assert_eq!(repo.url(), "https://github.com/owner/name");
+        assert_eq!(pr.url(), "https://github.com/owner/name/pull/7");
+    }
+
     #[test]
     fn prompt_json_contains_only_active_overrides() {
         let prompts = super::Prompts {

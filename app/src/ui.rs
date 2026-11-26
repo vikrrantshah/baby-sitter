@@ -1694,6 +1694,7 @@ impl AppView {
         let count = self.active_count(repo);
         let switch_repo = repo.clone();
         let settings_repo = repo.clone();
+        let github_url = repo.url();
         let switch = Switch::new(SharedString::from(format!("repo-{repo}")))
             .accessibility_label(format!("Watch {repo}"))
             .checked(selected)
@@ -1727,9 +1728,29 @@ impl AppView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_ellipsis()
-                    .text_color(ink())
-                    .child(repo.name.clone()),
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .text_color(ink())
+                            .child(repo.name.clone()),
+                    )
+                    .child(
+                        icon_button(
+                            SharedString::from(format!("github-{repo}")),
+                            IconName::Github,
+                            "Open on GitHub",
+                            px(24.),
+                        )
+                        .flex_shrink_0()
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            open_url(github_url.clone());
+                        }),
+                    ),
             )
             .when(count > 0, |row| {
                 row.child(
@@ -2417,6 +2438,7 @@ impl AppView {
             .inputs
             .get(repo)
             .expect("watched repositories have settings inputs");
+        let github_url = repo.url();
         let header = div()
             .flex_shrink_0()
             .border_b_1()
@@ -2450,11 +2472,38 @@ impl AppView {
                     .gap(px(6.))
                     .child(
                         div()
-                            .text_size(px(24.))
-                            .line_height(relative(1.2))
-                            .font_semibold()
-                            .text_color(ink())
-                            .child(repo.to_string()),
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(24.))
+                                    .line_height(relative(1.2))
+                                    .font_semibold()
+                                    .text_color(ink())
+                                    .child(repo.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(
+                                        icon_button(
+                                            "github-repo-title".into(),
+                                            IconName::Github,
+                                            "Open on GitHub",
+                                            px(24.),
+                                        )
+                                        .flex_shrink_0()
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                open_url(github_url.clone());
+                                            },
+                                        ),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
@@ -2682,12 +2731,7 @@ impl AppView {
             ink(),
             cx,
         )
-        .on_click(move |_, _, _| {
-            let url = url.clone();
-            std::thread::spawn(move || {
-                let _ = std::process::Command::new("open").arg(url).status();
-            });
-        });
+        .on_click(move |_, _, _| open_url(url.clone()));
         let title = div()
             .flex()
             .items_center()
@@ -3669,6 +3713,12 @@ fn duration_fields(inputs: &RepoInputs) -> Div {
             &inputs.interval_error,
             false,
         ))
+}
+
+fn open_url(url: String) {
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("open").arg(url).status();
+    });
 }
 
 fn copy_pr_link(pr: &PrRef, url: &str, window: &mut Window, cx: &mut App) {
