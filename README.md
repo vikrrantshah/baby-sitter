@@ -108,7 +108,7 @@ A PR is stacked when its base branch is another PR's branch, the PR below it. A 
 
 In the app, PRs are listed by repository, then by PR number from highest to lowest. A stack takes the place of its bottom PR, each stacked row sits under the PR below it, and a vertical line joins the play buttons of PRs in the same stack. **Babysit stack bottom up** and **Babysit stack top down** in the row's More actions menu start every open PR in the stack in that mode. Top down also starts PRs on side branches of the stack, because each PR waits for every PR stacked on it. A stack runs in one mode at a time. Play on a PR whose stack is already running top down joins it top down.
 
-A stack babysat as a stack appears in one card with its mode, one timer, one Stop button, the PR that merges next, and a rail that flows in the merge direction.
+A stack babysat as a stack appears in one card with its mode, merged progress, one timer, one Stop button, the PR that merges next, and a rail that flows in the merge direction.
 
 ## What it never does
 

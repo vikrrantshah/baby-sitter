@@ -554,6 +554,8 @@ pub struct Config {
     pub active: BTreeMap<PrRef, ActiveSit>,
     #[serde(default)]
     pub history: BTreeMap<PrRef, PastSit>,
+    #[serde(default)]
+    pub stack_links: BTreeMap<PrRef, PrRef>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -610,6 +612,24 @@ pub fn stack_parents(rows: &[PrRow]) -> BTreeMap<PrRef, PrRef> {
         }
     }
     parents
+}
+
+pub fn effective_parents(
+    mut live: BTreeMap<PrRef, PrRef>,
+    remembered: &BTreeMap<PrRef, PrRef>,
+) -> BTreeMap<PrRef, PrRef> {
+    for (child, parent) in remembered {
+        live.entry(child.clone()).or_insert_with(|| parent.clone());
+    }
+    live
+}
+
+pub fn prune_stack_links(
+    links: &mut BTreeMap<PrRef, PrRef>,
+    active: &BTreeMap<PrRef, ActiveSit>,
+    history: &BTreeMap<PrRef, PastSit>,
+) {
+    links.retain(|child, _| active.contains_key(child) || history.contains_key(child));
 }
 
 pub fn stack_of(pr: &PrRef, parents: &BTreeMap<PrRef, PrRef>) -> Vec<PrRef> {
@@ -753,6 +773,7 @@ pub struct StackGroup {
     pub rows: std::ops::Range<usize>,
     pub mode: StackMode,
     pub watched: usize,
+    pub merged: usize,
     pub deadline: u64,
     pub next: PrRef,
 }
@@ -761,6 +782,7 @@ pub fn stack_groups(
     rows: &[Cow<'_, PrRow>],
     parents: &BTreeMap<PrRef, PrRef>,
     active: &BTreeMap<PrRef, ActiveSit>,
+    states: &BTreeMap<PrRef, SitState>,
 ) -> Vec<StackGroup> {
     let mut groups = Vec::new();
     let mut start = 0;
@@ -777,8 +799,18 @@ pub fn stack_groups(
             let (watched, deadline) = sits.fold((1, first.deadline), |(count, deadline), sit| {
                 (count + 1, deadline.max(sit.deadline))
             });
-            if members.len() >= 2 && (watched >= 2 || mode == StackMode::TopDown) {
-                let unmerged = |row: &&Cow<'_, PrRow>| row.state != PrState::Merged;
+            let sat_merged = |row: &Cow<'_, PrRow>| {
+                matches!(
+                    states.get(&row.pr),
+                    Some(SitState::Finished(Outcome::Merged))
+                )
+            };
+            let babysat = watched + members.iter().filter(|row| sat_merged(row)).count();
+            if members.len() >= 2 && (babysat >= 2 || mode == StackMode::TopDown) {
+                let is_merged =
+                    |row: &Cow<'_, PrRow>| row.state == PrState::Merged || sat_merged(row);
+                let merged = members.iter().filter(|row| is_merged(row)).count();
+                let unmerged = |row: &&Cow<'_, PrRow>| !is_merged(row);
                 let next = match mode {
                     StackMode::BottomUp => members.iter().find(unmerged),
                     StackMode::TopDown => members.iter().rev().filter(unmerged).find(|row| {
@@ -792,6 +824,7 @@ pub fn stack_groups(
                         rows: start..end,
                         mode,
                         watched,
+                        merged,
                         deadline,
                         next: next.pr.clone(),
                     });
@@ -1061,6 +1094,118 @@ pub fn classify(code: Option<i32>, stderr: &str, cancel_requested: bool) -> Outc
 #[cfg(test)]
 mod tests {
     #[test]
+    fn remembered_parents_fill_gaps_without_overriding_live_links() {
+        let prs: Vec<_> = (1..=5)
+            .map(|n| row(&format!("owner/repo#{n}")).pr)
+            .collect();
+        let live = BTreeMap::from([
+            (prs[1].clone(), prs[0].clone()),
+            (prs[3].clone(), prs[2].clone()),
+        ]);
+        let remembered = BTreeMap::from([
+            (prs[1].clone(), prs[4].clone()),
+            (prs[2].clone(), prs[0].clone()),
+        ]);
+        let parents = effective_parents(live, &remembered);
+        assert_eq!(parents.get(&prs[1]), Some(&prs[0]));
+        assert_eq!(parents.get(&prs[2]), Some(&prs[0]));
+        assert_eq!(parents.get(&prs[3]), Some(&prs[2]));
+    }
+
+    #[test]
+    fn merged_bottom_remains_in_watched_stack_after_retarget() {
+        let mut rows: Vec<_> = (1..=3).map(|n| row(&format!("owner/repo#{n}"))).collect();
+        rows[0].state = PrState::Merged;
+        rows[0].base = "main".into();
+        rows[0].head = "a".into();
+        rows[1].base = "main".into();
+        rows[1].head = "b".into();
+        rows[2].base = "b".into();
+        let remembered = BTreeMap::from([(rows[1].pr.clone(), rows[0].pr.clone())]);
+        let parents = effective_parents(stack_parents(&rows), &remembered);
+        let mut active: BTreeMap<_, _> = rows[1..]
+            .iter()
+            .map(|row| {
+                (
+                    row.pr.clone(),
+                    ActiveSit {
+                        deadline: 10,
+                        stack: StackMode::BottomUp,
+                    },
+                )
+            })
+            .collect();
+        let ordered = order_stacks(rows.iter().rev().map(Cow::Borrowed).collect(), &parents);
+        assert_eq!(ordered[0].pr, rows[0].pr);
+        let groups = stack_groups(&ordered, &parents, &active, &BTreeMap::new());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rows, 0..3);
+        assert_eq!(groups[0].merged, 1);
+        assert_eq!(groups[0].watched, 2);
+        assert_eq!(groups[0].next, rows[1].pr);
+        let states = BTreeMap::from([(rows[1].pr.clone(), SitState::Finished(Outcome::Merged))]);
+        let groups = stack_groups(&ordered, &parents, &active, &states);
+        assert_eq!(groups[0].merged, 2);
+        assert_eq!(groups[0].next, rows[2].pr);
+        active.remove(&rows[1].pr);
+        let groups = stack_groups(&ordered, &parents, &active, &states);
+        assert_eq!(groups.len(), 1, "the last running PR keeps its stack card");
+        assert_eq!(groups[0].watched, 1);
+        assert_eq!(groups[0].next, rows[2].pr);
+    }
+
+    #[test]
+    fn pruning_keeps_links_for_active_and_historical_children() {
+        let prs: Vec<_> = (1..=4)
+            .map(|n| row(&format!("owner/repo#{n}")).pr)
+            .collect();
+        let mut links = BTreeMap::from([
+            (prs[1].clone(), prs[0].clone()),
+            (prs[2].clone(), prs[0].clone()),
+            (prs[3].clone(), prs[0].clone()),
+        ]);
+        let active = BTreeMap::from([(
+            prs[1].clone(),
+            ActiveSit {
+                deadline: 10,
+                stack: StackMode::BottomUp,
+            },
+        )]);
+        let history = BTreeMap::from([(
+            prs[2].clone(),
+            PastSit {
+                title: String::new(),
+                outcome: Outcome::Merged,
+                finished_at: 0,
+            },
+        )]);
+        prune_stack_links(&mut links, &active, &history);
+        assert_eq!(
+            links,
+            BTreeMap::from([
+                (prs[1].clone(), prs[0].clone()),
+                (prs[2].clone(), prs[0].clone())
+            ])
+        );
+    }
+
+    #[test]
+    fn stack_links_round_trip_and_old_configs_default_empty() {
+        let mut config = Config::default();
+        let child = row("owner/repo#2").pr;
+        let parent = row("owner/repo#1").pr;
+        config.stack_links.insert(child, parent);
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), config);
+        assert!(
+            serde_json::from_str::<Config>("{}")
+                .unwrap()
+                .stack_links
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn stack_groups_show_mode_next_and_latest_deadline() {
         let rows = stack_rows();
         let parents = stack_parents(&rows);
@@ -1075,7 +1220,7 @@ mod tests {
                 },
             );
         }
-        let groups = stack_groups(&ordered, &parents, &active);
+        let groups = stack_groups(&ordered, &parents, &active, &BTreeMap::new());
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].rows, 0..4);
         assert_eq!(groups[0].watched, 3);
@@ -1090,13 +1235,13 @@ mod tests {
                 stack: StackMode::TopDown,
             },
         );
-        let groups = stack_groups(&ordered, &parents, &active);
+        let groups = stack_groups(&ordered, &parents, &active, &BTreeMap::new());
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].watched, 1);
         assert_eq!(groups[0].next, rows[3].pr);
         active.get_mut(&rows[1].pr).unwrap().stack = StackMode::BottomUp;
-        assert!(stack_groups(&ordered, &parents, &active).is_empty());
-        assert!(stack_groups(&ordered[..1], &parents, &active).is_empty());
+        assert!(stack_groups(&ordered, &parents, &active, &BTreeMap::new()).is_empty());
+        assert!(stack_groups(&ordered[..1], &parents, &active, &BTreeMap::new()).is_empty());
     }
 
     #[test]
@@ -1119,7 +1264,7 @@ mod tests {
             })
             .collect();
         let ordered: Vec<_> = rows.iter().map(Cow::Borrowed).collect();
-        let groups = stack_groups(&ordered, &parents, &active);
+        let groups = stack_groups(&ordered, &parents, &active, &BTreeMap::new());
         assert_eq!(
             groups
                 .iter()

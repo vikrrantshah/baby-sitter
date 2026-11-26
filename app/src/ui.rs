@@ -306,6 +306,30 @@ impl AppView {
         let phase = (self.pulse_epoch.elapsed().as_millis() % PERIOD_MS) as f32 / PERIOD_MS as f32;
         pulsating_between(0.35, 1.0)(phase)
     }
+    fn effective_parents(&self, prs: &[PrRow]) -> BTreeMap<PrRef, PrRef> {
+        model::effective_parents(model::stack_parents(prs), &self.config.stack_links)
+    }
+
+    fn record_stack_links(&mut self, prs: &[PrRow]) {
+        model::prune_stack_links(
+            &mut self.config.stack_links,
+            &self.config.active,
+            &self.config.history,
+        );
+        for (child, parent) in model::stack_parents(prs) {
+            if self.config.active.contains_key(&child) || self.config.active.contains_key(&parent) {
+                self.config.stack_links.insert(child, parent);
+            }
+        }
+    }
+
+    fn prune_stack_links(&mut self) {
+        model::prune_stack_links(
+            &mut self.config.stack_links,
+            &self.config.active,
+            &self.config.history,
+        );
+    }
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Settings(SettingsPage::App);
         cx.notify();
@@ -419,6 +443,7 @@ impl AppView {
                                     finished_at: model::unix_now(),
                                 },
                             );
+                            this.prune_stack_links();
                             if *outcome == Outcome::Merged
                                 && (!this.config.app.auto_dismiss_merged
                                     || this.config.app.clear_merged_after.is_zero())
@@ -1197,6 +1222,11 @@ impl AppView {
                         this.refresh_error = None;
                         this.titles
                             .extend(prs.iter().map(|row| (row.pr.clone(), row.title.clone())));
+                        let previous_links = this.config.stack_links.clone();
+                        this.record_stack_links(&prs);
+                        if this.config.stack_links != previous_links {
+                            this.save();
+                        }
                         this.closed_prs.retain(|pr, state| {
                             let found = prs.iter().any(|row| &row.pr == pr);
                             match (*state, found) {
@@ -1425,8 +1455,20 @@ impl AppView {
             stack: mode,
         };
         self.config.active.insert(pr.clone(), sit);
+        let previous_links = self.config.stack_links.clone();
+        if let Load::Ready(rows) = &self.prs {
+            let links = model::stack_parents(rows);
+            for (child, parent) in links {
+                if self.config.active.contains_key(&child)
+                    || self.config.active.contains_key(&parent)
+                {
+                    self.config.stack_links.insert(child, parent);
+                }
+            }
+        }
         if !self.save() {
             self.config.active.remove(&pr);
+            self.config.stack_links = previous_links;
             if let Some(past) = previous {
                 self.config.history.insert(pr, past);
             }
@@ -1447,7 +1489,7 @@ impl AppView {
         let Load::Ready(rows) = &self.prs else {
             return;
         };
-        let parents = model::stack_parents(rows);
+        let parents = self.effective_parents(rows);
         let tree = model::stack_tree(pr, &parents);
         if let Some(other) = tree
             .iter()
@@ -1526,7 +1568,10 @@ impl AppView {
             _ => return true,
         };
         let previous = self.config.history.remove(&pr);
+        let previous_links = self.config.stack_links.clone();
+        self.prune_stack_links();
         if !self.save() {
+            self.config.stack_links = previous_links;
             if let Some(past) = previous {
                 self.config.history.insert(pr, past);
             }
@@ -1581,7 +1626,10 @@ impl AppView {
             return;
         };
         let old = self.config.active.remove(&pr);
+        let previous_links = self.config.stack_links.clone();
+        self.prune_stack_links();
         if !self.save() {
+            self.config.stack_links = previous_links;
             if let Some(deadline) = old {
                 self.config.active.insert(pr, deadline);
             }
@@ -2681,7 +2729,7 @@ impl AppView {
                     let mode = match &this.prs {
                         Load::Ready(rows) => model::stack_mode_of(
                             &pr,
-                            &model::stack_parents(rows),
+                            &this.effective_parents(rows),
                             &this.config.active,
                         )
                         .unwrap_or_default(),
@@ -2691,20 +2739,21 @@ impl AppView {
                 })),
             )
         };
-        let dismiss = matches!(state, Some(SitState::Finished(_))).then(|| {
-            let pr = row.pr.clone();
-            round_button(
-                SharedString::from(format!("dismiss-{pr}")),
-                IconName::X,
-                "Dismiss",
-                muted(),
-                ink(),
-                cx,
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.dismiss(pr.clone(), window, cx);
-            }))
-        });
+        let dismiss =
+            (matches!(state, Some(SitState::Finished(_))) && group.is_none()).then(|| {
+                let pr = row.pr.clone();
+                round_button(
+                    SharedString::from(format!("dismiss-{pr}")),
+                    IconName::X,
+                    "Dismiss",
+                    muted(),
+                    ink(),
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.dismiss(pr.clone(), window, cx);
+                }))
+            });
         let time_left = (active && group.is_none())
             .then(|| self.config.active.get(&row.pr))
             .flatten()
@@ -2970,12 +3019,16 @@ impl AppView {
                     )
                 },
             );
-        let rail_line = |segment: Div| {
+        let inset = if group.is_some() {
+            ROW_INSET - 9.
+        } else {
+            ROW_INSET
+        };
+        let rail_line = |segment: Div, upper: bool| {
             segment
                 .absolute()
-                .left(px(ROW_INSET + 15.5))
+                .left(px(inset + 15.5))
                 .w(px(3.))
-                .rounded_full()
                 .bg(accent().opacity(0.7))
                 .when_some(
                     group.filter(|(_, running)| *running),
@@ -2986,60 +3039,91 @@ impl AppView {
                         } else {
                             phase
                         };
-                        segment.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top(relative(phase * 0.8))
-                                .w_full()
-                                .h(relative(0.2))
-                                .rounded_full()
-                                .bg(accent()),
-                        )
+                        let visible = if upper { phase >= 0.5 } else { phase < 0.5 };
+                        let local = if upper {
+                            (phase - 0.5) * 2.
+                        } else {
+                            phase * 2.
+                        };
+                        segment.when(visible, |segment| {
+                            segment.child(
+                                div()
+                                    .absolute()
+                                    .left(px(-1.5))
+                                    .top(relative(local))
+                                    .mt(px(-3.))
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(accent().opacity((std::f32::consts::PI * phase).sin())),
+                            )
+                        })
                     },
                 )
         };
         div()
             .relative()
-            .px(px(ROW_INSET))
+            .px(px(inset))
             .flex_shrink_0()
             .py(px(18.))
             .when(!last, |item| item.border_b_1().border_color(divider()))
             .when(rail.up, |item| {
-                item.child(rail_line(div()).top_0().h(px(18.)))
+                item.child(rail_line(div(), true).top_0().h(px(18.)))
             })
             .when(rail.down, |item| {
-                item.child(rail_line(div()).top(px(52.)).bottom_0())
+                item.child(rail_line(div(), false).top(px(52.)).bottom_0())
             })
             .flex()
             .items_start()
             .gap(px(20.))
             .child(
-                div()
-                    .flex_shrink_0()
-                    .size(px(34.))
-                    .rounded_full()
-                    .when(next, |node| node.border_2().border_color(accent()))
-                    .child(match action {
-                        Some(action) => action.into_any_element(),
-                        None if shows_merged => {
-                            let color = pr_state_color(PrState::Merged);
+                div().flex_shrink_0().size(px(34.)).child(match action {
+                    Some(action) => action.into_any_element(),
+                    None if shows_merged => {
+                        let color = pr_state_color(PrState::Merged);
+                        div()
+                            .id(SharedString::from(format!("merged-{}", row.pr)))
+                            .flex_shrink_0()
+                            .size(px(34.))
+                            .rounded_full()
+                            .bg(color.opacity(0.18))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(color)
+                            .child(Icon::empty().path("icons/git-merge.svg").size(px(16.)))
+                            .tooltip(|window, cx| Tooltip::new("Merged").build(window, cx))
+                            .into_any_element()
+                    }
+                    None if active && group.is_some() => div()
+                        .id(SharedString::from(format!("stack-node-{}", row.pr)))
+                        .size(px(34.))
+                        .rounded_full()
+                        .bg(if next {
+                            accent().opacity(0.18)
+                        } else {
+                            raised()
+                        })
+                        .when(next, |node| node.border_2().border_color(accent()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
                             div()
-                                .id(SharedString::from(format!("merged-{}", row.pr)))
-                                .flex_shrink_0()
-                                .size(px(34.))
+                                .size(px(8.))
                                 .rounded_full()
-                                .bg(color.opacity(0.18))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(color)
-                                .child(Icon::empty().path("icons/git-merge.svg").size(px(16.)))
-                                .tooltip(|window, cx| Tooltip::new("Merged").build(window, cx))
-                                .into_any_element()
-                        }
-                        None => div().size(px(34.)).into_any_element(),
-                    }),
+                                .bg(accent().opacity(self.pulse())),
+                        )
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(if next {
+                                "Merges next"
+                            } else {
+                                "Babysat with the stack"
+                            })
+                            .build(window, cx)
+                        })
+                        .into_any_element(),
+                    None => div().size(px(34.)).into_any_element(),
+                }),
             )
             .child(content)
             .child(
@@ -3085,21 +3169,33 @@ impl AppView {
     fn render_dashboard(&self, fullscreen: bool, cx: &mut Context<Self>) -> (Div, Div) {
         let mut rows = self.dashboard_rows();
         let parents = match &self.prs {
-            Load::Ready(prs) => model::stack_parents(prs),
-            _ => BTreeMap::new(),
+            Load::Ready(prs) => self.effective_parents(prs),
+            _ => self.effective_parents(&[]),
         };
         let watched = model::watched_prs(&rows, &self.states, &parents);
         let watch_counts = model::watch_counts(&rows, &watched);
         let query = self.search.read(cx).value().to_string();
         let searching = !query.trim().is_empty();
-        rows.retain(|row| {
+        let admitted = |row: &PrRow| {
             if searching {
                 model::matches_search(row, &query)
             } else {
                 self.watch_filter.admits(watched.contains(&row.pr))
                     && self.state_filter.admits(row, self.states.get(&row.pr))
             }
-        });
+        };
+        let whole_stacks: BTreeSet<PrRef> = if searching {
+            BTreeSet::new()
+        } else {
+            let ordered = model::order_stacks(rows.clone(), &parents);
+            model::stack_groups(&ordered, &parents, &self.config.active, &self.states)
+                .into_iter()
+                .map(|group| &ordered[group.rows])
+                .filter(|members| members.iter().any(|row| admitted(row)))
+                .flat_map(|members| members.iter().map(|row| row.pr.clone()))
+                .collect()
+        };
+        rows.retain(|row| whole_stacks.contains(&row.pr) || admitted(row));
         let rows = model::order_stacks(rows, &parents);
         let list = match &self.prs {
             Load::Loading if rows.is_empty() => message("Loading pull requests…", None),
@@ -3170,7 +3266,12 @@ impl AppView {
                         .flex_col()
                         .children({
                             let rails = model::stack_rails(&rows, &parents);
-                            let groups = model::stack_groups(&rows, &parents, &self.config.active);
+                            let groups = model::stack_groups(
+                                &rows,
+                                &parents,
+                                &self.config.active,
+                                &self.states,
+                            );
                             let mut elements = Vec::new();
                             let mut index = 0;
                             for group in &groups {
@@ -3197,10 +3298,10 @@ impl AppView {
                                     StackMode::BottomUp => "bottom up",
                                     StackMode::TopDown => "top down",
                                 };
-                                let label = if group.watched < count {
+                                let label = if group.merged > 0 {
                                     format!(
-                                        "Stack of {count} · {mode} · watching {} of {count}",
-                                        group.watched
+                                        "Stack of {count} · {mode} · {} of {count} merged",
+                                        group.merged
                                     )
                                 } else {
                                     format!("Stack of {count} · {mode}")
@@ -3236,7 +3337,8 @@ impl AppView {
                                     ))
                                     .child(stop);
                                 let mut card = div()
-                                    .mx(px(ROW_INSET))
+                                    .flex_shrink_0()
+                                    .mx(px(8.))
                                     .my(px(6.))
                                     .rounded(px(10.))
                                     .border_1()
@@ -4266,14 +4368,11 @@ impl Render for AppView {
         });
         let stack_flowing = match &self.prs {
             Load::Ready(prs) => {
-                let parents = model::stack_parents(prs);
-                let mut bottoms = BTreeSet::new();
-                self.config.active.iter().any(|(pr, sit)| {
-                    running(pr)
-                        && ((sit.stack == StackMode::TopDown
-                            && model::stack_tree(pr, &parents).len() > 1)
-                            || !bottoms.insert(model::stack_of(pr, &parents).swap_remove(0)))
-                })
+                let parents = self.effective_parents(prs);
+                let rows = model::order_stacks(self.dashboard_rows(), &parents);
+                model::stack_groups(&rows, &parents, &self.config.active, &self.states)
+                    .iter()
+                    .any(|group| rows[group.rows.clone()].iter().any(|row| running(&row.pr)))
             }
             _ => false,
         };
