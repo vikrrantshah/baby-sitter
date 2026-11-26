@@ -2883,7 +2883,24 @@ impl AppView {
                     .text_color(ink())
                     .child(row.title.clone()),
             );
-        let place = format!("{} #{}", row.pr.repo, row.pr.number);
+        let place = if row.base.is_empty() || row.head.is_empty() {
+            div()
+                .flex_shrink_0()
+                .text_size(px(13.))
+                .text_color(muted())
+                .child(row.pr.repo.to_string())
+        } else {
+            div()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(13.))
+                .text_color(muted())
+                .child(branch_chip(format!("head-{}", row.pr), &row.head).min_w_0())
+                .child(div().flex_shrink_0().child("into"))
+                .child(branch_chip(format!("base-{}", row.pr), &row.base).flex_shrink_0())
+        };
         let copy_url = row.url.clone();
         let copy_pr = row.pr.clone();
         let path = sitter::worktree_path(&self.data, &row.pr);
@@ -2935,16 +2952,27 @@ impl AppView {
                     .gap(px(16.))
                     .child(
                         div()
-                            .id(SharedString::from(format!("copy-link-{}", row.pr)))
-                            .text_size(px(13.))
-                            .text_color(muted())
-                            .cursor_pointer()
-                            .hover(|style| style.text_color(ink()).underline())
-                            .tooltip(|window, cx| Tooltip::new("Copy link").build(window, cx))
-                            .on_click(move |_, window, cx| {
-                                copy_pr_link(&copy_pr, &copy_url, window, cx)
-                            })
-                            .child(place),
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(place)
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("copy-link-{}", row.pr)))
+                                    .flex_shrink_0()
+                                    .text_size(px(13.))
+                                    .text_color(muted())
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(ink()).underline())
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("Copy link").build(window, cx)
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        copy_pr_link(&copy_pr, &copy_url, window, cx)
+                                    })
+                                    .child(format!("#{}", row.pr.number)),
+                            ),
                     )
                     .child(gate_icons(
                         &row.pr,
@@ -4036,6 +4064,26 @@ fn duration_fields(inputs: &RepoInputs) -> Div {
             &inputs.interval_error,
             false,
         ))
+}
+
+/// A branch name in a gray chip, for the head and base of a row's PR.
+fn branch_chip(id: String, name: &str) -> Stateful<Div> {
+    let gray = muted();
+    let full = SharedString::from(name.to_owned());
+    div()
+        .id(SharedString::from(id))
+        .px(px(6.))
+        .py(px(1.))
+        .rounded(px(6.))
+        .bg(gray.opacity(0.14))
+        .text_color(gray)
+        .font_family("Menlo")
+        .text_size(px(12.))
+        .text_ellipsis()
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+        .child(name.to_owned())
 }
 
 fn open_url(url: String) {
