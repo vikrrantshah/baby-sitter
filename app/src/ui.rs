@@ -1082,6 +1082,9 @@ impl AppView {
         self.load_prs(window, cx);
     }
     fn load_repos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading_repos {
+            return;
+        }
         if !matches!(self.repos, Load::Ready(_)) {
             self.repos = Load::Loading;
         }
@@ -1975,12 +1978,34 @@ impl AppView {
             .justify_between()
             .gap(px(12.))
             .child(scope)
-            .child(header_picker(
-                &self.org_select,
-                "Filter by organization",
-                "All organizations",
-                Size::Medium,
-            ));
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(header_picker(
+                        &self.org_select,
+                        "Filter by organization",
+                        "All organizations",
+                        Size::Medium,
+                    ))
+                    .child(
+                        round_button_with(
+                            "refresh-repos".into(),
+                            refresh_icon(self.loading_repos),
+                            "Refresh repositories",
+                            raised(),
+                            ink(),
+                            cx,
+                        )
+                        .size(px(32.))
+                        .rounded(px(16.))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.load_repos(window, cx);
+                            cx.notify();
+                        })),
+                    ),
+            );
         let body = div()
             .size_full()
             .flex()
