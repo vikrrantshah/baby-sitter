@@ -2870,7 +2870,10 @@ impl AppView {
                             } else {
                                 [GateState::Pending; 4]
                             });
-                            if row.state == PrState::Draft {
+                            let lands_through_bottom = parents.contains_key(&row.pr)
+                                && model::stack_mode_of(&row.pr, parents, &self.config.active)
+                                    == Some(StackMode::TopDown);
+                            if row.state == PrState::Draft || lands_through_bottom {
                                 gates[3] = GateState::Skipped;
                             }
                             gates
