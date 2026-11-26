@@ -1,5 +1,5 @@
 mod act;
-mod codex;
+mod agent;
 mod decide;
 mod domain;
 mod git;
@@ -44,6 +44,12 @@ struct Cli {
     /// Read instruction overrides from a JSON file.
     #[arg(long, value_name = "FILE")]
     prompts: Option<PathBuf>,
+    /// Coding agent to run.
+    #[arg(long, value_enum, default_value = "codex")]
+    agent: agent::AgentKind,
+    /// Model to use instead of the agent's default.
+    #[arg(long)]
+    model: Option<String>,
     /// Print the default instruction texts as JSON and exit.
     #[arg(long)]
     print_default_prompts: bool,
@@ -121,7 +127,7 @@ fn main() -> ExitCode {
 
 fn run_cli(cli: Cli) -> ExitCode {
     if cli.print_default_prompts {
-        println!("{}", codex::default_prompts_json());
+        println!("{}", agent::default_prompts_json());
         return ExitCode::SUCCESS;
     }
     let deadline = match Instant::now().checked_add(cli.timeout) {
@@ -145,12 +151,16 @@ fn run_cli(cli: Cli) -> ExitCode {
 }
 fn run(cli: &Cli, deadline: Instant) -> anyhow::Result<()> {
     if let Some(path) = cli.prompts.as_deref() {
-        codex::load(path)?;
+        agent::load(path)?;
     }
     let env = act::Env::new(
         cli.pr.as_deref(),
         cli.dry_run,
         cli.prompts.clone(),
+        agent::AgentConfig {
+            kind: cli.agent,
+            model: cli.model.clone(),
+        },
         deadline,
     )?;
     let mut consecutive_failures = 0;
@@ -245,6 +255,29 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_and_model_options_are_visible_and_parse() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--agent <AGENT>"));
+        assert!(help.contains("--model <MODEL>"));
+        for (name, kind) in [
+            ("codex", agent::AgentKind::Codex),
+            ("claude", agent::AgentKind::Claude),
+            ("pi", agent::AgentKind::Pi),
+            ("omp", agent::AgentKind::Omp),
+        ] {
+            assert!(help.contains(name));
+            let cli = Cli::try_parse_from(["baby-sitter", "--agent", name, "--model", "example"])
+                .unwrap();
+            assert_eq!(cli.agent, kind);
+            assert_eq!(cli.model.as_deref(), Some("example"));
+        }
+        let cli = Cli::try_parse_from(["baby-sitter"]).unwrap();
+        assert_eq!(cli.agent, agent::AgentKind::Codex);
+        assert!(cli.model.is_none());
+    }
 
     #[test]
     fn stack_option_defaults_to_bottom_up_and_accepts_top_down() {

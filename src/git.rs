@@ -486,8 +486,8 @@ mod tests {
         crate::act::resolve_conflicts(&repo.git, &head, "main", |files| {
             assert_eq!(files, &["src.txt"]);
             fs::write(repo.git.root.join("src.txt"), "both versions\n").unwrap();
-            Ok(crate::codex::ConflictFix {
-                outcome: crate::codex::ConflictOutcome::Resolved,
+            Ok(crate::agent::ConflictFix {
+                outcome: crate::agent::ConflictOutcome::Resolved,
                 summary: "Keep both versions\nExplain the resolution".into(),
             })
         })
@@ -585,8 +585,8 @@ mod tests {
         assert!(
             crate::act::resolve_conflicts(&repo.git, &head, "main", |_| {
                 fs::write(repo.git.root.join("src.txt"), "resolved\n").unwrap();
-                Ok(crate::codex::ConflictFix {
-                    outcome: crate::codex::ConflictOutcome::Resolved,
+                Ok(crate::agent::ConflictFix {
+                    outcome: crate::agent::ConflictOutcome::Resolved,
                     summary: "Resolve the conflict".into(),
                 })
             })
@@ -637,8 +637,8 @@ mod tests {
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
         let error = crate::act::resolve_conflicts(&repo.git, &head, "main", |_| {
             fs::write(repo.git.root.join("src.txt"), "resolved\n").unwrap();
-            Ok(crate::codex::ConflictFix {
-                outcome: crate::codex::ConflictOutcome::Resolved,
+            Ok(crate::agent::ConflictFix {
+                outcome: crate::agent::ConflictOutcome::Resolved,
                 summary: "Resolve the conflict".into(),
             })
         })
@@ -679,11 +679,11 @@ mod tests {
                 if !matches!(failure, "markers" | "index") {
                     fs::write(repo.git.root.join("src.txt"), "resolved\n").unwrap();
                 }
-                Ok(crate::codex::ConflictFix {
+                Ok(crate::agent::ConflictFix {
                     outcome: if failure == "human" {
-                        crate::codex::ConflictOutcome::NeedsHuman
+                        crate::agent::ConflictOutcome::NeedsHuman
                     } else {
-                        crate::codex::ConflictOutcome::Resolved
+                        crate::agent::ConflictOutcome::Resolved
                     },
                     summary: "A person must decide".into(),
                 })
@@ -693,8 +693,10 @@ mod tests {
             match failure {
                 "human" | "error" => assert!(error.contains("Merge conflicts need a person")),
                 "markers" => assert!(error.contains("conflict markers remain")),
-                "outside" => assert!(error.contains("codex edited files outside the conflicts")),
-                "index" => assert!(error.contains("codex changed the Git index")),
+                "outside" => {
+                    assert!(error.contains("the coding agent edited files outside the conflicts"))
+                }
+                "index" => assert!(error.contains("the coding agent changed the Git index")),
                 _ => unreachable!(),
             }
             assert!(!repo.git.merge_in_progress(), "{failure}");

@@ -1,5 +1,5 @@
 use crate::{
-    codex,
+    agent,
     decide::Action,
     domain::*,
     git::{Git, MergeStart, is_ci_configuration},
@@ -16,6 +16,7 @@ pub struct Env {
     pub gh: Gh,
     pub git: Git,
     pub prompts_path: Option<PathBuf>,
+    pub agent: agent::AgentConfig,
     pub deadline: Instant,
     pub _lock: Option<File>,
 }
@@ -24,6 +25,7 @@ impl Env {
         arg: Option<&str>,
         dry_run: bool,
         prompts_path: Option<PathBuf>,
+        agent: agent::AgentConfig,
         deadline: Instant,
     ) -> anyhow::Result<Self> {
         let gh = Gh::resolve(arg, deadline)?;
@@ -46,6 +48,7 @@ impl Env {
             gh,
             git,
             prompts_path,
+            agent,
             deadline,
             _lock: lock,
         })
@@ -86,16 +89,17 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 env.git.is_clean()?,
                 "working tree became dirty since snapshot"
             );
-            let resolved = codex::run(
+            let resolved = agent::run(
                 &env.git.root,
                 &env.git.state_dir(),
                 &batch,
                 env.prompts_path.as_deref(),
+                &env.agent,
                 env.deadline,
             )?;
             ensure!(
                 env.git.head()? == head.sha,
-                "codex changed HEAD; inspect the checkout"
+                "the coding agent changed HEAD; inspect the checkout"
             );
             if env.git.commit_all_with(crate::git::REVIEW_COMMIT_MESSAGE)? {
                 env.git.push(&head.branch)?;
@@ -134,12 +138,13 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
         }
         Action::ResolveConflicts { head, base } => {
             resolve_conflicts(&env.git, &head, &base, |files| {
-                codex::resolve_conflicts(
+                agent::resolve_conflicts(
                     &env.git.root,
                     &env.git.state_dir(),
                     &base,
                     files,
                     env.prompts_path.as_deref(),
+                    &env.agent,
                     env.deadline,
                 )
             })
@@ -165,16 +170,17 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                 };
                 checks_with_logs.push((check, log));
             }
-            let result = codex::fix_ci(
+            let result = agent::fix_ci(
                 &env.git.root,
                 &env.git.state_dir(),
                 &checks_with_logs,
                 env.prompts_path.as_deref(),
+                &env.agent,
                 env.deadline,
             );
             ensure!(
                 env.git.head()? == head.sha,
-                "codex changed HEAD; inspect the checkout"
+                "the coding agent changed HEAD; inspect the checkout"
             );
             let result = match result {
                 Ok(result) => result,
@@ -183,11 +189,11 @@ pub fn execute(env: &Env, action: Action, pr_id: &str) -> anyhow::Result<()> {
                     return Err(error);
                 }
             };
-            if result.outcome == codex::CiFixOutcome::NeedsHuman && env.git.is_clean()? {
+            if result.outcome == agent::CiFixOutcome::NeedsHuman && env.git.is_clean()? {
                 bail!("CI needs a person: {names}: {}", result.summary.trim());
             }
             commit_ci_fix(env, &head, &result.summary)?;
-            if result.outcome == codex::CiFixOutcome::NeedsHuman {
+            if result.outcome == agent::CiFixOutcome::NeedsHuman {
                 eprintln!(
                     "baby-sitter: pushed a partial CI fix for {names}: {}",
                     result.summary.trim()
@@ -201,7 +207,7 @@ pub(crate) fn resolve_conflicts(
     git: &Git,
     head: &Head,
     base: &str,
-    resolve: impl FnOnce(&[String]) -> anyhow::Result<codex::ConflictFix>,
+    resolve: impl FnOnce(&[String]) -> anyhow::Result<agent::ConflictFix>,
 ) -> anyhow::Result<()> {
     ensure!(git.head()? == head.sha, "local HEAD moved since snapshot");
     ensure!(
@@ -235,18 +241,18 @@ pub(crate) fn resolve_conflicts(
                     format!("Merge conflicts need a person: {}", files.join(", "))
                 })?;
                 ensure!(
-                    fix.outcome != codex::ConflictOutcome::NeedsHuman,
+                    fix.outcome != agent::ConflictOutcome::NeedsHuman,
                     "Merge conflicts need a person: {}: {}",
                     files.join(", "),
                     fix.summary.trim()
                 );
                 ensure!(
                     git.head()? == head.sha,
-                    "codex changed HEAD; inspect the checkout"
+                    "the coding agent changed HEAD; inspect the checkout"
                 );
                 ensure!(
                     git.index_state()? == index,
-                    "codex changed the Git index; inspect the checkout"
+                    "the coding agent changed the Git index; inspect the checkout"
                 );
                 let outside: Vec<_> = git
                     .unstaged_paths()?
@@ -256,7 +262,7 @@ pub(crate) fn resolve_conflicts(
                     .collect();
                 ensure!(
                     outside.is_empty(),
-                    "codex edited files outside the conflicts: {}",
+                    "the coding agent edited files outside the conflicts: {}",
                     outside.join(", ")
                 );
                 ensure!(
@@ -307,7 +313,7 @@ fn ensure_ci_configuration_unchanged(git: &Git) -> anyhow::Result<()> {
     let protected = git.ci_configuration_changes()?;
     ensure!(
         protected.is_empty(),
-        "codex edited CI configuration: {}; changes left uncommitted for inspection",
+        "the coding agent edited CI configuration: {}; changes left uncommitted for inspection",
         protected.join(", ")
     );
     Ok(())
@@ -317,7 +323,7 @@ fn commit_ci_fix(env: &Env, head: &Head, summary: &str) -> anyhow::Result<()> {
     ensure_ci_configuration_unchanged(&env.git)?;
     ensure!(
         env.git.commit_all_with(&ci_commit_message(summary))?,
-        "codex reported a fix but changed nothing"
+        "the coding agent reported a fix but changed nothing"
     );
     let protected = env.git.committed_ci_changes(&head.sha)?;
     ensure!(
@@ -336,7 +342,7 @@ fn optional_job_log(result: anyhow::Result<String>) -> anyhow::Result<Option<Str
     }
 }
 
-fn reply_body(resolution: &codex::Resolution) -> String {
+fn reply_body(resolution: &agent::Resolution) -> String {
     let marker = Marker {
         item: resolution.item.id.clone(),
         outcome: resolution.outcome,

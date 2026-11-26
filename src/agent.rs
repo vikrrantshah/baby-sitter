@@ -7,6 +7,50 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, fmt::Write, fs, path::Path, process::Command, time::Instant};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AgentKind {
+    #[default]
+    Codex,
+    Claude,
+    Pi,
+    Omp,
+}
+
+impl std::fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct AgentConfig {
+    pub kind: AgentKind,
+    pub model: Option<String>,
+}
+
+const SEATBELT_PROFILE: &str = r##"(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+  (subpath (param "WORKTREE"))
+  (subpath "/private/tmp")
+  (subpath "/private/var/folders")
+  (subpath (param "STATE"))
+  (regex (param "STATE_FILE"))
+  (subpath (string-append (param "HOME") "/.cache"))
+  (subpath (string-append (param "HOME") "/Library/Caches"))
+  (literal "/dev/null")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr")
+  (literal "/dev/tty")
+  (regex #"^/dev/fd/")
+  (regex #"^/dev/ttys"))"##;
+
 const REVIEW_INSTRUCTIONS: &str = "Edit files and run checks. Each item is an unanswered review thread. Return exactly one result per thread id. Use fixed only when the code addresses the feedback. Reply text is posted verbatim in the thread as the viewer.";
 const CI_INSTRUCTIONS: &str = "Fix every cause of the failing checks that is in the code. \
     Keep the pull request's purpose: fix what breaks the checks without reverting, disabling, or reshaping the behavior the PR introduces. \
@@ -161,6 +205,7 @@ pub fn run(
     state_dir: &Path,
     batch: &Batch,
     prompts_path: Option<&Path>,
+    agent: &AgentConfig,
     deadline: Instant,
 ) -> anyhow::Result<Vec<Resolution>> {
     let ids: Vec<_> = batch.0.iter().map(|i| i.id.to_string()).collect();
@@ -170,8 +215,10 @@ pub fn run(
         state_dir,
         &value,
         prompts_path,
-        PromptKind::Review,
-        |instructions| review_prompt(instructions, batch),
+        agent,
+        (PromptKind::Review, |instructions| {
+            review_prompt(instructions, batch)
+        }),
         deadline,
     )?;
     let mut results = BTreeMap::new();
@@ -182,14 +229,14 @@ pub fn run(
         }
         let outcome = r.outcome.parse()?;
         if results.insert(id.clone(), (outcome, r.reply)).is_some() {
-            bail!("duplicate codex result {id}");
+            bail!("duplicate coding agent result {id}");
         }
     }
     let mut resolved = Vec::new();
     for item in &batch.0 {
         let (outcome, reply) = results
             .remove(&item.id)
-            .with_context(|| format!("missing codex result {}", item.id))?;
+            .with_context(|| format!("missing coding agent result {}", item.id))?;
         resolved.push(Resolution {
             item: item.clone(),
             outcome,
@@ -197,7 +244,7 @@ pub fn run(
         });
     }
     if !results.is_empty() {
-        bail!("unexpected codex result ids: {:?}", results.keys());
+        bail!("unexpected coding agent result ids: {:?}", results.keys());
     }
     Ok(resolved)
 }
@@ -207,6 +254,7 @@ pub fn fix_ci(
     state_dir: &Path,
     checks: &[(FailedCheck, Option<String>)],
     prompts_path: Option<&Path>,
+    agent: &AgentConfig,
     deadline: Instant,
 ) -> anyhow::Result<CiFix> {
     let schema = serde_json::json!({
@@ -223,12 +271,14 @@ pub fn fix_ci(
         state_dir,
         &schema,
         prompts_path,
-        PromptKind::Ci,
-        |instructions| ci_prompt(instructions, checks),
+        agent,
+        (PromptKind::Ci, |instructions| {
+            ci_prompt(instructions, checks)
+        }),
         deadline,
     )?;
     if result.summary.trim().is_empty() {
-        bail!("codex returned an empty CI fix summary");
+        bail!("the coding agent returned an empty CI fix summary");
     }
     Ok(result)
 }
@@ -238,6 +288,7 @@ pub fn resolve_conflicts(
     base: &str,
     files: &[String],
     prompts_path: Option<&Path>,
+    agent: &AgentConfig,
     deadline: Instant,
 ) -> anyhow::Result<ConflictFix> {
     let schema = serde_json::json!({
@@ -254,12 +305,14 @@ pub fn resolve_conflicts(
         state_dir,
         &schema,
         prompts_path,
-        PromptKind::Conflicts,
-        |instructions| conflict_prompt(instructions, base, files),
+        agent,
+        (PromptKind::Conflicts, |instructions| {
+            conflict_prompt(instructions, base, files)
+        }),
         deadline,
     )?;
     if result.summary.trim().is_empty() {
-        bail!("codex returned an empty conflict resolution summary");
+        bail!("the coding agent returned an empty conflict resolution summary");
     }
     Ok(result)
 }
@@ -309,8 +362,8 @@ fn invoke<T: DeserializeOwned>(
     state_dir: &Path,
     schema: &serde_json::Value,
     prompts_path: Option<&Path>,
-    kind: PromptKind,
-    build_prompt: impl FnOnce(&str) -> String,
+    agent: &AgentConfig,
+    (kind, build_prompt): (PromptKind, impl FnOnce(&str) -> String),
     deadline: Instant,
 ) -> anyhow::Result<T> {
     let prompts = match prompts_path {
@@ -319,33 +372,267 @@ fn invoke<T: DeserializeOwned>(
     };
     let mut prompt = build_prompt(prompts.instructions(kind));
     write!(&mut prompt, "\n\n{FIXED_RULES}").expect("writing to a string");
-    let id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let dir = state_dir.join(format!("run-{id}"));
-    fs::create_dir_all(&dir)?;
-    let schema_path = dir.join("schema.json");
-    let output = dir.join("out.json");
-    fs::write(&schema_path, serde_json::to_vec(schema)?)?;
-    proc::run(
-        Command::new("codex")
+    if agent.kind == AgentKind::Codex {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let dir = state_dir.join(format!("run-{id}"));
+        fs::create_dir_all(&dir)?;
+        let schema_path = dir.join("schema.json");
+        let output = dir.join("out.json");
+        fs::write(&schema_path, serde_json::to_vec(schema)?)?;
+        let mut command = Command::new("codex");
+        command
             .args(["exec", "--sandbox", "workspace-write", "--ephemeral", "-C"])
             .arg(root)
             .arg("--output-schema")
             .arg(&schema_path)
             .arg("-o")
-            .arg(&output)
-            .arg("-"),
-        Some(&prompt),
-        deadline,
-    )?;
-    serde_json::from_slice(&fs::read(&output).context("reading codex output")?)
-        .context("parsing codex output")
+            .arg(&output);
+        if let Some(model) = &agent.model {
+            command.args(["-m", model]);
+        }
+        command.arg("-");
+        proc::run(&mut command, Some(&prompt), deadline)?;
+        return serde_json::from_slice(&fs::read(&output).context("reading coding agent output")?)
+            .context("parsing coding agent output");
+    }
+    let home = std::env::var("HOME").context("HOME is required for the coding agent sandbox")?;
+    let root = fs::canonicalize(root).context("canonicalizing worktree")?;
+    let (program, state) = match agent.kind {
+        AgentKind::Claude => ("claude", ".claude"),
+        AgentKind::Pi => ("pi", ".pi"),
+        AgentKind::Omp => ("omp", ".omp"),
+        AgentKind::Codex => unreachable!(),
+    };
+    let state_file = if agent.kind == AgentKind::Claude {
+        let escaped: String = home
+            .chars()
+            .flat_map(|c| {
+                if ".+*?()[]{}^$|\\".contains(c) {
+                    vec!['\\', c]
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
+        format!("^{escaped}/\\.claude\\.json")
+    } else {
+        "^$".to_owned()
+    };
+    let mut command = Command::new("sandbox-exec");
+    command
+        .arg("-p")
+        .arg(SEATBELT_PROFILE)
+        .arg("-D")
+        .arg(format!("WORKTREE={}", root.display()))
+        .arg("-D")
+        .arg(format!("HOME={home}"))
+        .arg("-D")
+        .arg(format!("STATE={home}/{state}"))
+        .arg("-D")
+        .arg(format!("STATE_FILE={state_file}"))
+        .arg(program)
+        .current_dir(&root);
+    match agent.kind {
+        AgentKind::Claude => {
+            command.args([
+                "-p",
+                "--dangerously-skip-permissions",
+                "--no-session-persistence",
+                "--output-format",
+                "json",
+                "--json-schema",
+                &schema.to_string(),
+            ]);
+        }
+        AgentKind::Omp | AgentKind::Pi => {
+            write!(&mut prompt, "\nYour final message must be only one JSON object that matches this JSON schema, with no other text: {schema}").expect("writing to a string");
+            if agent.kind == AgentKind::Omp {
+                command.args(["-p", "--mode=json", "--no-session", "--auto-approve"]);
+            } else {
+                command.args(["-p", "--mode", "json", "--no-session"]);
+            }
+        }
+        AgentKind::Codex => unreachable!(),
+    }
+    if let Some(model) = &agent.model {
+        command.args(["--model", model]);
+    }
+    if agent.kind == AgentKind::Claude {
+        let (status, output, stderr) = proc::output(&mut command, Some(&prompt), deadline, None)?;
+        if !status.success() {
+            if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&output)
+                && let Some(result) = envelope.get("result").and_then(|value| value.as_str())
+            {
+                bail!("{result} (claude)");
+            }
+            let cause = stderr.trim();
+            if cause.is_empty() {
+                bail!("{status} (claude)");
+            }
+            bail!("{cause} (claude)");
+        }
+        parse_claude(&output)
+    } else {
+        let output = proc::run(&mut command, Some(&prompt), deadline)?;
+        parse_events(&output)
+    }
+}
+
+fn parse_claude<T: DeserializeOwned>(output: &str) -> anyhow::Result<T> {
+    let envelope: serde_json::Value =
+        serde_json::from_str(output).context("parsing Claude Code envelope")?;
+    let result = envelope
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("no result text");
+    if envelope.get("is_error").and_then(|v| v.as_bool()) != Some(false) {
+        bail!("Claude Code failed: {result}");
+    }
+    let structured = envelope
+        .get("structured_output")
+        .filter(|v| !v.is_null())
+        .with_context(|| format!("Claude Code missing structured output: {result}"))?;
+    serde_json::from_value(structured.clone()).context("parsing Claude Code structured output")
+}
+
+fn parse_events<T: DeserializeOwned>(output: &str) -> anyhow::Result<T> {
+    let mut last = None;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let event: serde_json::Value =
+            serde_json::from_str(line).context("parsing coding agent JSONL event")?;
+        if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
+            last = Some(event);
+        }
+    }
+    let event = last.context("missing assistant message_end")?;
+    let message = &event["message"];
+    if message["stopReason"] != "stop" {
+        bail!(
+            "assistant message did not stop normally: {}",
+            message["stopReason"]
+        );
+    }
+    let blocks = message["content"]
+        .as_array()
+        .context("missing assistant content blocks")?;
+    let mut text = String::new();
+    for block in blocks.iter().filter(|block| block["type"] == "text") {
+        text.push_str(block["text"].as_str().context("missing assistant text")?);
+    }
+    let mut text = text.trim();
+    if let Some(fenced) = text.strip_prefix("```") {
+        let (language, body) = fenced
+            .split_once('\n')
+            .context("missing code fence newline")?;
+        if !matches!(language.trim(), "" | "json") {
+            bail!("unsupported code fence language");
+        }
+        text = body
+            .trim_end()
+            .strip_suffix("```")
+            .context("missing closing code fence")?
+            .trim();
+    }
+    if text.is_empty() {
+        bail!("missing assistant text");
+    }
+    serde_json::from_str(text).context("parsing coding agent final message")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_envelopes_require_success_and_structured_output() {
+        let success = r#"{"type":"result","is_error":false,"result":"ok","structured_output":{"outcome":"fixed","summary":"Repair build"}}"#;
+        let result: CiFix = parse_claude(success).unwrap();
+        assert_eq!(result.summary, "Repair build");
+        let error = parse_claude::<CiFix>(
+            r#"{"is_error":true,"result":"OAuth token revoked","structured_output":null}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("OAuth token revoked"));
+        let error = parse_claude::<CiFix>(
+            r#"{"is_error":false,"result":"No structured answer","structured_output":null}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("No structured answer"));
+    }
+
+    #[test]
+    fn event_stream_requires_last_successful_assistant_message() {
+        let result: serde_json::Value =
+            parse_events(include_str!("../tests/fixtures/omp.out")).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["file"], "done.txt");
+        let fenced = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"```json\n{\"answer\":42}\n```"}]}}"#;
+        let result: serde_json::Value = parse_events(fenced).unwrap();
+        assert_eq!(result["answer"], 42);
+        let failed = format!(
+            "{fenced}\n{}",
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","content":[{"type":"text","text":"{}"}]}}"#
+        );
+        assert!(
+            parse_events::<serde_json::Value>(&failed)
+                .unwrap_err()
+                .to_string()
+                .contains("stop")
+        );
+        assert!(
+            parse_events::<serde_json::Value>("{}")
+                .unwrap_err()
+                .to_string()
+                .contains("message_end")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_allows_worktree_writes_and_denies_other_writes() {
+        let unique = crate::test_support::unique_test_dir("baby-sitter-sandbox");
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(unique.file_name().unwrap());
+        let worktree = root.join("worktree");
+        let home = root.join("home");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let worktree = fs::canonicalize(worktree).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let output = Command::new("sandbox-exec")
+            .arg("-p")
+            .arg(SEATBELT_PROFILE)
+            .arg("-D")
+            .arg(format!("WORKTREE={}", worktree.display()))
+            .arg("-D")
+            .arg(format!("HOME={}", home.display()))
+            .arg("-D")
+            .arg(format!("STATE={}/.omp", home.display()))
+            .arg("-D")
+            .arg("STATE_FILE=^$")
+            .args([
+                "/bin/sh",
+                "-c",
+                "echo ok > \"$1/inside\" && ! echo bad > \"$2/outside\"",
+                "sh",
+            ])
+            .arg(&worktree)
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(worktree.join("inside")).unwrap(), "ok\n");
+        assert!(!root.join("outside").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn default_builders_preserve_instructions_and_supply_data() {
@@ -511,7 +798,7 @@ mod tests {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "codex::tests::exercise_codex_calls_in_child",
+                "agent::tests::exercise_codex_calls_in_child",
                 "--nocapture",
             ])
             .env("BABY_SITTER_CODEX_TEST_ROOT", &root)
@@ -556,7 +843,15 @@ mod tests {
             line: Some(1),
             context: "review feedback".into(),
         }]);
-        let resolutions = run(&root, &state, &batch, None, deadline()).unwrap();
+        let resolutions = run(
+            &root,
+            &state,
+            &batch,
+            None,
+            &AgentConfig::default(),
+            deadline(),
+        )
+        .unwrap();
         assert_eq!(resolutions[0].outcome, Outcome::Fixed);
         let review_prompt = prompt();
         assert!(review_prompt.contains("Use fixed only when the code addresses the feedback."));
@@ -564,9 +859,16 @@ mod tests {
 
         fs::write(&output, r#"{"outcome":"fixed","summary":"Fix checks"}"#).unwrap();
         assert_eq!(
-            fix_ci(&root, &state, &[], None, deadline())
-                .unwrap()
-                .outcome,
+            fix_ci(
+                &root,
+                &state,
+                &[],
+                None,
+                &AgentConfig::default(),
+                deadline()
+            )
+            .unwrap()
+            .outcome,
             CiFixOutcome::Fixed
         );
         let ci_prompt = prompt();
@@ -590,6 +892,7 @@ mod tests {
                 "main",
                 &["source.ts".into()],
                 None,
+                &AgentConfig::default(),
                 deadline()
             )
             .unwrap()
@@ -613,6 +916,7 @@ mod tests {
             &state,
             &[],
             None,
+            &AgentConfig::default(),
             Instant::now() + Duration::from_millis(200),
         )
         .unwrap_err();
@@ -630,7 +934,15 @@ mod tests {
             r#"{"results":[{"id":"thread:abc","outcome":"fixed","reply":"Fixed"}]}"#,
         )
         .unwrap();
-        run(&root, &state, &batch, Some(&overrides), deadline()).unwrap();
+        run(
+            &root,
+            &state,
+            &batch,
+            Some(&overrides),
+            &AgentConfig::default(),
+            deadline(),
+        )
+        .unwrap();
         let actual = prompt();
         assert!(actual.starts_with("Review override\n\nITEM thread:abc\nreview feedback"));
         assert!(ends_with_rules(&actual), "{actual}");
@@ -649,7 +961,15 @@ mod tests {
             },
             Some("compiler error".into()),
         )];
-        fix_ci(&root, &state, &checks, Some(&overrides), deadline()).unwrap();
+        fix_ci(
+            &root,
+            &state,
+            &checks,
+            Some(&overrides),
+            &AgentConfig::default(),
+            deadline(),
+        )
+        .unwrap();
         let actual = prompt();
         assert!(
             actual.starts_with("Updated CI override\n\nCheck: build\nJob log:\ncompiler error\n")
@@ -673,6 +993,7 @@ mod tests {
             "release",
             &["source.ts".into(), "other file.rs".into()],
             Some(&overrides),
+            &AgentConfig::default(),
             deadline(),
         )
         .unwrap();
@@ -685,12 +1006,28 @@ mod tests {
 
         let events = fs::read_to_string(root.join("events")).unwrap();
         fs::write(&overrides, r#"{"ci":null}"#).unwrap();
-        let error = fix_ci(&root, &state, &checks, Some(&overrides), deadline()).unwrap_err();
+        let error = fix_ci(
+            &root,
+            &state,
+            &checks,
+            Some(&overrides),
+            &AgentConfig::default(),
+            deadline(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("parsing prompts file"));
         assert_eq!(fs::read_to_string(root.join("events")).unwrap(), events);
         fs::remove_file(&overrides).unwrap();
         fs::write(&output, r#"{"outcome":"fixed","summary":"Fix checks"}"#).unwrap();
-        fix_ci(&root, &state, &checks, Some(&overrides), deadline()).unwrap();
+        fix_ci(
+            &root,
+            &state,
+            &checks,
+            Some(&overrides),
+            &AgentConfig::default(),
+            deadline(),
+        )
+        .unwrap();
         let actual = prompt();
         assert!(actual.starts_with("Fix every cause of the failing checks that is in the code."));
         assert!(actual.contains("Check: build\nJob log:\ncompiler error\n"));

@@ -47,6 +47,18 @@ pub(crate) fn command_label(cmd: &Command) -> String {
         .file_name()
         .unwrap_or(cmd.get_program())
         .to_string_lossy();
+    if program == "sandbox-exec" {
+        let mut args = cmd.get_args().filter_map(|arg| arg.to_str());
+        while let Some(arg) = args.next() {
+            match arg {
+                "-p" | "-D" => {
+                    args.next();
+                }
+                "claude" | "pi" | "omp" => return arg.to_owned(),
+                _ => break,
+            }
+        }
+    }
     let mut label = program.to_string();
     let mut args = cmd.get_args().filter_map(|arg| arg.to_str());
     if let Some(first) = args.next() {
@@ -71,6 +83,9 @@ pub(crate) fn command_label(cmd: &Command) -> String {
                     | "log"
             ),
             "codex" => first == "exec",
+            "claude" => first == "auth",
+            "pi" => first == "auth",
+            "omp" => matches!(first, "auth-gateway" | "usage"),
             _ => false,
         };
         if known {
@@ -92,7 +107,7 @@ pub(crate) fn command_label(cmd: &Command) -> String {
     }
     label
 }
-fn output(
+pub(crate) fn output(
     cmd: &mut Command,
     input: Option<&str>,
     deadline: Instant,
@@ -197,6 +212,11 @@ mod tests {
         let mut git = Command::new("git");
         git.args(["push", "secret-token"]);
         assert_eq!(command_label(&git), "git push");
+        for program in ["claude", "pi", "omp"] {
+            let mut sandbox = Command::new("sandbox-exec");
+            sandbox.args(["-p", "secret profile", "-D", "HOME=secret", program, "-p"]);
+            assert_eq!(command_label(&sandbox), program);
+        }
     }
 
     #[test]
