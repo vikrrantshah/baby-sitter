@@ -60,9 +60,14 @@ impl Git {
     pub fn state_dir(&self) -> PathBuf {
         self.git_dir.join("baby-sitter")
     }
+    /// The user's rerere must neither resolve a PR's conflict nor learn an agent's resolution:
+    /// `.git/rr-cache` is shared with every worktree and replays into the user's own merges.
     fn run(&self, args: &[&str]) -> anyhow::Result<String> {
         proc::run(
-            Command::new("git").current_dir(&self.root).args(args),
+            Command::new("git")
+                .current_dir(&self.root)
+                .args(["-c", "rerere.enabled=false"])
+                .args(args),
             None,
             self.deadline,
         )
@@ -453,6 +458,45 @@ mod tests {
         assert_eq!(
             fs::read_to_string(repo.git.root.join("file with space.txt")).unwrap(),
             "feature version\n"
+        );
+    }
+
+    #[test]
+    fn rerere_neither_resolves_nor_records_conflicts() {
+        let repo = TestRepo::new(Some("conflict.txt"), false);
+        let plain = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&repo.git.root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status;
+            status.success()
+        };
+        assert!(plain(&["config", "rerere.enabled", "true"]));
+        assert!(plain(&["config", "rerere.autoupdate", "true"]));
+        let rr_cache = repo.git.git_dir.join("rr-cache");
+        let recorded = || fs::read_dir(&rr_cache).map_or(0, |entries| entries.count());
+        let feature = repo.git.head().unwrap();
+        repo.git.fetch("origin", "main").unwrap();
+
+        assert!(matches!(
+            repo.git.merge_no_commit("main").unwrap(),
+            MergeStart::Conflicted(_)
+        ));
+        fs::write(repo.git.root.join("conflict.txt"), "resolved\n").unwrap();
+        repo.git.commit_all_with("resolve").unwrap();
+        assert_eq!(recorded(), 0, "Baby Sitter's commit fed rerere");
+
+        assert!(plain(&["reset", "-q", "--hard", feature.as_str()]));
+        assert!(!plain(&["merge", "-q", "origin/main"]));
+        fs::write(repo.git.root.join("conflict.txt"), "resolved\n").unwrap();
+        assert!(plain(&["commit", "-qam", "user resolution"]));
+        assert!(recorded() > 0, "the user's own merge should record");
+        assert!(plain(&["reset", "-q", "--hard", feature.as_str()]));
+        assert_eq!(
+            repo.git.merge_no_commit("main").unwrap(),
+            MergeStart::Conflicted(vec!["conflict.txt".into()])
         );
     }
 

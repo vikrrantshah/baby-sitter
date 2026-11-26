@@ -5,7 +5,14 @@ use crate::{
 };
 use anyhow::{Context, bail};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, fmt::Write, fs, path::Path, process::Command, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fmt::Write,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Instant,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AgentKind {
@@ -42,14 +49,35 @@ const SEATBELT_PROFILE: &str = r##"(version 1)
   (subpath "/private/var/folders")
   (subpath (param "STATE"))
   (regex (param "STATE_FILE"))
-  (subpath (string-append (param "HOME") "/.cache"))
-  (subpath (string-append (param "HOME") "/Library/Caches"))
   (literal "/dev/null")
   (literal "/dev/stdout")
   (literal "/dev/stderr")
   (literal "/dev/tty")
   (regex #"^/dev/fd/")
-  (regex #"^/dev/ttys"))"##;
+  (regex #"^/dev/ttys"))
+(deny file-write*
+  (subpath (string-append (param "WORKTREE") "/.git"))
+  (subpath (string-append (param "HOME") "/.claude/settings.json"))
+  (subpath (string-append (param "HOME") "/.claude/settings.local.json"))
+  (subpath (string-append (param "HOME") "/.claude/hooks"))
+  (subpath (string-append (param "HOME") "/.claude/commands"))
+  (subpath (string-append (param "HOME") "/.claude/agents"))
+  (subpath (string-append (param "HOME") "/.claude/skills"))
+  (subpath (string-append (param "HOME") "/.claude/plugins"))
+  (subpath (string-append (param "HOME") "/.omp/agent/config.yml"))
+  (subpath (string-append (param "HOME") "/.omp/agent/mcp.json"))
+  (subpath (string-append (param "HOME") "/.omp/agent/extensions"))
+  (subpath (string-append (param "HOME") "/.omp/agent/skills"))
+  (subpath (string-append (param "HOME") "/.omp/agent/agents"))
+  (subpath (string-append (param "HOME") "/.pi/agent/settings.json"))
+  (subpath (string-append (param "HOME") "/.pi/agent/models.json"))
+  (subpath (string-append (param "HOME") "/.pi/agent/extensions")))
+(deny process-exec
+  (literal "/usr/bin/open")
+  (literal "/bin/launchctl")
+  (literal "/usr/bin/osascript")
+  (literal "/usr/bin/automator"))
+(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd"))"##;
 
 const REVIEW_INSTRUCTIONS: &str = "Edit files and run checks. Each item is an unanswered review thread. Return exactly one result per thread id. Use fixed only when the code addresses the feedback. Reply text is posted verbatim in the thread as the viewer.";
 const CI_INSTRUCTIONS: &str = "Fix every cause of the failing checks that is in the code. \
@@ -357,6 +385,167 @@ fn ci_prompt(instructions: &str, checks: &[(FailedCheck, Option<String>)]) -> St
     prompt
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct McpSnapshot {
+    global: Option<serde_json::Value>,
+    projects: BTreeMap<String, serde_json::Value>,
+}
+
+impl McpSnapshot {
+    fn capture(value: &serde_json::Value) -> Self {
+        let projects = value.get("projects").and_then(|v| v.as_object());
+        Self {
+            global: value.get("mcpServers").cloned(),
+            projects: projects
+                .into_iter()
+                .flat_map(|projects| projects.iter())
+                .filter_map(|(name, project)| {
+                    project.get("mcpServers").map(|v| (name.clone(), v.clone()))
+                })
+                .collect(),
+        }
+    }
+
+    fn restore(&self, value: &mut serde_json::Value) -> anyhow::Result<bool> {
+        if *self == Self::capture(value) {
+            return Ok(false);
+        }
+        let root = value
+            .as_object_mut()
+            .context("Claude Code configuration must be an object")?;
+        match &self.global {
+            Some(servers) => {
+                root.insert("mcpServers".into(), servers.clone());
+            }
+            None => {
+                root.remove("mcpServers");
+            }
+        }
+        if let Some(projects) = root.get_mut("projects").and_then(|v| v.as_object_mut()) {
+            for project in projects.values_mut() {
+                if let Some(project) = project.as_object_mut() {
+                    project.remove("mcpServers");
+                }
+            }
+        }
+        if !self.projects.is_empty() {
+            let projects = root
+                .entry("projects")
+                .or_insert_with(|| serde_json::json!({}));
+            if !projects.is_object() {
+                *projects = serde_json::json!({});
+            }
+            let projects = projects.as_object_mut().unwrap();
+            for (name, servers) in &self.projects {
+                let project = projects
+                    .entry(name)
+                    .or_insert_with(|| serde_json::json!({}));
+                if !project.is_object() {
+                    *project = serde_json::json!({});
+                }
+                let project = project.as_object_mut().unwrap();
+                project.insert("mcpServers".into(), servers.clone());
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn read_claude_config(path: &Path) -> anyhow::Result<serde_json::Value> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).context("parsing Claude Code configuration")?;
+            anyhow::ensure!(
+                value.is_object(),
+                "Claude Code configuration must be an object"
+            );
+            Ok(value)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(error) => Err(error).context("reading Claude Code configuration"),
+    }
+}
+
+struct RunCache(PathBuf);
+
+impl RunCache {
+    fn new() -> anyhow::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        loop {
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("baby-sitter-cache-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).context("creating coding agent cache"),
+            }
+        }
+    }
+}
+
+impl Drop for RunCache {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let temporary = path.with_file_name(format!(
+        ".claude.json.baby-sitter-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let result = (|| {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        if let Ok(metadata) = fs::metadata(path) {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.write_all(bytes)?;
+        fs::rename(&temporary, path)?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// `original` is the file's bytes before the run. When the file no longer parses, the agent may
+/// have planted servers Baby Sitter cannot see, so the whole pre-run file goes back.
+fn restore_claude_config(
+    path: &Path,
+    snapshot: &McpSnapshot,
+    original: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    let mut config = match read_claude_config(path) {
+        Ok(config) => config,
+        Err(error) => {
+            match original {
+                Some(bytes) => write_atomically(path, bytes),
+                None => fs::remove_file(path).map_err(Into::into),
+            }
+            .context("restoring Claude Code configuration")?;
+            return Err(error.context(
+                "Claude Code left an unreadable configuration; Baby Sitter restored the copy from before the run.",
+            ));
+        }
+    };
+    if snapshot.restore(&mut config)? {
+        write_atomically(path, &serde_json::to_vec_pretty(&config)?)
+            .context("restoring Claude Code MCP servers")?;
+        bail!("Claude Code changed its MCP servers during the run; Baby Sitter restored them.");
+    }
+    Ok(())
+}
+
 fn invoke<T: DeserializeOwned>(
     root: &Path,
     state_dir: &Path,
@@ -398,6 +587,7 @@ fn invoke<T: DeserializeOwned>(
             .context("parsing coding agent output");
     }
     let home = std::env::var("HOME").context("HOME is required for the coding agent sandbox")?;
+    let cache = RunCache::new()?;
     let root = fs::canonicalize(root).context("canonicalizing worktree")?;
     let (program, state) = match agent.kind {
         AgentKind::Claude => ("claude", ".claude"),
@@ -433,7 +623,10 @@ fn invoke<T: DeserializeOwned>(
         .arg("-D")
         .arg(format!("STATE_FILE={state_file}"))
         .arg(program)
-        .current_dir(&root);
+        .current_dir(&root)
+        .env("XDG_CACHE_HOME", &cache.0)
+        .env("npm_config_cache", &cache.0)
+        .env("BUN_INSTALL_CACHE_DIR", &cache.0);
     match agent.kind {
         AgentKind::Claude => {
             command.args([
@@ -460,7 +653,16 @@ fn invoke<T: DeserializeOwned>(
         command.args(["--model", model]);
     }
     if agent.kind == AgentKind::Claude {
-        let (status, output, stderr) = proc::output(&mut command, Some(&prompt), deadline, None)?;
+        let config_path = Path::new(&home).join(".claude.json");
+        let original = match fs::read(&config_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("reading Claude Code configuration"),
+        };
+        let snapshot = McpSnapshot::capture(&read_claude_config(&config_path)?);
+        let result = proc::output(&mut command, Some(&prompt), deadline, None);
+        restore_claude_config(&config_path, &snapshot, original.as_deref())?;
+        let (status, output, stderr) = result?;
         if !status.success() {
             if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&output)
                 && let Some(result) = envelope.get("result").and_then(|value| value.as_str())
@@ -587,6 +789,135 @@ mod tests {
                 .to_string()
                 .contains("message_end")
         );
+    }
+
+    #[test]
+    fn claude_mcp_changes_are_restored_without_losing_other_changes() {
+        let original = serde_json::json!({
+            "mcpServers": {"global": {"command": "safe"}},
+            "projects": {"/one": {"mcpServers": {"local": {"command": "safe"}}}, "/two": {}}
+        });
+        let snapshot = McpSnapshot::capture(&original);
+        let mut changed = serde_json::json!({
+            "mcpServers": {"global": {"command": "bad"}},
+            "projects": {"/one": {"mcpServers": {}, "other": 3}, "/two": {"mcpServers": null}, "/new": {"mcpServers": {}}},
+            "theme": "dark"
+        });
+        assert!(snapshot.restore(&mut changed).unwrap());
+        assert_eq!(McpSnapshot::capture(&changed), snapshot);
+        assert_eq!(changed["projects"]["/one"]["other"], 3);
+        assert_eq!(changed["theme"], "dark");
+        assert!(changed["projects"]["/new"].get("mcpServers").is_none());
+        assert!(!snapshot.restore(&mut changed).unwrap());
+        let empty = McpSnapshot::capture(&serde_json::json!({}));
+        assert!(empty.restore(&mut changed).unwrap());
+        assert_eq!(McpSnapshot::capture(&changed), empty);
+    }
+
+    #[test]
+    fn unreadable_claude_config_is_replaced_by_the_pre_run_copy() {
+        let dir = crate::test_support::unique_test_dir("baby-sitter-claude-config");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".claude.json");
+        let original = br#"{"mcpServers":{"global":{"command":"safe"}}}"#;
+        fs::write(&path, original).unwrap();
+        let snapshot = McpSnapshot::capture(&read_claude_config(&path).unwrap());
+        fs::write(&path, r#"{"mcpServers":{"planted":{"command":"evil"}}"#).unwrap();
+        let error = restore_claude_config(&path, &snapshot, Some(original)).unwrap_err();
+        assert!(format!("{error:#}").contains("restored the copy from before the run"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_protects_git_settings_caches_and_process_launch() {
+        let unique = crate::test_support::unique_test_dir("baby-sitter-sandbox-hardening");
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(unique.file_name().unwrap());
+        let worktree = root.join("worktree");
+        let home = root.join("home");
+        for path in [
+            "worktree/.git/hooks",
+            "home/.claude",
+            "home/.omp/agent",
+            "home/.pi/agent",
+            "home/.cache",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        let worktree = fs::canonicalize(worktree).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let escaped: String = home
+            .to_string_lossy()
+            .chars()
+            .flat_map(|c| {
+                if ".+*?()[]{}^$|\\".contains(c) {
+                    vec!['\\', c]
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
+        let run = |state: &str, state_file: &str, script: &str| {
+            let output = Command::new("sandbox-exec")
+                .args(["-p", SEATBELT_PROFILE, "-D"])
+                .arg(format!("WORKTREE={}", worktree.display()))
+                .arg("-D")
+                .arg(format!("HOME={}", home.display()))
+                .arg("-D")
+                .arg(format!("STATE={}/{state}", home.display()))
+                .arg("-D")
+                .arg(format!("STATE_FILE={state_file}"))
+                .args(["/bin/sh", "-c", script, "sh"])
+                .arg(&worktree)
+                .arg(&home)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(
+            ".claude",
+            &format!("^{escaped}/\\.claude\\.json"),
+            r#"
+            echo ok > "$1/inside" &&
+            ! echo bad > "$1/.git/hooks/x" &&
+            echo ok > "$2/.claude.json.tmp" &&
+            ! echo bad > "$2/.claudeX" &&
+            ! echo bad > "$2/.claude/settings.json" &&
+            ! echo bad > "$2/.cache/x" &&
+            ! /usr/bin/open "$1/inside"
+        "#,
+        );
+        run(
+            ".omp",
+            "^$",
+            r#"
+            ! echo bad > "$2/.omp/agent/config.yml" &&
+            echo ok > "$2/.omp/agent/state"
+        "#,
+        );
+        run(
+            ".pi",
+            "^$",
+            r#"
+            ! echo bad > "$2/.pi/agent/models.json" &&
+            echo ok > "$2/.pi/agent/state"
+        "#,
+        );
+        fs::remove_dir_all(worktree.join(".git")).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+        run(".omp", "^$", r#"! echo bad > "$1/.git""#);
+        assert_eq!(
+            fs::read_to_string(worktree.join(".git")).unwrap(),
+            "gitdir: elsewhere\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "macos")]

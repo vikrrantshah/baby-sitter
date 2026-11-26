@@ -100,6 +100,8 @@ A conflicting PR gets the same treatment as failing CI. The `conflict` rule runs
 
 The run stops if the PR still conflicts after three resolve commits among its last 20 commits.
 
+Every git command the binary runs turns off rerere, git's reuse of recorded conflict resolutions. A resolution you recorded elsewhere never settles a PR's conflict unseen, and a resolution the coding agent wrote never enters `.git/rr-cache`, which your own merges in every worktree replay.
+
 ## CI fixes keep the PR's purpose
 
 Before fixing, the binary waits for pending checks, so the coding agent sees every failure at once. When every failure is a cancelled Actions run, the binary reruns it instead, up to a run's third attempt. Only the newest check suite for each workflow counts, so a superseded cancelled run does not trigger a fix.
@@ -128,7 +130,7 @@ Codex writes a schema-checked file using `--output-schema`. Claude Code returns 
 
 The binary never installs packages. The default instructions tell the coding agent to edit files and run checks using tools the checkout already has. In the app, set a repository's **Setup command**, such as `pnpm install`, so each new worktree has its dependencies before the first agent call. When you run the CLI yourself, install dependencies in your checkout first.
 
-Codex runs with `--sandbox workspace-write`. Claude Code, pi, and omp run under macOS `sandbox-exec`. Its profile permits writes to the worktree, `/private/tmp`, `/private/var/folders`, `~/.cache`, `~/Library/Caches`, and the agent's own state. That state is `~/.claude` and `~/.claude.json*` for Claude Code, `~/.pi` for pi, and `~/.omp` for omp. The profile also permits writes to the required `/dev` nodes. Reads and network access remain open. Claude Code runs with `--dangerously-skip-permissions` and omp with `--auto-approve`. The sandbox bounds their writes.
+Codex runs with `--sandbox workspace-write`, which keeps `.git` read-only and disables network access by default. Claude Code, pi, and omp run under macOS `sandbox-exec`. Their sandbox permits writes to the worktree outside `.git`, `/private/tmp`, `/private/var/folders`, and their own non-settings state. It also permits writes to required `/dev` nodes. Each run uses a temporary cache. Claude Code's MCP server settings are checked after the run and restored if changed. These agents have full network and read access, including `~/.ssh` and anything a command can read from the Keychain. Claude Code runs with `--dangerously-skip-permissions` and omp with `--auto-approve`.
 
 ## The merge waits for every gate
 
