@@ -180,13 +180,11 @@ mod tests {
     #[test]
     fn pi_lists_rows_or_empty_signed_out_output() {
         assert!(parse_pi(include_str!("../tests/fixtures/pi-models-empty.txt")).is_empty());
-        let models = parse_pi(
-            "provider  model  context\nanthropic  claude-sonnet  200k\nWarning: skipped\nopenai  gpt-5  128k\n",
-        );
-        assert_eq!(
-            models.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(),
-            ["anthropic/claude-sonnet", "openai/gpt-5"]
-        );
+        let models = parse_pi(include_str!("../tests/fixtures/pi-models.txt"));
+        let values: Vec<_> = models.iter().map(|m| m.value.as_str()).collect();
+        assert_eq!(values.len(), 28);
+        assert_eq!(values[0], "anthropic/claude-fable-5");
+        assert!(values.contains(&"openai-codex/gpt-6.2-sol"));
     }
 
     #[test]
