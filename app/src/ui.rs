@@ -1972,14 +1972,15 @@ impl AppView {
             .border_color(divider())
             .flex()
             .items_center()
+            .justify_between()
             .gap(px(12.))
+            .child(scope)
             .child(header_picker(
                 &self.org_select,
                 "Filter by organization",
                 "All organizations",
                 Size::Medium,
-            ))
-            .child(scope);
+            ));
         let body = div()
             .size_full()
             .flex()
