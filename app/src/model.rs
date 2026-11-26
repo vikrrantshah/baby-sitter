@@ -130,9 +130,43 @@ mod optional_duration_serde {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentKind {
+    #[default]
+    Codex,
+    Claude,
+    Pi,
+    Omp,
+}
+
+impl AgentKind {
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Pi, Self::Omp];
+
+    pub fn arg(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Defaults {
+    pub agent: AgentKind,
+    pub model: Option<String>,
     #[serde(with = "duration_serde")]
     pub timeout: Duration,
     #[serde(with = "duration_serde")]
@@ -144,6 +178,8 @@ pub struct Defaults {
 impl Default for Defaults {
     fn default() -> Self {
         Self {
+            agent: AgentKind::default(),
+            model: None,
             timeout: Duration::from_secs(7200),
             draft_timeout: Duration::from_secs(7200),
             interval: Duration::from_secs(30),
@@ -168,6 +204,10 @@ impl AppSettings {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepoSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(
         default,
         with = "optional_duration_serde",
@@ -192,6 +232,8 @@ pub struct RepoSettings {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resolved {
+    pub agent: AgentKind,
+    pub model: Option<String>,
     pub timeout: Duration,
     pub draft_timeout: Duration,
     pub interval: Duration,
@@ -201,6 +243,13 @@ pub struct Resolved {
 impl RepoSettings {
     pub fn resolve(&self, defaults: &Defaults) -> Resolved {
         Resolved {
+            agent: self.agent.unwrap_or(defaults.agent),
+            model: self.model.clone().or_else(|| {
+                self.agent
+                    .is_none()
+                    .then(|| defaults.model.clone())
+                    .flatten()
+            }),
             timeout: self.timeout.unwrap_or(defaults.timeout),
             draft_timeout: self.draft_timeout.unwrap_or(defaults.draft_timeout),
             interval: self.interval.unwrap_or(defaults.interval),
@@ -1291,12 +1340,14 @@ mod tests {
             timeout: Duration::from_secs(3600),
             draft_timeout: Duration::from_secs(7200),
             interval: Duration::from_secs(45),
+            ..Defaults::default()
         };
         let settings = RepoSettings {
             timeout: Some(Duration::from_secs(1800)),
             draft_timeout: None,
             interval: Some(Duration::from_secs(10)),
             setup_command: Some("pnpm install".into()),
+            ..RepoSettings::default()
         };
         assert_eq!(
             settings.resolve(&defaults),
@@ -1304,6 +1355,8 @@ mod tests {
                 timeout: Duration::from_secs(1800),
                 draft_timeout: Duration::from_secs(7200),
                 interval: Duration::from_secs(10),
+                agent: AgentKind::Codex,
+                model: None,
                 setup_command: Some("pnpm install".into()),
             }
         );
@@ -1317,6 +1370,8 @@ mod tests {
                 timeout: Duration::from_secs(3600),
                 draft_timeout: Duration::from_secs(14400),
                 interval: Duration::from_secs(45),
+                agent: AgentKind::Codex,
+                model: None,
                 setup_command: None,
             }
         );
@@ -1326,9 +1381,44 @@ mod tests {
                 timeout: Duration::from_secs(3600),
                 draft_timeout: Duration::from_secs(7200),
                 interval: Duration::from_secs(45),
+                agent: AgentKind::Codex,
+                model: None,
                 setup_command: None,
             }
         );
+    }
+
+    #[test]
+    fn agent_and_model_inherit_only_for_the_same_default_agent() {
+        let config: Config = serde_json::from_str(r#"{"app":{"defaults":{"timeout":"1h","interval":"30s"}},"repos":{"owner/repo":{"timeout":"30m"}}}"#).unwrap();
+        let old = config.app.defaults;
+        assert_eq!(
+            config
+                .repos
+                .get(&"owner/repo".parse().unwrap())
+                .unwrap()
+                .agent,
+            None
+        );
+        assert_eq!(old.agent, AgentKind::Codex);
+        assert_eq!(old.model, None);
+        let defaults = Defaults {
+            agent: AgentKind::Claude,
+            model: Some("default-model".into()),
+            ..old
+        };
+        let mut repo = RepoSettings::default();
+        assert_eq!(
+            repo.resolve(&defaults).model.as_deref(),
+            Some("default-model")
+        );
+        repo.agent = Some(AgentKind::Pi);
+        assert_eq!(repo.resolve(&defaults).agent, AgentKind::Pi);
+        assert_eq!(repo.resolve(&defaults).model, None);
+        repo.model = Some("repo-model".into());
+        assert_eq!(repo.resolve(&defaults).model.as_deref(), Some("repo-model"));
+        repo.agent = None;
+        assert_eq!(repo.resolve(&defaults).model.as_deref(), Some("repo-model"));
     }
 
     #[test]
@@ -1338,6 +1428,7 @@ mod tests {
             draft_timeout: Some(Duration::from_secs(5400)),
             interval: None,
             setup_command: None,
+            ..RepoSettings::default()
         };
         let json = serde_json::to_value(&settings).unwrap();
         assert_eq!(json, serde_json::json!({ "draft_timeout": "90m" }));

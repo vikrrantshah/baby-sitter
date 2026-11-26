@@ -1,8 +1,8 @@
 use crate::{
     gh::{self, ChildEnv},
     model::{
-        self, ActiveSit, Config, Defaults, GateState, Outcome, PastSit, PrRef, PrRow, PrState,
-        RepoListItem, RepoName, RepoScope, RepoSettings, SitState, StackMode, StateFilter,
+        self, ActiveSit, AgentKind, Config, Defaults, GateState, Outcome, PastSit, PrRef, PrRow,
+        PrState, RepoListItem, RepoName, RepoScope, RepoSettings, SitState, StackMode, StateFilter,
         VerdictKind, WatchFilter,
     },
     notifications,
@@ -197,6 +197,7 @@ struct RepoInputs {
     timeout: Entity<InputState>,
     draft_timeout: Entity<InputState>,
     interval: Entity<InputState>,
+    model: Entity<InputState>,
     setup_command: Option<Entity<InputState>>,
     timeout_error: Option<String>,
     draft_timeout_error: Option<String>,
@@ -526,7 +527,7 @@ impl AppView {
             .filter(|(_, past)| !past.title.starts_with("Pull request #"))
             .map(|(pr, past)| (pr.clone(), past.title.clone()))
             .collect();
-        let defaults = config.app.defaults;
+        let defaults = config.app.defaults.clone();
         let app_inputs = Self::duration_inputs(
             DurationTarget::App,
             [
@@ -534,6 +535,7 @@ impl AppView {
                 Some(defaults.draft_timeout),
                 Some(defaults.interval),
             ],
+            defaults.model.clone(),
             None,
             window,
             cx,
@@ -789,6 +791,7 @@ impl AppView {
     fn duration_inputs(
         target: DurationTarget,
         values: [Option<Duration>; 3],
+        model: Option<String>,
         defaults: Option<Defaults>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -822,7 +825,48 @@ impl AppView {
         let timeout = make_input(values[0], defaults[0], window, cx);
         let draft_timeout = make_input(values[1], defaults[1], window, cx);
         let interval = make_input(values[2], defaults[2], window, cx);
+        let model = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(model.unwrap_or_default())
+                .placeholder("Agent default")
+        });
+        let model_target = target.clone();
+        let model_subscription = cx.subscribe_in(
+            &model,
+            window,
+            move |this: &mut Self, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    let text = input.read(cx).value().to_string();
+                    let value = model::normalize_setup_command(&text).map(str::to_owned);
+                    let previous = match &model_target {
+                        DurationTarget::App => {
+                            std::mem::replace(&mut this.config.app.defaults.model, value)
+                        }
+                        DurationTarget::Repo(repo) => {
+                            let Some(settings) = this.config.repos.get_mut(repo) else {
+                                return;
+                            };
+                            std::mem::replace(&mut settings.model, value)
+                        }
+                    };
+                    if !this.save() {
+                        match &model_target {
+                            DurationTarget::App => this.config.app.defaults.model = previous,
+                            DurationTarget::Repo(repo) => {
+                                if let Some(settings) = this.config.repos.get_mut(repo) {
+                                    settings.model = previous;
+                                }
+                            }
+                        }
+                    } else {
+                        this.load_setup(window, cx);
+                    }
+                    cx.notify();
+                }
+            },
+        );
         let mut subscriptions = Vec::new();
+        subscriptions.push(model_subscription);
         for (input, field) in [
             (&timeout, Field::Timeout),
             (&draft_timeout, Field::DraftTimeout),
@@ -845,6 +889,7 @@ impl AppView {
             timeout,
             draft_timeout,
             interval,
+            model,
             setup_command: None,
             timeout_error: None,
             draft_timeout_error: None,
@@ -863,7 +908,8 @@ impl AppView {
         let mut inputs = Self::duration_inputs(
             DurationTarget::Repo(repo.clone()),
             [settings.timeout, settings.draft_timeout, settings.interval],
-            Some(self.config.app.defaults),
+            settings.model.clone(),
+            Some(self.config.app.defaults.clone()),
             window,
             cx,
         );
@@ -1949,9 +1995,9 @@ impl AppView {
         let mut content = div().px(px(ROW_INSET)).py(px(28.)).w_full().max_w(px(800.))
             .flex().flex_col().gap(px(24.))
             .child(div().text_size(px(13.)).line_height(relative(1.4)).text_color(muted())
-                .child("Codex gets these instructions, followed by the review threads, failing checks, or conflicted files. Baby Sitter applies its safety checks regardless of the instructions. It never commits CI configuration changes and checks conflict resolutions before pushing."))
+                .child("The coding agent gets these instructions, followed by the review threads, failing checks, or conflicted files. Baby Sitter applies its safety checks regardless of the instructions. It never commits CI configuration changes and checks conflict resolutions before pushing."))
             .child(div().text_size(px(12.)).text_color(muted())
-                .child("Changes apply to running babysits the next time they call Codex."));
+                .child("Changes apply to running babysits the next time they call the coding agent."));
         match &self.prompt_editors {
             Load::Loading => content = content.child("Loading prompts…"),
             Load::Error(error) => {
@@ -2084,6 +2130,98 @@ impl AppView {
         (header, body)
     }
 
+    fn agent_fields(
+        &self,
+        inputs: &RepoInputs,
+        target: DurationTarget,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let selected = match &target {
+            DurationTarget::App => Some(self.config.app.defaults.agent),
+            DurationTarget::Repo(repo) => self
+                .config
+                .repos
+                .get(repo)
+                .and_then(|settings| settings.agent),
+        };
+        let label = selected.map_or("App default", AgentKind::label);
+        let view = cx.entity().downgrade();
+        let is_repo = matches!(target, DurationTarget::Repo(_));
+        let picker = Button::new("coding-agent")
+            .label(label)
+            .outline()
+            .dropdown_menu(move |mut menu, _, _| {
+                let choices = std::iter::once(None)
+                    .filter(|_| is_repo)
+                    .chain(AgentKind::ALL.into_iter().map(Some));
+                for choice in choices {
+                    let view = view.clone();
+                    let target = target.clone();
+                    let label = choice.map_or("App default", AgentKind::label);
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| div().child(label)).on_click(
+                            move |_, window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    let previous = match &target {
+                                        DurationTarget::App => Some(std::mem::replace(
+                                            &mut this.config.app.defaults.agent,
+                                            choice.expect("app agent"),
+                                        )),
+                                        DurationTarget::Repo(repo) => {
+                                            let Some(settings) = this.config.repos.get_mut(repo)
+                                            else {
+                                                return;
+                                            };
+                                            std::mem::replace(&mut settings.agent, choice)
+                                        }
+                                    };
+                                    if !this.save() {
+                                        match &target {
+                                            DurationTarget::App => {
+                                                this.config.app.defaults.agent =
+                                                    previous.expect("app agent")
+                                            }
+                                            DurationTarget::Repo(repo) => {
+                                                if let Some(settings) =
+                                                    this.config.repos.get_mut(repo)
+                                                {
+                                                    settings.agent = previous;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        this.load_setup(window, cx);
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        ),
+                    );
+                }
+                menu
+            });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child("Coding agent")
+                    .child(picker),
+            )
+            .child(duration_field(
+                Icon::empty().path("icons/square-terminal.svg"),
+                "Model",
+                "Leave empty to use the agent default.",
+                &inputs.model,
+                &None,
+                false,
+            ))
+    }
+
     fn render_app_settings(&self, cx: &mut Context<Self>) -> (Div, Div) {
         let header = self
             .settings_header("App", None, cx)
@@ -2135,6 +2273,7 @@ impl AppView {
                                                 .child("Repositories use these values unless they set their own."),
                                         ),
                                 )
+                                .child(self.agent_fields(&self.app_inputs, DurationTarget::App, cx))
                                 .child(duration_fields(&self.app_inputs)),
                         )
                         .child(
@@ -2249,6 +2388,7 @@ impl AppView {
                         .max_w(px(SETTINGS_LABEL_WIDTH
                             + SETTINGS_COLUMN_GAP
                             + SETTINGS_INPUT_WIDTH))
+                        .child(self.agent_fields(inputs, DurationTarget::Repo(repo.clone()), cx))
                         .child(duration_fields(inputs).child(duration_field(
                             Icon::empty().path("icons/square-terminal.svg"),
                             "Setup command",
@@ -3092,13 +3232,14 @@ impl AppView {
         }
         self.setup = Load::Loading;
         let env = self.env.clone();
+        let config = self.config.clone();
         self.setup_task = Some(cx.spawn_in(window, async move |view, cx| {
             let results = cx
                 .background_spawn(async move {
                     if request_authorization {
                         notifications::request_authorization();
                     }
-                    setup::run_all(&env)
+                    setup::run_all(&env, &config)
                 })
                 .await;
             let _ = view.update_in(cx, |this, _, cx| {
@@ -3202,7 +3343,7 @@ impl AppView {
                     if section == Section::Permissions {
                         body = body.child(
                             div().text_size(px(13.)).text_color(muted()).child(
-                                "Baby Sitter needs no other macOS permissions. If macOS asks for Desktop, Documents, or Photos while a babysit runs, that request comes from Codex reading outside the checkout. Choose Don't Allow.",
+                                "Baby Sitter needs no other macOS permissions. If macOS asks for Desktop, Documents, or Photos while a babysit runs, that request comes from the coding agent reading outside the checkout. Choose Don't Allow.",
                             ),
                         );
                     }
@@ -3229,9 +3370,6 @@ impl AppView {
                                     "gh" if detail.starts_with("Version ") => "brew upgrade gh",
                                     "gh-auth" if detail.contains("token lacks repo scope") => {
                                         "gh auth refresh -s repo,read:org"
-                                    }
-                                    "codex-auth" if detail == "Install Codex first" => {
-                                        "brew install --cask codex"
                                     }
                                     _ if section == Section::Permissions => "",
                                     _ => "Check again",

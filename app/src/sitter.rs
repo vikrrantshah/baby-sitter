@@ -728,6 +728,10 @@ impl Runner {
                 self.stack.arg(),
             ])
             .current_dir(worktree_path(&self.data, &self.pr));
+        command.arg("--agent").arg(self.settings.agent.arg());
+        if let Some(model) = &self.settings.model {
+            command.arg("--model").arg(model);
+        }
         command.arg("--prompts").arg(self.data.join("prompts.json"));
         command
     }
@@ -1076,6 +1080,21 @@ mod tests {
                     .any(|pair| pair[0] == "--stack" && pair[1] == expected)
             );
         }
+        runner.settings.agent = model::AgentKind::Claude;
+        let command = runner.cli_command(Path::new("/bin/baby-sitter"));
+        let args: Vec<_> = command.get_args().collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--agent" && pair[1] == "claude")
+        );
+        assert!(!args.iter().any(|arg| *arg == "--model"));
+        runner.settings.model = Some("example".into());
+        let command = runner.cli_command(Path::new("/bin/baby-sitter"));
+        let args: Vec<_> = command.get_args().collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--model" && pair[1] == "example")
+        );
     }
 
     #[test]

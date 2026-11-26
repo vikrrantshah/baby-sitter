@@ -1,5 +1,6 @@
 use crate::{
     gh::ChildEnv,
+    model::{AgentKind, Config},
     notifications::{self, NotificationAccess},
 };
 use std::{
@@ -72,6 +73,36 @@ pub const CHECKS: &[CheckSpec] = &[
         label: "Notifications",
         section: Section::Permissions,
         run: check_notifications,
+    },
+    CheckSpec {
+        id: "claude",
+        label: "Claude Code CLI",
+        section: Section::Required,
+        run: check_claude,
+    },
+    CheckSpec {
+        id: "claude-auth",
+        label: "Claude Code sign-in",
+        section: Section::Required,
+        run: check_claude_auth,
+    },
+    CheckSpec {
+        id: "pi",
+        label: "pi CLI",
+        section: Section::Required,
+        run: check_pi,
+    },
+    CheckSpec {
+        id: "pi-auth",
+        label: "pi sign-in",
+        section: Section::Required,
+        run: check_pi_auth,
+    },
+    CheckSpec {
+        id: "omp",
+        label: "omp CLI",
+        section: Section::Required,
+        run: check_omp,
     },
 ];
 
@@ -236,9 +267,82 @@ fn check_codex_auth(env: &ChildEnv) -> CheckState {
             )
         }
         Ok(_) => missing("Not signed in", "codex login"),
-        Err(error) if error == "not found" => CheckState::Failed("Install Codex first".into()),
+        Err(error) if error == "not found" => {
+            missing("Install Codex first", "brew install --cask codex")
+        }
         Err(error) => CheckState::Failed(error),
     }
+}
+fn agent_cli(env: &ChildEnv, program: &str, fix: &str) -> CheckState {
+    match version_output(env, program, fix, "Not installed") {
+        Ok(text) => CheckState::Ok(text),
+        Err(state) => state,
+    }
+}
+
+fn check_claude(env: &ChildEnv) -> CheckState {
+    agent_cli(env, "claude", "brew install --cask claude-code")
+}
+fn check_pi(env: &ChildEnv) -> CheckState {
+    agent_cli(env, "pi", "npm install -g @earendil-works/pi-coding-agent")
+}
+fn check_omp(env: &ChildEnv) -> CheckState {
+    match agent_cli(env, "omp", "https://omp.sh") {
+        CheckState::Missing { detail, .. } => CheckState::Missing {
+            detail,
+            fix: Fix::OpenSettings("https://omp.sh"),
+        },
+        state => state,
+    }
+}
+fn agent_auth(
+    env: &ChildEnv,
+    program: &str,
+    args: &[&str],
+    fix: &str,
+    require_ready: bool,
+) -> CheckState {
+    match command(env, program, args) {
+        Ok(output)
+            if output.status.success()
+                && (!require_ready
+                    || String::from_utf8_lossy(&output.stdout).trim() == "ready") =>
+        {
+            CheckState::Ok("Signed in".into())
+        }
+        Ok(_) => missing("Not signed in", fix),
+        Err(error) if error == "not found" => missing(
+            "Not installed",
+            match program {
+                "claude" => "brew install --cask claude-code",
+                "pi" => "npm install -g @earendil-works/pi-coding-agent",
+                _ => fix,
+            },
+        ),
+        Err(error) => CheckState::Failed(error),
+    }
+}
+fn check_claude_auth(env: &ChildEnv) -> CheckState {
+    agent_auth(
+        env,
+        "claude",
+        &["auth", "status", "--json"],
+        "claude auth login",
+        false,
+    )
+}
+fn check_pi_auth(env: &ChildEnv) -> CheckState {
+    check_pi_auth_model(env, None)
+}
+fn check_pi_auth_model(env: &ChildEnv, model: Option<&str>) -> CheckState {
+    let (flag, value) = model.map_or(("--provider", "anthropic"), |model| ("--model", model));
+    agent_auth(
+        env,
+        "pi",
+        &["auth", "check", flag, value],
+        "pi auth login anthropic",
+        true,
+    )
 }
 
 const NOTIFICATION_SETTINGS_URL: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.github.vikrrantshah.baby-sitter";
@@ -298,16 +402,55 @@ pub fn required_failures<'a>(
     })
 }
 
-pub fn run_all(env: &ChildEnv) -> Vec<(&'static CheckSpec, CheckState)> {
-    let mut results = Vec::with_capacity(CHECKS.len());
-    for spec in CHECKS {
-        let state = if spec.id == "codex-auth"
-            && results
+fn checks_for(config: &Config) -> Vec<&'static CheckSpec> {
+    CHECKS
+        .iter()
+        .filter(|spec| {
+            let agent = match spec.id {
+                "codex" | "codex-auth" => Some(AgentKind::Codex),
+                "claude" | "claude-auth" => Some(AgentKind::Claude),
+                "pi" | "pi-auth" => Some(AgentKind::Pi),
+                "omp" => Some(AgentKind::Omp),
+                _ => None,
+            };
+            agent.is_none_or(|agent| {
+                config.app.defaults.agent == agent
+                    || config
+                        .repos
+                        .values()
+                        .any(|settings| settings.agent == Some(agent))
+            })
+        })
+        .collect()
+}
+
+pub fn run_all(env: &ChildEnv, config: &Config) -> Vec<(&'static CheckSpec, CheckState)> {
+    let mut pi_models = Vec::new();
+    if config.app.defaults.agent == AgentKind::Pi {
+        pi_models.push(config.app.defaults.model.as_deref());
+    }
+    for settings in config.repos.values() {
+        if settings.agent.unwrap_or(config.app.defaults.agent) == AgentKind::Pi {
+            let model = settings.model.as_deref().or_else(|| {
+                if settings.agent.is_none() {
+                    config.app.defaults.model.as_deref()
+                } else {
+                    None
+                }
+            });
+            if !pi_models.contains(&model) {
+                pi_models.push(model);
+            }
+        }
+    }
+    let mut results = Vec::new();
+    for spec in checks_for(config) {
+        let state = if spec.id == "pi-auth" {
+            pi_models
                 .iter()
-                .any(|(check, state): &(&CheckSpec, CheckState)| {
-                    check.id == "codex" && matches!(state, CheckState::Missing { .. })
-                }) {
-            CheckState::Failed("Install Codex first".into())
+                .map(|model| check_pi_auth_model(env, *model))
+                .find(|state| !matches!(state, CheckState::Ok(_)))
+                .unwrap_or_else(|| CheckState::Ok("Signed in".into()))
         } else {
             (spec.run)(env)
         };
@@ -319,6 +462,35 @@ pub fn run_all(env: &ChildEnv) -> Vec<(&'static CheckSpec, CheckState)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_checks_cover_default_and_repository_agents() {
+        let mut config = Config::default();
+        config.app.defaults.agent = AgentKind::Claude;
+        config.repos.insert(
+            "owner/one".parse().unwrap(),
+            crate::model::RepoSettings {
+                agent: Some(AgentKind::Pi),
+                ..Default::default()
+            },
+        );
+        config.repos.insert(
+            "owner/two".parse().unwrap(),
+            crate::model::RepoSettings {
+                agent: Some(AgentKind::Omp),
+                ..Default::default()
+            },
+        );
+        let ids: Vec<_> = checks_for(&config).iter().map(|spec| spec.id).collect();
+        assert!(ids.contains(&"claude"));
+        assert!(ids.contains(&"claude-auth"));
+        assert!(ids.contains(&"pi"));
+        assert!(ids.contains(&"pi-auth"));
+        assert!(ids.contains(&"omp"));
+        assert!(!ids.contains(&"omp-auth"));
+        assert!(!ids.contains(&"codex"));
+        assert!(!ids.contains(&"codex-auth"));
+    }
+
     #[test]
     fn notification_access_reports_each_status_and_action() {
         let settings = |detail: &str| CheckState::Missing {
