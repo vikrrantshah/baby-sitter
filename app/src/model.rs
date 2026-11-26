@@ -789,7 +789,12 @@ pub fn dashboard_rows<'a>(
                 })
             }),
     );
-    rows.sort_by_cached_key(|row| (row.pr.repo.to_string().to_lowercase(), row.pr.number));
+    rows.sort_by_cached_key(|row| {
+        (
+            row.pr.repo.to_string().to_lowercase(),
+            std::cmp::Reverse(row.pr.number),
+        )
+    });
     rows
 }
 
@@ -1665,14 +1670,14 @@ mod tests {
         let rows = dashboard_rows(&prs, &history, &sits, &watched, Some(&repo));
         assert_eq!(
             rows.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
-            [1, 3, 7, 11]
+            [11, 7, 3, 1]
         );
         assert_eq!(
             rows.iter()
                 .filter(|row| WatchFilter::Watched.admits(watched_prs.contains(&row.pr)))
                 .map(|row| row.pr.number)
                 .collect::<Vec<_>>(),
-            [3, 7, 11]
+            [11, 7, 3]
         );
         assert_eq!(WatchFilter::default(), WatchFilter::All);
     }
@@ -1706,11 +1711,11 @@ mod tests {
                 .map(|row| row.pr.to_string())
                 .collect::<Vec<_>>(),
             [
-                "alpha/web#3",
-                "alpha/web#8",
-                "alpha/web#5",
                 "alpha/web#6",
                 "alpha/web#2",
+                "alpha/web#5",
+                "alpha/web#3",
+                "alpha/web#8",
                 "beta/api#1",
                 "Zeta/app#2",
             ]
