@@ -160,6 +160,15 @@ impl AgentKind {
             Self::Omp => "omp",
         }
     }
+
+    pub fn logo(self) -> &'static str {
+        match self {
+            Self::Codex => "logos/codex.svg",
+            Self::Claude => "logos/claude.svg",
+            Self::Pi => "logos/pi.svg",
+            Self::Omp => "logos/omp.svg",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

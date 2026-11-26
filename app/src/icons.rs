@@ -50,6 +50,19 @@ filled! {
     "x" => "x-circle-fill.svg",
 }
 
+const LOGOS: &[(&str, &[u8])] = &[
+    (
+        "logos/codex.svg",
+        include_bytes!("../assets/logos/codex.svg"),
+    ),
+    (
+        "logos/claude.svg",
+        include_bytes!("../assets/logos/claude.svg"),
+    ),
+    ("logos/pi.svg", include_bytes!("../assets/logos/pi.svg")),
+    ("logos/omp.svg", include_bytes!("../assets/logos/omp.svg")),
+];
+
 pub struct FilledAssets;
 
 impl AssetSource for FilledAssets {
@@ -64,6 +77,9 @@ impl AssetSource for FilledAssets {
                 "../assets/icons/stack-16.svg"
             ))));
         }
+        if let Some((_, svg)) = LOGOS.iter().find(|(logo, _)| *logo == path) {
+            return Ok(Some(Cow::Borrowed(svg)));
+        }
         match FILLED.iter().find(|(lucide, _)| *lucide == path) {
             Some((_, svg)) => Ok(Some(Cow::Borrowed(svg))),
             None => assets::AllAssets.load(path),
@@ -77,7 +93,8 @@ impl AssetSource for FilledAssets {
 
 #[cfg(test)]
 mod tests {
-    use super::FILLED;
+    use super::{FILLED, FilledAssets};
+    use crate::model::AgentKind;
     use gpui_kit::{AssetSource, assets};
 
     /// A typo in an overridden path would leave the icon in outline with no error.
@@ -87,6 +104,18 @@ mod tests {
             assert!(
                 matches!(assets::AllAssets.load(path), Ok(Some(_))),
                 "{path} is not a Lucide catalog path"
+            );
+        }
+    }
+
+    #[test]
+    fn every_agent_harness_has_a_logo() {
+        for kind in AgentKind::ALL {
+            assert!(
+                matches!(FilledAssets.load(kind.logo()), Ok(Some(_))),
+                "{} has no logo at {}",
+                kind.label(),
+                kind.logo()
             );
         }
     }

@@ -2145,14 +2145,16 @@ impl AppView {
                 .and_then(|settings| settings.agent),
         };
         let label = selected.map_or("App default", AgentKind::label);
+        let app_default = self.config.app.defaults.agent;
         let view = cx.entity().downgrade();
         let is_repo = matches!(target, DurationTarget::Repo(_));
         let picker = Button::new("coding-agent")
-            .child(div().flex_1().text_left().child(label))
+            .child(harness_choice(selected.unwrap_or(app_default), label).flex_1())
             .dropdown_caret(true)
             .outline()
             .w_full()
-            .dropdown_menu(move |mut menu, _, _| {
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.min_w(px(SETTINGS_INPUT_WIDTH));
                 let choices = std::iter::once(None)
                     .filter(|_| is_repo)
                     .chain(AgentKind::ALL.into_iter().map(Some));
@@ -2160,8 +2162,9 @@ impl AppView {
                     let view = view.clone();
                     let target = target.clone();
                     let label = choice.map_or("App default", AgentKind::label);
+                    let shown = choice.unwrap_or(app_default);
                     menu = menu.item(
-                        PopupMenuItem::element(move |_, _| div().child(label)).on_click(
+                        PopupMenuItem::element(move |_, _| harness_choice(shown, label)).on_click(
                             move |_, window, cx| {
                                 let _ = view.update(cx, |this, cx| {
                                     let previous = match &target {
@@ -3479,6 +3482,16 @@ impl AppView {
         }
         (header, div().size_full().child(body))
     }
+}
+
+/// An agent harness's logo next to its name, for the picker and its menu.
+fn harness_choice(kind: AgentKind, label: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(img(kind.logo()).size(px(16.)).flex_shrink_0())
+        .child(label)
 }
 
 fn duration_field(
