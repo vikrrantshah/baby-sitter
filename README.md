@@ -2,7 +2,7 @@
 
 `baby-sitter` takes a GitHub pull request from open to merged. It answers review threads, keeps the branch up to date with its base, fixes failing CI, and then merges the PR or adds it to the merge queue. When something needs a person, it stops and says why.
 
-Codex writes the code changes and the reply text. The binary does every git and GitHub write itself and checks Codex's edits before it commits them.
+A coding agent writes the code changes and the reply text: Codex by default, or Claude Code, pi, or omp. The binary does every git and GitHub write itself and checks the agent's edits before it commits them.
 
 There are two ways to run it:
 
@@ -13,7 +13,7 @@ There are two ways to run it:
 
 - `gh` 2.97.0 or later, signed in as the account that should reply and merge.
 - `git`.
-- `codex`, signed in.
+- A coding agent, signed in: `codex` (the default), `claude` (Claude Code), `pi`, or `omp`.
 - For the app: macOS, and Xcode's command line tools to build the bundle.
 
 ## Install
@@ -49,9 +49,11 @@ Each row also has a **More actions** menu to mark a draft ready for review, conv
 
 **Settings > App** holds the defaults for every repository. The timeout and draft timeout are both `2h`, and the interval between checks is `30s`. To override a value for one repository, use the gear next to that repository. **Auto-dismiss merged PRs** clears merged rows and their worktrees after the **Clear after** delay.
 
+**Coding agent** and **Model**, under Settings > App, pick the agent for every repository, and a repository's gear can override both. Codex is the default. An empty model means the agent's own default. A repository that picks its own agent ignores the app's model, since a model name belongs to one agent. Codex runs in its own workspace-write sandbox. Claude Code, pi, and omp run inside a macOS sandbox that lets them write only inside the PR's worktree, the temporary folders, the shared caches, and the agent's own settings folder, such as `~/.claude`. They can still read your files and reach the network, as Codex can. **Status** checks that each agent in use is installed and, except omp, signed in.
+
 A repository's gear also sets its **Setup command**, such as `pnpm install`. Baby Sitter runs it once in each PR worktree before the babysit starts. A finished setup does not run again unless you change the command. It is the only package install, so set it for any repository whose checks need dependencies. If the command fails, the babysit stops with its error and the app removes the worktree. The next start runs the setup again.
 
-**Settings > Prompts** lets you replace the instructions Codex gets for review threads, failing CI, and merge conflicts. Turn on **Custom review prompt**, **Custom CI fix prompt**, or **Custom conflict prompt**, edit the text, and select **Save**. Until you save, the default prompt applies. Turning a toggle off restores the default and keeps your text for later. Running babysits use the change the next time they call Codex. Your text replaces only the instructions. Baby Sitter still adds the threads, checks, or conflicted files, and its safety checks apply regardless of the text.
+**Settings > Prompts** lets you replace the instructions the coding agent gets for review threads, failing CI, and merge conflicts. Turn on **Custom review prompt**, **Custom CI fix prompt**, or **Custom conflict prompt**, edit the text, and select **Save**. Until you save, the default prompt applies. Turning a toggle off restores the default and keeps your text for later. Running babysits use the change the next time they call the agent. Your text replaces only the instructions. Baby Sitter still adds the threads, checks, or conflicted files, and its safety checks apply regardless of the text.
 
 Quitting the app stops every babysit. The next launch restarts them with their original deadlines.
 
@@ -70,10 +72,12 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 |---|---|---|
 | `--dry-run` | off | Print every rule's verdict for the current state of the PR, then exit. |
 | `--merge-method` | `squash` | `squash`, `merge`, or `rebase` for direct merges. A merge queue uses its own method. |
-| `--timeout` | `2h` | Deadline for the whole run, including every `gh`, `git`, and `codex` call. |
+| `--timeout` | `2h` | Deadline for the whole run, including every `gh`, `git`, and coding agent call. |
+| `--agent` | `codex` | Coding agent: `codex`, `claude` (Claude Code), `pi`, or `omp`. Every agent but Codex runs inside the macOS sandbox described above. |
+| `--model` | none | A model for the agent, such as `sonnet` for Claude Code. Without it, the agent uses its own default. |
 | `--interval` | `10s` | Time between checks while the run waits. |
 | `--gates` | off | Print each phase's state before every decision, for example `[gates] reviews=met checks=waiting branch=met merge=pending`. `reviews` is the Comments phase. |
-| `--prompts` | none | A JSON file that replaces the instructions for some prompts, for example `{"ci": "…"}`. Keys are `review`, `ci`, and `conflicts`. A missing file means the defaults. The binary reads the file again before each Codex call. |
+| `--prompts` | none | A JSON file that replaces the instructions for some prompts, for example `{"ci": "…"}`. Keys are `review`, `ci`, and `conflicts`. A missing file means the defaults. The binary reads the file again before each agent call. |
 | `--print-default-prompts` | off | Print the default instructions as JSON, then exit. |
 
 | Exit code | Meaning |
@@ -86,9 +90,9 @@ baby-sitter 123 --merge-method rebase --timeout 4h --interval 30s
 
 Each pass reads the PR from GitHub and works on the first of four phases that is not done:
 
-1. **Comments.** Codex answers unresolved review threads and fixes the code they ask about. The binary replies in each thread and resolves the fixed ones.
-2. **Branch.** The binary updates the branch from its base. When the two conflict, Codex resolves the conflicted files.
-3. **Checks.** The binary waits for CI. It reruns cancelled runs and has Codex fix the code behind real failures.
+1. **Comments.** The coding agent answers unresolved review threads and fixes the code they ask about. The binary replies in each thread and resolves the fixed ones.
+2. **Branch.** The binary updates the branch from its base. When the two conflict, the agent resolves the conflicted files.
+3. **Checks.** The binary waits for CI. It reruns cancelled runs and has the agent fix the code behind real failures.
 4. **Merge.** The binary waits for approvals, then merges or enqueues the exact commit it checked.
 
 A phase starts only when every earlier phase is done. If an earlier phase slips, for example a new review comment arrives while the PR sits in the merge queue, the run goes back to it. The binary keeps no state file, so a crashed run restarts where it left off.

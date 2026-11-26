@@ -22,14 +22,14 @@ flowchart TD
   PRE -- "closed, dirty, ahead, or diverged" --> STOP([Stop, exit 1])
   PRE -- "checkout behind" --> FF["Fast-forward"] --> NEXT
   PRE -- no --> C{{"1 · Comments<br/>fixed threads open or threads unanswered?"}}
-  C -- yes --> CA["Resolve fixed threads, or have Codex<br/>edit code and reply, then push"] --> NEXT
+  C -- yes --> CA["Resolve fixed threads, or have the coding agent<br/>edit code and reply, then push"] --> NEXT
   C -- no --> B{{"2 · Branch<br/>mergeability unknown, conflicts, or behind base?"}}
   B -- unknown --> WAIT["Wait for --interval"] --> NEXT
-  B -- conflicts --> BC["Merge the base, have Codex resolve conflicts,<br/>commit and push"] --> NEXT
+  B -- conflicts --> BC["Merge the base, have the coding agent resolve conflicts,<br/>commit and push"] --> NEXT
   B -- "behind, direct merge" --> BU["Update branch"] --> NEXT
   B -- no --> K{{"3 · Checks<br/>CI failed, cancelled, pending, or not started?"}}
   K -- "cancelled only" --> KR["Rerun the runs"] --> NEXT
-  K -- failed --> KF["Have Codex fix the code<br/>without changing the PR's goal or CI files"] --> NEXT
+  K -- failed --> KF["Have the coding agent fix the code<br/>without changing the PR's goal or CI files"] --> NEXT
   K -- "pending or starting" --> WAIT
   K -- "fix limit or needs a person" --> STOP
   K -- no --> M{{"4 · Merge<br/>queued, draft, reviews, or merge state pending?"}}
@@ -46,9 +46,9 @@ The rules live in `RULES` in `src/decide.rs`, grouped as preconditions and then 
 | Stage | Rules | Result when a rule matches |
 |---|---|---|
 | Preconditions | `merged`, `closed`, `local-upstream`, `local-dirty`, `local-diverged`, `local-behind` | Exit 0 for `merged`. Fast-forward a checkout that is behind. Stop for the others. |
-| 1 · Comments | `resolve-fixed`, `unhandled-items` | Resolve threads whose newest marker says `fixed`. Send unanswered threads to Codex, push, reply in the threads, and request re-review. |
-| 2 · Branch | `stack-retarget`, `mergeability-unknown`, `conflict`, `behind-base` | Move a stacked PR onto its merged parent's base with `gh pr edit --base`. Wait while GitHub computes mergeability. Merge the base and have Codex resolve conflicts. Run `gh pr update-branch` for direct merges. A merge queue updates the branch itself. |
-| 3 · Checks | `ci-failed`, `rerun-cancelled`, `fix-ci`, `ci-pending`, `ci-starting` | Wait for pending checks before fixing. Rerun Actions runs when every failure is a cancellation. Otherwise send the failures to Codex, then commit and push a code fix. |
+| 1 · Comments | `resolve-fixed`, `unhandled-items` | Resolve threads whose newest marker says `fixed`. Send unanswered threads to the coding agent, push, reply in the threads, and request re-review. |
+| 2 · Branch | `stack-retarget`, `mergeability-unknown`, `conflict`, `behind-base` | Move a stacked PR onto its merged parent's base with `gh pr edit --base`. Wait while GitHub computes mergeability. Merge the base and have the coding agent resolve conflicts. Run `gh pr update-branch` for direct merges. A merge queue updates the branch itself. |
+| 3 · Checks | `ci-failed`, `rerun-cancelled`, `fix-ci`, `ci-pending`, `ci-starting` | Wait for pending checks before fixing. Rerun Actions runs when every failure is a cancellation. Otherwise send the failures to the coding agent, then commit and push a code fix. |
 | 4 · Merge | `stacked`, `stack-above`, `in-queue`, `dequeued`, `review-decision`, `review-requests`, `unresolved-threads`, `draft`, `merge-state` | Bottom up, wait while the PR below is open. Top down, wait while any open PR is based on this PR's branch. In both modes, stop if the PR below was closed without merging. Wait while queued, while reviews block the merge, or while the PR is a draft. The wait message names the reviewers who requested changes and the pending review requests. Stop if the queue removed the current head for a reason other than a merge. |
 
 `--dry-run` prints every rule's verdict for the current snapshot.
@@ -76,7 +76,7 @@ In both modes, `stacked` stops the run when the parent was closed without mergin
 
 The binary handles unresolved review threads from people and bots. It replies only inside those threads and never posts a top-level PR comment.
 
-Codex gets every unanswered thread in one batch. It edits files and returns one result for each thread, with the reply text. The result is `fixed`, `declined`, or `needs_human`. If Codex fails, times out, or returns a result that does not match the batch, the run stops before it writes anything.
+The coding agent gets every unanswered thread in one batch. It edits files and returns one result for each thread, with the reply text. The result is `fixed`, `declined`, or `needs_human`. If the agent fails, times out, or returns a result that does not match the batch, the run stops before it writes anything.
 
 Every reply ends with a hidden marker:
 
@@ -84,7 +84,7 @@ Every reply ends with a hidden marker:
 <!-- baby-sitter:v1 item=thread:PRRT_abc outcome=fixed answers=4628647074 -->
 ```
 
-`answers` is the ID of the newest comment that Codex saw. A thread is unanswered when someone else commented after every comment you answered. The binary reads markers only from your own comments. A reply you write by hand also counts as an answer to the comments before it.
+`answers` is the ID of the newest comment that the coding agent saw. A thread is unanswered when someone else commented after every comment you answered. The binary reads markers only from your own comments. A reply you write by hand also counts as an answer to the comments before it.
 
 The binary resolves only `fixed` threads. Declined threads and threads that need a person stay open, and the merge waits until someone replies or resolves them.
 
@@ -94,7 +94,7 @@ A conflicting PR gets the same treatment as failing CI. The `conflict` rule runs
 
 1. The binary fetches the base branch and runs `git merge --no-commit origin/<base>`. Merging keeps the push a plain fast-forward and keeps review comments attached to their commits, as `gh pr update-branch` does.
 2. If any conflicted file is CI configuration, the binary aborts the merge and stops. A person edits those files.
-3. Codex gets the list of conflicted files. It edits only those files, keeps the intent of both sides, and removes every conflict marker. It returns `resolved`, or `needs_human` when the conflict needs a product decision.
+3. The coding agent gets the list of conflicted files. It edits only those files, keeps the intent of both sides, and removes every conflict marker. It returns `resolved`, or `needs_human` when the conflict needs a product decision.
 4. The binary checks the result. Only conflicted files may change, none may be CI configuration, and no conflict markers may remain. A failed check or a `needs_human` aborts the merge and stops with the reason, so the checkout never stays mid-merge.
 5. The binary commits the merge with the `Baby-Sitter: resolve-conflicts` trailer and pushes.
 
@@ -102,27 +102,33 @@ The run stops if the PR still conflicts after three resolve commits among its la
 
 ## CI fixes keep the PR's purpose
 
-Before fixing, the binary waits for pending checks, so Codex sees every failure at once. When every failure is a cancelled Actions run, the binary reruns it instead, up to a run's third attempt. Only the newest check suite for each workflow counts, so a superseded cancelled run does not trigger a fix.
+Before fixing, the binary waits for pending checks, so the coding agent sees every failure at once. When every failure is a cancelled Actions run, the binary reruns it instead, up to a run's third attempt. Only the newest check suite for each workflow counts, so a superseded cancelled run does not trigger a fix.
 
-Codex gets the failed Actions job logs and the URLs of failing external checks. It fixes every cause that is in the code, without reverting, disabling, or reshaping the behavior the PR introduces. It must not edit CI configuration or delete, skip, or weaken tests. When the only fix would contradict the PR's goal, or a cause needs a person, it returns `needs_human`. The binary still pushes any code fix, waits for CI on it, and stops with the remaining reason once nothing in the code is left to fix.
+The coding agent gets the failed Actions job logs and the URLs of failing external checks. It fixes every cause that is in the code, without reverting, disabling, or reshaping the behavior the PR introduces. It must not edit CI configuration or delete, skip, or weaken tests. When the only fix would contradict the PR's goal, or a cause needs a person, it returns `needs_human`. The binary still pushes any code fix, waits for CI on it, and stops with the remaining reason once nothing in the code is left to fix.
 
 The binary checks for CI configuration changes in the working tree before committing and in the commit before pushing. It leaves an unsafe change uncommitted, or an unsafe commit local, for you to inspect. Fix commits carry the `Baby-Sitter: fix-ci` trailer, and the run stops if CI still fails after three fix commits among the PR's last 20 commits.
 
-## Each Codex prompt has fixed parts
+## Each coding agent prompt has fixed parts
 
-Codex gets one of three prompts. The `review` prompt covers unanswered threads, `ci` covers failing checks, and `conflicts` covers merge conflicts. Each prompt has three parts, in this order:
+The coding agent gets one of three prompts. The `review` prompt covers unanswered threads, `ci` covers failing checks, and `conflicts` covers merge conflicts. Each prompt has three parts, in this order:
 
 1. The instructions. `baby-sitter --print-default-prompts` prints the defaults. `--prompts <file>` or **Settings > Prompts** in the app replaces them.
 2. The `ITEM` blocks for review threads, the failing checks and their logs, or the base branch and the conflicted files.
-3. A fixed rule that Codex must not run `git` or `gh` and must not install packages. Custom instructions cannot remove it. It is an instruction to Codex, not a runtime block.
+3. A fixed rule that the coding agent must not run `git` or `gh` and must not install packages. Custom instructions cannot remove it. It is an instruction to the agent, not a runtime block.
 
-The binary checks the `--prompts` file at startup and stops with the cause when the file is invalid. A missing file means the defaults. The binary reads the file again before each Codex call, so a running babysit picks up a change at its next call. The app always passes `<data dir>/prompts.json` and deletes the file when no custom prompt is saved and turned on.
+The binary checks the `--prompts` file at startup and stops with the cause when the file is invalid. A missing file means the defaults. The binary reads the file again before each agent call, so a running babysit picks up a change at its next call. The app always passes `<data dir>/prompts.json` and deletes the file when no custom prompt is saved and turned on.
 
-Custom instructions cannot loosen what the code enforces. Codex must still reply in the JSON shape the binary expects. The binary still refuses to commit or push CI configuration changes, and it still checks conflict resolutions before it commits them.
+Custom instructions cannot loosen what the code enforces. The coding agent must still reply in the JSON shape the binary expects. The binary still refuses to commit or push CI configuration changes, and it still checks conflict resolutions before it commits them.
 
-## Codex checks its edits with the checkout's own tools
+## The binary reads structured agent output
 
-The binary never installs packages. Codex runs with `--sandbox workspace-write` and no network access, and it may not install packages either. Its default instructions tell it to edit files and run checks, so it uses whatever tools the checkout already has. In the app, set a repository's **Setup command**, such as `pnpm install`, so each new worktree has its dependencies before the first Codex call. When you run the CLI yourself, install dependencies in your checkout first.
+Codex writes a schema-checked file using `--output-schema`. Claude Code returns `structured_output` checked against the schema supplied with `--json-schema`. pi and omp stream JSON events. The binary takes the last assistant message if it stopped normally and parses its text as one JSON object. It stops if the message is missing or the object does not match the expected result.
+
+## The coding agent checks edits with the checkout's own tools
+
+The binary never installs packages. The default instructions tell the coding agent to edit files and run checks using tools the checkout already has. In the app, set a repository's **Setup command**, such as `pnpm install`, so each new worktree has its dependencies before the first agent call. When you run the CLI yourself, install dependencies in your checkout first.
+
+Codex runs with `--sandbox workspace-write`. Claude Code, pi, and omp run under macOS `sandbox-exec`. Its profile permits writes to the worktree, `/private/tmp`, `/private/var/folders`, `~/.cache`, `~/Library/Caches`, and the agent's own state. That state is `~/.claude` and `~/.claude.json*` for Claude Code, `~/.pi` for pi, and `~/.omp` for omp. The profile also permits writes to the required `/dev` nodes. Reads and network access remain open. Claude Code runs with `--dangerously-skip-permissions` and omp with `--auto-approve`. The sandbox bounds their writes.
 
 ## The merge waits for every gate
 
@@ -143,9 +149,9 @@ With a merge queue, the binary enqueues the snapshot's head SHA and the queue's 
 
 | The crash happened | The next run sees | The next run does |
 |---|---|---|
-| While Codex ran | A dirty tree, or the same unanswered items | Stops so you can inspect the tree, or calls Codex again |
+| While the coding agent ran | A dirty tree, or the same unanswered items | Stops so you can inspect the tree, or calls the agent again |
 | After the commit, before the push | The local branch is ahead | Pushes the commits if baby-sitter made all of them and none touches CI configuration. Stops if any commit is yours |
-| After some replies | Markers on the answered items | Sends only the remaining items to Codex |
+| After some replies | Markers on the answered items | Sends only the remaining items to the coding agent |
 | Before the threads were resolved | Open threads with a `fixed` marker | Resolves them |
 | Before the re-review request | Nothing | Nothing. The request is lost, and the merge still waits on the review decision |
 
@@ -168,9 +174,14 @@ After a merge, the app removes the worktree. After any other outcome, it keeps t
 | GitHub CLI | yes | `gh --version` reports 2.97.0 or later |
 | GitHub sign-in | yes | `gh auth status --hostname github.com` names an account, and the token scopes, when listed, include `repo` |
 | Git | yes | `git --version` runs |
-| Codex CLI | yes | `codex --version` runs |
-| Codex sign-in | yes | `codex login status` exits 0 |
+| Codex CLI | when in use | `codex --version` runs |
+| Codex sign-in | when in use | `codex login status` exits 0 |
+| Claude Code CLI | when in use | `claude --version` runs |
+| Claude Code sign-in | when in use | `claude auth status --json` exits 0 |
+| pi CLI | when in use | `pi --version` runs |
+| pi sign-in | when in use | `pi auth check` reports `ready` for the configured model, or for the `anthropic` provider when no model is set |
+| omp CLI | when in use | `omp --version` runs. omp has no sign-in check |
 
 The **Permissions** section reads Baby Sitter's notification settings from macOS. It is green when notifications are allowed with banners and Notification Center on. When macOS has not asked yet, **Allow notifications** shows the prompt. When notifications are off, or allowed but hidden from banners or Notification Center, **Open System Settings** opens Baby Sitter's notification settings. A permission problem does not raise the banner on the Pull requests page, because babysits run without notifications.
 
-Baby Sitter needs no other macOS permission. It writes only under `~/Library/Application Support/baby-sitter`. A prompt for Desktop, Documents, or Photos during a babysit comes from Codex reading outside the checkout. Choose **Don't Allow**.
+Baby Sitter needs no other macOS permission. It writes only under `~/Library/Application Support/baby-sitter`. A prompt for Desktop, Documents, or Photos during a babysit comes from the coding agent reading outside the checkout. Choose **Don't Allow**.
