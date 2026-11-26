@@ -45,6 +45,8 @@ The search box finds PRs by number or title. Digits, with or without a leading `
 
 The pull request list reloads every minute, so new PRs appear without pressing refresh.
 
+A PR in a merge queue shows its position, such as `#2 in queue`.
+
 Each row also has a **More actions** menu to mark a draft ready for review, convert a PR to draft, close it, or copy its link.
 
 **Settings > App** holds the defaults for every repository. The timeout and draft timeout are both `2h`, and the interval between checks is `30s`. To override a value for one repository, use the gear next to that repository. The GitHub icon next to a repository's name, in the repository list and on its settings page, opens the repository on GitHub. The refresh button next to the organization picker reloads the repository list from GitHub. **Auto-dismiss merged PRs** clears merged rows and their worktrees after the **Clear after** delay.

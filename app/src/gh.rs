@@ -101,11 +101,11 @@ mod tests {
     fn graphql_search_parses_all_pull_request_states() {
         let fixture = r#"[
           {"data":{"search":{"nodes":[
-            {"number":1,"title":"draft","url":"https://example.com/1","baseRefName":"main","headRefName":"branch-1","isDraft":true,"isInMergeQueue":false,"state":"OPEN","repository":{"nameWithOwner":"owner/repo"}},
-            {"number":2,"title":"ready","url":"https://example.com/2","baseRefName":"branch-1","headRefName":"branch-2","isDraft":false,"isInMergeQueue":false,"state":"OPEN","repository":{"nameWithOwner":"owner/repo"}},
-            {"number":3,"title":"queued","url":"https://example.com/3","baseRefName":"main","headRefName":"branch-3","isDraft":true,"isInMergeQueue":true,"state":"OPEN","repository":{"nameWithOwner":"owner/repo"}},
-            {"number":4,"title":"merged","url":"https://example.com/4","baseRefName":"main","headRefName":"branch-4","isDraft":true,"isInMergeQueue":true,"state":"MERGED","repository":{"nameWithOwner":"owner/repo"}},
-            {"number":5,"title":"closed","url":"https://example.com/5","baseRefName":"main","headRefName":"branch-5","isDraft":true,"isInMergeQueue":true,"state":"CLOSED","repository":{"nameWithOwner":"owner/repo"}}
+            {"number":1,"title":"draft","url":"https://example.com/1","baseRefName":"main","headRefName":"branch-1","isDraft":true,"isInMergeQueue":false,"mergeQueueEntry":null,"state":"OPEN","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":2,"title":"ready","url":"https://example.com/2","baseRefName":"branch-1","headRefName":"branch-2","isDraft":false,"isInMergeQueue":false,"mergeQueueEntry":null,"state":"OPEN","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":3,"title":"queued","url":"https://example.com/3","baseRefName":"main","headRefName":"branch-3","isDraft":true,"isInMergeQueue":true,"mergeQueueEntry":{"position":2},"state":"OPEN","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":4,"title":"merged","url":"https://example.com/4","baseRefName":"main","headRefName":"branch-4","isDraft":true,"isInMergeQueue":true,"mergeQueueEntry":null,"state":"MERGED","repository":{"nameWithOwner":"owner/repo"}},
+            {"number":5,"title":"closed","url":"https://example.com/5","baseRefName":"main","headRefName":"branch-5","isDraft":true,"isInMergeQueue":true,"mergeQueueEntry":null,"state":"CLOSED","repository":{"nameWithOwner":"owner/repo"}}
           ]}}}
         ]"#;
         let rows = parse_pr_search(fixture.as_bytes()).unwrap();
@@ -118,6 +118,12 @@ mod tests {
                 PrState::Merged,
                 PrState::Closed
             ]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.queue_position)
+                .collect::<Vec<_>>(),
+            [None, None, Some(2), None, None]
         );
         assert_eq!((&*rows[1].base, &*rows[1].head), ("branch-1", "branch-2"));
     }
@@ -217,6 +223,7 @@ const PR_SEARCH_QUERY: &str = r#"query($endCursor: String) {
     nodes {
       ... on PullRequest {
         number title url baseRefName headRefName isDraft isInMergeQueue state
+        mergeQueueEntry { position }
         repository { nameWithOwner }
       }
     }
@@ -242,6 +249,10 @@ struct SearchRepo {
     name_with_owner: RepoName,
 }
 #[derive(Deserialize)]
+struct QueueEntry {
+    position: u32,
+}
+#[derive(Deserialize)]
 struct SearchPr {
     number: u64,
     title: String,
@@ -255,6 +266,8 @@ struct SearchPr {
     is_draft: bool,
     #[serde(rename = "isInMergeQueue")]
     is_in_merge_queue: bool,
+    #[serde(rename = "mergeQueueEntry")]
+    merge_queue_entry: Option<QueueEntry>,
     state: SearchPrState,
 }
 #[derive(Deserialize)]
@@ -286,6 +299,7 @@ fn parse_pr_search(bytes: &[u8]) -> Result<Vec<PrRow>> {
                 SearchPrState::Open if row.is_draft => PrState::Draft,
                 SearchPrState::Open => PrState::Ready,
             },
+            queue_position: row.merge_queue_entry.map(|entry| entry.position),
         })
         .collect())
 }

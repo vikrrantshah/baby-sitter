@@ -585,6 +585,7 @@ pub struct PrRow {
     pub title: String,
     pub url: String,
     pub state: PrState,
+    pub queue_position: Option<u32>,
     pub base: String,
     pub head: String,
 }
@@ -878,6 +879,7 @@ pub fn dashboard_rows<'a>(
                     } else {
                         PrState::Ready
                     },
+                    queue_position: None,
                     base: String::new(),
                     head: String::new(),
                 })
@@ -1404,6 +1406,7 @@ mod tests {
             title: format!("PR {}", pr.number),
             pr,
             state: PrState::Ready,
+            queue_position: None,
             base: String::new(),
             head: String::new(),
         }

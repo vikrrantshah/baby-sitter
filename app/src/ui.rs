@@ -2970,6 +2970,24 @@ impl AppView {
                         },
                         active.then(|| self.pulse()),
                     ))
+                    .when_some(row.queue_position, |line, position| {
+                        let color = pr_state_color(PrState::Queued);
+                        line.child(
+                            div()
+                                .id(SharedString::from(format!("queue-position-{}", row.pr)))
+                                .px(px(7.))
+                                .py(px(2.))
+                                .rounded_full()
+                                .bg(color.opacity(0.15))
+                                .text_color(color)
+                                .text_size(px(12.))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(format!("Position {position} in the merge queue"))
+                                        .build(window, cx)
+                                })
+                                .child(format!("#{position} in queue")),
+                        )
+                    })
                     .when(next, |line| {
                         line.child(
                             div()
