@@ -2739,21 +2739,20 @@ impl AppView {
                 })),
             )
         };
-        let dismiss =
-            (matches!(state, Some(SitState::Finished(_))) && group.is_none()).then(|| {
-                let pr = row.pr.clone();
-                round_button(
-                    SharedString::from(format!("dismiss-{pr}")),
-                    IconName::X,
-                    "Dismiss",
-                    muted(),
-                    ink(),
-                    cx,
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.dismiss(pr.clone(), window, cx);
-                }))
-            });
+        let dismiss = matches!(state, Some(SitState::Finished(_))).then(|| {
+            let pr = row.pr.clone();
+            round_button(
+                SharedString::from(format!("dismiss-{pr}")),
+                IconName::X,
+                "Dismiss",
+                muted(),
+                ink(),
+                cx,
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.dismiss(pr.clone(), window, cx);
+            }))
+        });
         let time_left = (active && group.is_none())
             .then(|| self.config.active.get(&row.pr))
             .flatten()
