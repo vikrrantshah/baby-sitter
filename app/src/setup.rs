@@ -339,7 +339,7 @@ fn check_pi_auth_model(env: &ChildEnv, model: Option<&str>) -> CheckState {
     agent_auth(
         env,
         "pi",
-        &["auth", "check", flag, value],
+        &["auth", "check", "--no-refresh", flag, value],
         "pi auth login anthropic",
         true,
     )

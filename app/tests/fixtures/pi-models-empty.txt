@@ -1,0 +1,6 @@
+Warning: No models available. Use /login to log into a provider via OAuth or API key. See:
+  /Users/vikrantshah/.nvm/versions/node/v24.21.0/lib/node_modules/@earendil-works/pi-coding-agent/docs/providers.md
+  /Users/vikrantshah/.nvm/versions/node/v24.21.0/lib/node_modules/@earendil-works/pi-coding-agent/docs/models.md
+No models available. Use /login to log into a provider via OAuth or API key. See:
+  /Users/vikrantshah/.nvm/versions/node/v24.21.0/lib/node_modules/@earendil-works/pi-coding-agent/docs/providers.md
+  /Users/vikrantshah/.nvm/versions/node/v24.21.0/lib/node_modules/@earendil-works/pi-coding-agent/docs/models.md

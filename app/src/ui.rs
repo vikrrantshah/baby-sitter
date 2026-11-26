@@ -5,6 +5,7 @@ use crate::{
         PrState, RepoListItem, RepoName, RepoScope, RepoSettings, SitState, StackMode, StateFilter,
         VerdictKind, WatchFilter,
     },
+    models::{self, ModelOption},
     notifications,
     setup::{self, CheckSpec, CheckState, Fix, Section},
     sitter::{self, Registry, RepoLocks, SitEvent, SitHandle},
@@ -197,7 +198,6 @@ struct RepoInputs {
     timeout: Entity<InputState>,
     draft_timeout: Entity<InputState>,
     interval: Entity<InputState>,
-    model: Entity<InputState>,
     setup_command: Option<Entity<InputState>>,
     timeout_error: Option<String>,
     draft_timeout_error: Option<String>,
@@ -251,6 +251,7 @@ pub struct AppView {
     repos: Load<Vec<RepoName>>,
     prs: Load<Vec<PrRow>>,
     setup: Load<Vec<(&'static CheckSpec, CheckState)>>,
+    models: BTreeMap<AgentKind, Load<Vec<ModelOption>>>,
     titles: BTreeMap<PrRef, String>,
     /// Merged PRs dismissed while a GitHub search may still return an older snapshot.
     dismissed_merged: BTreeSet<PrRef>,
@@ -291,6 +292,7 @@ pub struct AppView {
     avatar_task: Option<Task<()>>,
     pr_task: Option<Task<()>>,
     setup_task: Option<Task<()>>,
+    model_tasks: BTreeMap<AgentKind, Task<()>>,
     pr_action_tasks: BTreeMap<PrRef, Task<()>>,
     removal_tasks: BTreeMap<PrRef, Task<()>>,
     sweep_task: Option<Task<()>>,
@@ -535,7 +537,6 @@ impl AppView {
                 Some(defaults.draft_timeout),
                 Some(defaults.interval),
             ],
-            defaults.model.clone(),
             None,
             window,
             cx,
@@ -572,6 +573,7 @@ impl AppView {
             repos: Load::Loading,
             prs: Load::Loading,
             setup: Load::Loading,
+            models: BTreeMap::new(),
             titles,
             dismissed_merged: BTreeSet::new(),
             closed_prs: BTreeMap::new(),
@@ -612,6 +614,7 @@ impl AppView {
             avatar_task: None,
             pr_task: None,
             setup_task: None,
+            model_tasks: BTreeMap::new(),
             pr_action_tasks: BTreeMap::new(),
             removal_tasks: BTreeMap::new(),
             sweep_task: None,
@@ -647,6 +650,32 @@ impl AppView {
                 false
             }
         }
+    }
+    fn load_models(&mut self, kind: AgentKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.models.contains_key(&kind) {
+            return;
+        }
+        self.models.insert(kind, Load::Loading);
+        let env = self.env.clone();
+        let task = cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    models::list_models(kind, &env).map_err(|error| format!("{error:#}"))
+                })
+                .await;
+            let _ = view.update_in(cx, |this, _, cx| {
+                this.models.insert(
+                    kind,
+                    match result {
+                        Ok(models) => Load::Ready(models),
+                        Err(error) => Load::Error(error),
+                    },
+                );
+                this.model_tasks.remove(&kind);
+                cx.notify();
+            });
+        });
+        self.model_tasks.insert(kind, task);
     }
     fn load_prompt_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let env = self.env.clone();
@@ -791,7 +820,6 @@ impl AppView {
     fn duration_inputs(
         target: DurationTarget,
         values: [Option<Duration>; 3],
-        model: Option<String>,
         defaults: Option<Defaults>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -825,48 +853,7 @@ impl AppView {
         let timeout = make_input(values[0], defaults[0], window, cx);
         let draft_timeout = make_input(values[1], defaults[1], window, cx);
         let interval = make_input(values[2], defaults[2], window, cx);
-        let model = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(model.unwrap_or_default())
-                .placeholder("Agent default")
-        });
-        let model_target = target.clone();
-        let model_subscription = cx.subscribe_in(
-            &model,
-            window,
-            move |this: &mut Self, input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    let text = input.read(cx).value().to_string();
-                    let value = model::normalize_setup_command(&text).map(str::to_owned);
-                    let previous = match &model_target {
-                        DurationTarget::App => {
-                            std::mem::replace(&mut this.config.app.defaults.model, value)
-                        }
-                        DurationTarget::Repo(repo) => {
-                            let Some(settings) = this.config.repos.get_mut(repo) else {
-                                return;
-                            };
-                            std::mem::replace(&mut settings.model, value)
-                        }
-                    };
-                    if !this.save() {
-                        match &model_target {
-                            DurationTarget::App => this.config.app.defaults.model = previous,
-                            DurationTarget::Repo(repo) => {
-                                if let Some(settings) = this.config.repos.get_mut(repo) {
-                                    settings.model = previous;
-                                }
-                            }
-                        }
-                    } else {
-                        this.load_setup(window, cx);
-                    }
-                    cx.notify();
-                }
-            },
-        );
         let mut subscriptions = Vec::new();
-        subscriptions.push(model_subscription);
         for (input, field) in [
             (&timeout, Field::Timeout),
             (&draft_timeout, Field::DraftTimeout),
@@ -889,7 +876,6 @@ impl AppView {
             timeout,
             draft_timeout,
             interval,
-            model,
             setup_command: None,
             timeout_error: None,
             draft_timeout_error: None,
@@ -908,7 +894,6 @@ impl AppView {
         let mut inputs = Self::duration_inputs(
             DurationTarget::Repo(repo.clone()),
             [settings.timeout, settings.draft_timeout, settings.interval],
-            settings.model.clone(),
             Some(self.config.app.defaults.clone()),
             window,
             cx,
@@ -2130,12 +2115,7 @@ impl AppView {
         (header, body)
     }
 
-    fn agent_fields(
-        &self,
-        inputs: &RepoInputs,
-        target: DurationTarget,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn agent_fields(&self, target: DurationTarget, cx: &mut Context<Self>) -> Div {
         let selected = match &target {
             DurationTarget::App => Some(self.config.app.defaults.agent),
             DurationTarget::Repo(repo) => self
@@ -2146,6 +2126,108 @@ impl AppView {
         };
         let label = selected.map_or("App default", AgentKind::label);
         let app_default = self.config.app.defaults.agent;
+        let kind = selected.unwrap_or(app_default);
+        let model = match &target {
+            DurationTarget::App => self.config.app.defaults.model.as_ref(),
+            DurationTarget::Repo(repo) => self
+                .config
+                .repos
+                .get(repo)
+                .and_then(|settings| settings.model.as_ref()),
+        };
+        let options = match self.models.get(&kind) {
+            Some(Load::Ready(options)) => options.clone(),
+            _ => Vec::new(),
+        };
+        let inherits_app_model = match &target {
+            DurationTarget::App => false,
+            DurationTarget::Repo(_) => selected.is_none(),
+        };
+        let unset_label = if inherits_app_model {
+            "App default"
+        } else {
+            "Harness default"
+        };
+        let model_label = model.map_or_else(
+            || unset_label.to_owned(),
+            |value| {
+                options
+                    .iter()
+                    .find(|option| option.value == *value)
+                    .map_or_else(|| value.clone(), |option| option.label.clone())
+            },
+        );
+        let status = match self.models.get(&kind) {
+            None | Some(Load::Loading) => Some("Loading models…".to_owned()),
+            Some(Load::Error(error)) => Some(error.lines().next().unwrap_or(error).to_owned()),
+            Some(Load::Ready(options)) if options.is_empty() => Some(
+                if kind == AgentKind::Pi {
+                    "No models. Sign in with `pi auth login`."
+                } else {
+                    "No models found"
+                }
+                .to_owned(),
+            ),
+            Some(Load::Ready(_)) => None,
+        };
+        let model_target = target.clone();
+        let model_view = cx.entity().downgrade();
+        let model_picker = Button::new("model-picker")
+            .child(harness_choice(kind, model_label).flex_1())
+            .dropdown_caret(true)
+            .outline()
+            .w_full()
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu
+                    .min_w(px(SETTINGS_INPUT_WIDTH))
+                    .max_h(px(320.))
+                    .scrollable(true);
+                let choices = std::iter::once((None, unset_label.to_owned())).chain(
+                    options
+                        .clone()
+                        .into_iter()
+                        .map(|option| (Some(option.value), option.label)),
+                );
+                for (value, label) in choices {
+                    let view = model_view.clone();
+                    let target = model_target.clone();
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let value = value.clone();
+                        let _ = view.update(cx, |this, cx| {
+                            let previous = match &target {
+                                DurationTarget::App => {
+                                    std::mem::replace(&mut this.config.app.defaults.model, value)
+                                }
+                                DurationTarget::Repo(repo) => {
+                                    let Some(settings) = this.config.repos.get_mut(repo) else {
+                                        return;
+                                    };
+                                    std::mem::replace(&mut settings.model, value)
+                                }
+                            };
+                            if !this.save() {
+                                match &target {
+                                    DurationTarget::App => {
+                                        this.config.app.defaults.model = previous
+                                    }
+                                    DurationTarget::Repo(repo) => {
+                                        if let Some(settings) = this.config.repos.get_mut(repo) {
+                                            settings.model = previous;
+                                        }
+                                    }
+                                }
+                            } else {
+                                this.load_setup(window, cx);
+                            }
+                            cx.notify();
+                        });
+                    }));
+                }
+                if let Some(status) = status.clone() {
+                    menu = menu.item(PopupMenuItem::new(status).disabled(true));
+                }
+                menu
+            });
         let view = cx.entity().downgrade();
         let is_repo = matches!(target, DurationTarget::Repo(_));
         let picker = Button::new("coding-agent")
@@ -2195,6 +2277,7 @@ impl AppView {
                                             }
                                         }
                                     } else {
+                                        this.load_models(choice.unwrap_or(app_default), window, cx);
                                         this.load_setup(window, cx);
                                     }
                                     cx.notify();
@@ -2217,13 +2300,13 @@ impl AppView {
                     .text_color(muted())
                     .child("Answers review threads, fixes CI, and resolves conflicts."),
             ))
-            .child(duration_field(
-                Icon::empty().path("icons/square-terminal.svg"),
+            .child(settings_field(
+                Icon::empty().path("icons/brain.svg"),
                 "Model",
-                "Leave empty to use the agent default.",
-                &inputs.model,
-                &None,
-                false,
+                model_picker,
+                div()
+                    .text_color(muted())
+                    .child("Models the selected harness offers."),
             ))
     }
 
@@ -2278,7 +2361,7 @@ impl AppView {
                                                 .child("Repositories use these values unless they set their own."),
                                         ),
                                 )
-                                .child(self.agent_fields(&self.app_inputs, DurationTarget::App, cx))
+                                .child(self.agent_fields(DurationTarget::App, cx))
                                 .child(duration_fields(&self.app_inputs)),
                         )
                         .child(
@@ -2393,7 +2476,7 @@ impl AppView {
                         .max_w(px(SETTINGS_LABEL_WIDTH
                             + SETTINGS_COLUMN_GAP
                             + SETTINGS_INPUT_WIDTH))
-                        .child(self.agent_fields(inputs, DurationTarget::Repo(repo.clone()), cx))
+                        .child(self.agent_fields(DurationTarget::Repo(repo.clone()), cx))
                         .child(duration_fields(inputs).child(duration_field(
                             Icon::empty().path("icons/square-terminal.svg"),
                             "Setup command",
@@ -3236,6 +3319,11 @@ impl AppView {
             return;
         }
         self.setup = Load::Loading;
+        self.models.retain(|_, load| match load {
+            Load::Loading => true,
+            Load::Ready(options) => !options.is_empty(),
+            Load::Error(_) => false,
+        });
         let env = self.env.clone();
         let config = self.config.clone();
         self.setup_task = Some(cx.spawn_in(window, async move |view, cx| {
@@ -3485,13 +3573,13 @@ impl AppView {
 }
 
 /// An agent harness's logo next to its name, for the picker and its menu.
-fn harness_choice(kind: AgentKind, label: &'static str) -> Div {
+fn harness_choice(kind: AgentKind, label: impl Into<SharedString>) -> Div {
     div()
         .flex()
         .items_center()
         .gap(px(8.))
         .child(img(kind.logo()).size(px(16.)).flex_shrink_0())
-        .child(label)
+        .child(label.into())
 }
 
 fn duration_field(
@@ -3930,6 +4018,18 @@ impl Render for AppView {
             Page::Settings(SettingsPage::Repo(repo)) if !self.config.repos.contains_key(repo)
         ) {
             self.page = Page::Settings(SettingsPage::Repositories);
+        }
+        let model_kind = match &self.page {
+            Page::Settings(SettingsPage::App) => Some(self.config.app.defaults.agent),
+            Page::Settings(SettingsPage::Repo(repo)) => self
+                .config
+                .repos
+                .get(repo)
+                .map(|settings| settings.agent.unwrap_or(self.config.app.defaults.agent)),
+            _ => None,
+        };
+        if let Some(kind) = model_kind {
+            self.load_models(kind, window, cx);
         }
         let (header, body) = match &self.page {
             Page::PullRequests => self.render_dashboard(window.is_fullscreen(), cx),
