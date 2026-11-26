@@ -579,7 +579,6 @@ pub struct PrRow {
     pub state: PrState,
     pub base: String,
     pub head: String,
-    pub updated_at: String,
 }
 
 pub fn stack_parents(rows: &[PrRow]) -> BTreeMap<PrRef, PrRef> {
@@ -787,11 +786,10 @@ pub fn dashboard_rows<'a>(
                     },
                     base: String::new(),
                     head: String::new(),
-                    updated_at: String::new(),
                 })
             }),
     );
-    rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    rows.sort_by_cached_key(|row| (row.pr.repo.to_string().to_lowercase(), row.pr.number));
     rows
 }
 
@@ -1109,7 +1107,7 @@ mod tests {
         assert_eq!(old.app.clear_merged_after, Duration::ZERO);
     }
     use super::*;
-    fn row(pr: &str, updated_at: &str) -> PrRow {
+    fn row(pr: &str) -> PrRow {
         let pr: PrRef = pr.parse().unwrap();
         PrRow {
             url: pr.url(),
@@ -1118,7 +1116,6 @@ mod tests {
             state: PrState::Ready,
             base: String::new(),
             head: String::new(),
-            updated_at: updated_at.into(),
         }
     }
 
@@ -1133,7 +1130,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(pr, base, head)| {
-            let mut row = row(pr, "");
+            let mut row = row(pr);
             row.base = base.into();
             row.head = head.into();
             row
@@ -1195,7 +1192,7 @@ mod tests {
     #[test]
     fn stack_tree_and_mode_include_side_branches() {
         let mut rows = stack_rows();
-        let mut sibling = row("arbio/platform#7001", "");
+        let mut sibling = row("arbio/platform#7001");
         sibling.base = "one".into();
         sibling.head = "sibling".into();
         rows.push(sibling);
@@ -1279,7 +1276,7 @@ mod tests {
 
     #[test]
     fn search_matches_number_prefix_or_title_ignoring_case() {
-        let mut pr = row("arbio/platform#6781", "");
+        let mut pr = row("arbio/platform#6781");
         pr.title = "chore(infra): NX-4585 disarm the production one-off".into();
         for query in [
             "",
@@ -1557,15 +1554,15 @@ mod tests {
 
     #[test]
     fn watch_counts_ignore_the_state_filter_but_follow_the_repository() {
-        let mut draft_watched = row("owner/one#1", "2026-01-01");
+        let mut draft_watched = row("owner/one#1");
         draft_watched.state = PrState::Draft;
-        let mut draft_unwatched = row("owner/one#2", "2026-01-02");
+        let mut draft_unwatched = row("owner/one#2");
         draft_unwatched.state = PrState::Draft;
         let prs = [
             draft_watched,
             draft_unwatched,
-            row("owner/one#3", "2026-01-03"),
-            row("owner/two#4", "2026-01-04"),
+            row("owner/one#3"),
+            row("owner/two#4"),
         ];
         let sits = BTreeMap::from([
             ("owner/one#1".parse().unwrap(), SitState::Preparing),
@@ -1590,11 +1587,7 @@ mod tests {
     }
     #[test]
     fn dashboard_filters_candidates_by_status_and_repository() {
-        let prs = [
-            row("owner/one#1", "2026-01-01"),
-            row("owner/two#2", "2026-01-03"),
-            row("owner/one#3", "2026-01-02"),
-        ];
+        let prs = [row("owner/one#1"), row("owner/two#2"), row("owner/one#3")];
         let history = BTreeMap::from([
             (
                 "owner/one#7".parse().unwrap(),
@@ -1672,7 +1665,7 @@ mod tests {
         let rows = dashboard_rows(&prs, &history, &sits, &watched, Some(&repo));
         assert_eq!(
             rows.iter().map(|row| row.pr.number).collect::<Vec<_>>(),
-            [3, 1, 7, 11]
+            [1, 3, 7, 11]
         );
         assert_eq!(
             rows.iter()
@@ -1685,10 +1678,50 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_orders_by_repository_then_number_with_stacks_at_their_bottom() {
+        let on = |pr: &str, base: &str, head: &str| PrRow {
+            base: base.into(),
+            head: head.into(),
+            ..row(pr)
+        };
+        let prs = [
+            on("Zeta/app#2", "main", "z"),
+            on("alpha/web#8", "a", "b"),
+            on("beta/api#1", "main", "x"),
+            on("alpha/web#5", "main", "e"),
+            on("alpha/web#2", "c", "d"),
+            on("alpha/web#3", "main", "a"),
+            on("alpha/web#6", "main", "c"),
+        ];
+        let watched = ["Zeta/app", "alpha/web", "beta/api"]
+            .into_iter()
+            .map(|repo| (repo.parse().unwrap(), RepoSettings::default()))
+            .collect();
+        let (history, sits) = (BTreeMap::new(), BTreeMap::new());
+        let rows = dashboard_rows(&prs, &history, &sits, &watched, None);
+        let ordered = order_stacks(rows, &stack_parents(&prs));
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|row| row.pr.to_string())
+                .collect::<Vec<_>>(),
+            [
+                "alpha/web#3",
+                "alpha/web#8",
+                "alpha/web#5",
+                "alpha/web#6",
+                "alpha/web#2",
+                "beta/api#1",
+                "Zeta/app#2",
+            ]
+        );
+    }
+
+    #[test]
     fn filters_classify_sits_and_pr_states() {
         let merged = SitState::Finished(Outcome::Merged);
         let rows: Vec<Cow<'_, PrRow>> = (1..=4)
-            .map(|n| Cow::Owned(row(&format!("owner/one#{n}"), "2026-01-01")))
+            .map(|n| Cow::Owned(row(&format!("owner/one#{n}"))))
             .collect();
         let sits = BTreeMap::from([
             (rows[0].pr.clone(), merged.clone()),
@@ -1705,7 +1738,7 @@ mod tests {
             "merged and running babysits are watched; stopped and never-started are not"
         );
 
-        let mut pr = row("owner/one#1", "2026-01-01");
+        let mut pr = row("owner/one#1");
         for state in [
             PrState::Ready,
             PrState::Queued,
@@ -1756,7 +1789,7 @@ mod tests {
         history.remove(&pr);
         sits.remove(&pr);
         assert!(dashboard_rows(&[], &history, &sits, &watched, None).is_empty());
-        let open = [row("owner/one#7", "2026-01-01")];
+        let open = [row("owner/one#7")];
         let mut rows = dashboard_rows(&open, &history, &sits, &watched, None);
         let watched_set = watched_prs(&rows, &sits, &BTreeMap::new());
         rows.retain(|row| WatchFilter::Unwatched.admits(watched_set.contains(&row.pr)));
@@ -1772,7 +1805,7 @@ mod tests {
 
     #[test]
     fn dashboard_prefers_current_title_over_history() {
-        let prs = [row("owner/one#1", "2026-01-01")];
+        let prs = [row("owner/one#1")];
         let pr = prs[0].pr.clone();
         let history = BTreeMap::from([(
             pr.clone(),
