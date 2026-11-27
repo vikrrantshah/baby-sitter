@@ -630,7 +630,8 @@ pub fn prune_stack_links(
     active: &BTreeMap<PrRef, ActiveSit>,
     history: &BTreeMap<PrRef, PastSit>,
 ) {
-    links.retain(|child, _| active.contains_key(child) || history.contains_key(child));
+    let tracked = |pr: &PrRef| active.contains_key(pr) || history.contains_key(pr);
+    links.retain(|child, parent| tracked(child) || tracked(parent));
 }
 
 pub fn stack_of(pr: &PrRef, parents: &BTreeMap<PrRef, PrRef>) -> Vec<PrRef> {
