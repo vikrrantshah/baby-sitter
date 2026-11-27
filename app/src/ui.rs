@@ -2898,8 +2898,11 @@ impl AppView {
                 .text_size(px(13.))
                 .text_color(muted())
                 .child(branch_chip(format!("head-{}", row.pr), &row.head).min_w_0())
-                .child(div().flex_shrink_0().child("into"))
-                .child(branch_chip(format!("base-{}", row.pr), &row.base).flex_shrink_0())
+                .when(!rail.up, |place| {
+                    place
+                        .child(div().flex_shrink_0().child("into"))
+                        .child(branch_chip(format!("base-{}", row.pr), &row.base).flex_shrink_0())
+                })
         };
         let copy_url = row.url.clone();
         let copy_pr = row.pr.clone();
