@@ -1192,6 +1192,42 @@ mod tests {
     }
 
     #[test]
+    fn pruning_keeps_links_whose_parent_is_babysat_or_merged() {
+        let prs: Vec<_> = (1..=6)
+            .map(|n| row(&format!("owner/repo#{n}")).pr)
+            .collect();
+        let mut links = BTreeMap::from([
+            (prs[1].clone(), prs[0].clone()),
+            (prs[3].clone(), prs[2].clone()),
+            (prs[5].clone(), prs[4].clone()),
+        ]);
+        let active = BTreeMap::from([(
+            prs[0].clone(),
+            ActiveSit {
+                deadline: 10,
+                stack: StackMode::BottomUp,
+            },
+        )]);
+        let history = BTreeMap::from([(
+            prs[2].clone(),
+            PastSit {
+                title: String::new(),
+                outcome: Outcome::Merged,
+                finished_at: 0,
+            },
+        )]);
+        prune_stack_links(&mut links, &active, &history);
+        assert_eq!(
+            links,
+            BTreeMap::from([
+                (prs[1].clone(), prs[0].clone()),
+                (prs[3].clone(), prs[2].clone()),
+            ]),
+            "a babysat or merged bottom keeps the unbabysat PR stacked on it"
+        );
+    }
+
+    #[test]
     fn stack_links_round_trip_and_old_configs_default_empty() {
         let mut config = Config::default();
         let child = row("owner/repo#2").pr;
